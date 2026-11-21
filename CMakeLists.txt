@@ -104,6 +104,17 @@ if(MSVC)
     target_compile_options(ScPluginScanWorker PRIVATE /utf-8)
 endif()
 
+# Na execucao local (fora do ZIP do CI), manter o helper junto do app.
+# Fazer o build do executavel auxiliar antes de copiar no POST_BUILD.
+add_dependencies(SilverConsole ScPluginScanWorker)
+if(WIN32)
+    add_custom_command(TARGET SilverConsole POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:ScPluginScanWorker>"
+          "$<TARGET_FILE_DIR:SilverConsole>/ScPluginScanWorker.exe"
+        COMMENT "Copiando helper isolado para a pasta do SilverConsole")
+endif()
+
 #------------------------------------------------------------------------------
 if(SILVERCONSOLE_TESTS)
     include(CTest)
