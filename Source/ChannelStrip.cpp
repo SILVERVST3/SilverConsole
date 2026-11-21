@@ -416,8 +416,19 @@ void ChannelStrip::tick()
         repaint();
     }
     if (shownMode != channel.getAutoMode()) refreshAutoButton();
-    // Estado faulted vem do callback; a interface atualiza sem locks em 30 Hz.
-    for (auto* slot : slots) slot->repaint();
+    // Atualiza apenas inserts alterados. Repintar todos os oito botoes de
+    // cada uma das 128 faixas a 30 Hz seria custo inutil no mixer.
+    for (int i = 0; i < slots.size(); ++i)
+    {
+        const auto& insert = channel.inserts[(size_t) i];
+        const int visual = insert.faulted.load (std::memory_order_relaxed) ? 2
+                         : insert.bypassed.load (std::memory_order_relaxed) ? 1 : 0;
+        if (lastInsertVisualState[(size_t) i] != visual)
+        {
+            lastInsertVisualState[(size_t) i] = visual;
+            slots[i]->repaint();
+        }
+    }
 }
 
 void ChannelStrip::resized()
