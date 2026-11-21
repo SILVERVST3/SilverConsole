@@ -713,7 +713,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         out.addFrom (1, 0, TR, n);
 
         storePeak (t.peakL, t.processingBuffer.getMagnitude (0, 0, n));
-        storePeak (t.peakR, scratch.getMagnitude (1, 0, n));
+        storePeak (t.peakR, t.processingBuffer.getMagnitude (1, 0, n));
     }
 
     // ---------------- Buses ----------------
