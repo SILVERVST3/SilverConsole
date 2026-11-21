@@ -1,6 +1,8 @@
 // SilverConsole - janela principal. Codigo original (MIT).
 #include "MainComponent.h"
 #include "AudioLoader.h"
+#include "PluginScanPolicy.h"
+#include "PluginScanSupervisor.h"
 #include <thread>
 
 namespace sc
@@ -299,7 +301,24 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     importButton.onClick = [this] { importDialog(); };
     addBusButton.onClick = [this] { if (createBus() == nullptr) alert ("Bus", "Limite de " + juce::String (kMaxBuses) + " buses."); };
     exportButton.onClick = [this] { exportDialog(); };
-    pluginsButton.onClick = [this] { showPluginManager (false); };
+    pluginsButton.onClick = [this]
+    {
+        juce::PopupMenu menu;
+        menu.addItem (1, "Gerenciar plugins VST3...");
+        menu.addItem (2, "Escanear VST3 com processo isolado");
+        menu.addItem (3, "Reavaliar VST3 com falha anterior...");
+        menu.addItem (4, "Testar DSP dos VST3 em processo isolado...");
+        const juce::Component::SafePointer<MainComponent> self (this);
+        menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pluginsButton),
+                            [self] (int choice)
+        {
+            if (self == nullptr) return;
+            if (choice == 1) self->showPluginManager (false);
+            else if (choice == 2) self->scanPluginsIsolated();
+            else if (choice == 3) self->scanPluginsIsolated (true);
+            else if (choice == 4) self->scanPluginsIsolated (false, true);
+        });
+    };
     audioButton.onClick = [this] { showAudioSettings(); };
 
     mixerViewport.setViewedComponent (&mixerContent, false);
@@ -532,7 +551,8 @@ void MainComponent::timerCallback()
               << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
             const auto rt = engine.getRealtimeStats();
             s << "  |  XRUN " << juce::String (rt.callbackOverruns)
-              << "  |  LOCK " << juce::String (rt.lockContentions);
+              << "  |  LOCK " << juce::String (rt.lockContentions)
+              << "  |  PLUG ERR " << juce::String (rt.pluginExceptions);
         }
         else s = "Sem dispositivo de audio - clique em Audio";
         if (s != statusText) { statusText = s; repaint (getWidth() - 470, kTopBarH, 470, kToolbarH); }
@@ -1047,7 +1067,7 @@ namespace
         {
             setUsingNativeTitleBar (true);
             list = new juce::PluginListComponent (host.formats, host.known, host.getDeadMansPedalFile(), settings, true);
-            list->setOptionsButtonText (juce::String::fromUTF8 ("Op\xc3\xa7\xc3\xb5\x65s / Escanear..."));
+            list->setOptionsButtonText ("Opcoes / Scan interno (sem isolamento)");
             list->setScanDialogText ("Escaneando plugins", "Procurando plugins VST3...");
             setContentOwned (list, false);
             setResizable (true, false);
@@ -1076,9 +1096,146 @@ void MainComponent::showPluginManager (bool startScan)
         });
     }
     pluginManagerWindow->toFront (true);
-    if (startScan)
-        if (auto* f = pluginHost.findVst3Format())
-            static_cast<PluginManagerWindow*> (pluginManagerWindow.get())->list->scanFor (*f);
+    if (startScan) scanPluginsIsolated();
+}
+
+void MainComponent::scanPluginsIsolated (bool retryFailed, bool probeDsp)
+{
+    if (job != nullptr) return;
+
+    const auto worker = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                            .getSiblingFile ("ScPluginScanWorker.exe");
+    if (! worker.existsAsFile())
+    {
+        alert ("Scanner VST3", "O auxiliar ScPluginScanWorker.exe nao esta ao lado "
+                             "do SilverConsole.exe. Recompile ou extraia o pacote completo.");
+        return;
+    }
+
+    const auto remembered = PluginScanPolicy::deserialize (
+        props.getUserSettings()->getValue (PluginScanPolicy::settingsKey));
+    if (retryFailed && remembered.isEmpty())
+    {
+        alert ("Scanner VST3", "Nao existem plugins em quarentena para reavaliar.");
+        return;
+    }
+
+    struct Result
+    {
+        std::vector<juce::PluginDescription> types;
+        juce::StringArray successPaths, failedPaths;
+        int total = 0, scanned = 0, skipped = 0, failed = 0, timedOut = 0;
+        bool cancelled = false;
+    };
+    auto result = std::make_shared<Result>();
+    runJob (retryFailed ? "Reavaliando VST3 com falhas anteriores..."
+                        : probeDsp ? "Testando DSP VST3 em processo isolado..."
+                        : "Escaneando VST3 em processo isolado...", true,
+            [worker, result, remembered, retryFailed, probeDsp] (Job& j)
+    {
+        // Apenas a enumeracao de caminhos acontece no host. Todo carregamento
+        // de VST3 para discovery acontece em processo filho independente.
+        juce::VST3PluginFormat format;
+        auto candidates = format.searchPathsForPlugins (
+            format.getDefaultLocationsToSearch(), true, false);
+        candidates.removeDuplicates (true);
+        result->total = candidates.size();
+
+        for (int i = 0; i < candidates.size(); ++i)
+        {
+            if (j.cancel.load()) { result->cancelled = true; break; }
+            const auto& candidate = candidates.getReference (i);
+            if (! PluginScanPolicy::shouldScan (remembered, candidate, retryFailed))
+            {
+                ++result->skipped;
+                j.progress = (float) (i + 1) / (float) juce::jmax (1, candidates.size());
+                continue;
+            }
+
+            ++result->scanned;
+            const auto destination = juce::File::getSpecialLocation (juce::File::tempDirectory)
+                .getChildFile ("silverconsole-scan-" + juce::Uuid().toString() + ".xml");
+            juce::StringArray args;
+            args.add (worker.getFullPathName());
+            if (probeDsp) args.add ("--probe");
+            args.add (candidate);
+            args.add (destination.getFullPathName());
+
+            bool passed = false;
+            // Supervisor compartilhado com os testes de falha/cancelamento.
+            // Nao roda na thread realtime e mata o filho em timeout/cancel.
+            const auto scan = PluginScanSupervisor::run (args, j.cancel, 20000);
+            if (scan.status == PluginScanSupervisor::Status::cancelled)
+                result->cancelled = true;
+            if (scan.status == PluginScanSupervisor::Status::timedOut)
+                ++result->timedOut;
+
+            if (scan.ok()
+                && destination.getSize() > 0
+                && destination.getSize() <= 4 * 1024 * 1024)
+            {
+                    if (auto xml = juce::XmlDocument::parse (destination))
+                    {
+                        if (xml->hasTagName ("SILVERCONSOLE_PLUGIN_SCAN")
+                            && xml->getStringAttribute ("format") == "VST3"
+                            && xml->getIntAttribute ("schemaVersion") == 1)
+                        {
+                            for (auto* node : xml->getChildIterator())
+                            {
+                                if (! node->hasTagName ("PLUGIN")) continue;
+                                juce::PluginDescription desc;
+                                if (desc.loadFromXml (*node) && desc.pluginFormatName == "VST3"
+                                    && desc.name.isNotEmpty())
+                                {
+                                    result->types.push_back (std::move (desc));
+                                    passed = true;
+                                }
+                            }
+                        }
+                    }
+            }
+            destination.deleteFile();
+            if (result->cancelled) break;
+
+            if (passed)
+                result->successPaths.add (candidate);
+            else
+            {
+                result->failedPaths.add (candidate);
+                ++result->failed;
+            }
+            j.progress = (float) (i + 1) / (float) juce::jmax (1, candidates.size());
+        }
+    },
+            [this, result, probeDsp] (Job&)
+    {
+        auto* settings = props.getUserSettings();
+        auto failed = PluginScanPolicy::deserialize (
+            settings->getValue (PluginScanPolicy::settingsKey));
+        for (auto& path : result->successPaths)
+            PluginScanPolicy::reportResult (failed, path, true);
+        for (auto& path : result->failedPaths)
+            PluginScanPolicy::reportResult (failed, path, false);
+        settings->setValue (PluginScanPolicy::settingsKey,
+                            PluginScanPolicy::serialize (failed));
+
+        for (auto& description : result->types)
+            pluginHost.known.addType (description);
+        settings->saveIfNeeded();
+        if (pluginManagerWindow != nullptr) pluginManagerWindow->repaint();
+
+        const juce::String summary = "Reconhecidos " + juce::String ((int) result->types.size())
+            + " tipo(s) VST3 em " + juce::String (result->scanned) + " candidato(s) examinados.\n"
+            + juce::String (result->skipped) + " ignorado(s) por falha anterior.\n"
+            + juce::String (result->failed) + (probeDsp ? " falha(s) no teste DSP, incluindo "
+                                                          : " falha(s), incluindo ")
+            + juce::String (result->timedOut) + " timeout(s).\n"
+            + juce::String (failed.size()) + " candidato(s) na lista de quarentena."
+            + (result->cancelled ? "\nVarredura cancelada, inclusive o processo em andamento."
+                                 : "\nUse Reavaliar VST3 com falha para tentar novamente.");
+        alert (probeDsp ? "Teste DSP isolado" : "Scanner isolado",
+               summary, result->failed > 0);
+    });
 }
 
 void MainComponent::showAudioSettings()

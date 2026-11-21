@@ -70,6 +70,7 @@ struct InsertSlot
     bool hasDescription = false;      // plugin externo (pode estar ausente)
     juce::MemoryBlock missingState;   // estado guardado quando o plugin nao abriu
     std::atomic<bool> bypassed { false };
+    std::atomic<bool> faulted { false }; // Falha C++ em processBlock; exibida na interface, sem locks
     int bufferChannels = 2;
     int mainOutChannels = 2;
 
@@ -233,13 +234,15 @@ public:
         juce::uint64 renderSuspensions = 0;
         juce::uint64 processedCallbacks = 0;
         juce::uint64 callbackOverruns = 0;
+        juce::uint64 pluginExceptions = 0;
     };
     RealtimeStats getRealtimeStats() const noexcept
     {
         return { lockContentions.load (std::memory_order_relaxed),
                  renderSuspensions.load (std::memory_order_relaxed),
                  processedCallbacks.load (std::memory_order_relaxed),
-                 callbackOverruns.load (std::memory_order_relaxed) };
+                 callbackOverruns.load (std::memory_order_relaxed),
+                 pluginExceptions.load (std::memory_order_relaxed) };
     }
     void resetRealtimeStats() noexcept
     {
@@ -247,6 +250,7 @@ public:
         renderSuspensions.store (0, std::memory_order_relaxed);
         processedCallbacks.store (0, std::memory_order_relaxed);
         callbackOverruns.store (0, std::memory_order_relaxed);
+        pluginExceptions.store (0, std::memory_order_relaxed);
     }
 
     // ---- Render ---------------------------------------------------------------
@@ -292,7 +296,7 @@ private:
     std::unique_ptr<OfflineTrackPool> offlineTrackPool;
     TruePeak4x truePeakMeter;
     MomentaryLoudness momentaryLoudness; // estado exclusivo do motor sob engine.lock
-    std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 };
+    std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 }, pluginExceptions { 0 };
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
     std::atomic<bool> srChanged { false };

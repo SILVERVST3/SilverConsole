@@ -5,8 +5,12 @@
 #include "AudioLoader.h"
 #include "Project.h"
 #include "AutomationRecorder.h"
+#include "PluginScanPolicy.h"
+#include "PluginScanSupervisor.h"
 #include <cstdio>
 #include <thread>
+#include <stdexcept>
+#include <limits>
 
 using namespace sc;
 
@@ -49,6 +53,20 @@ private:
     DelayLine line;
 };
 
+// Simula uma excecao de um insert de terceiros. Um crash de processo
+// real nao pode ser tratado assim e exige isolamento IPC (pendente).
+class ThrowingProcessor : public InternalDelay
+{
+public:
+    ThrowingProcessor() : InternalDelay (1) {}
+    void processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer&) override
+    {
+        // Um plugin pode deixar um bloco parcialmente corrompido ao falhar.
+        audio.setSample (0, 0, std::numeric_limits<float>::quiet_NaN());
+        throw std::runtime_error ("Falha de teste em plugin VST3");
+    }
+};
+
 static std::shared_ptr<const juce::AudioBuffer<float>> makeBuffer (int channels, int len, std::function<float (int, int)> fn)
 {
     auto b = std::make_shared<juce::AudioBuffer<float>> (channels, len);
@@ -86,6 +104,52 @@ static int peakIndex (const juce::AudioBuffer<float>& b, int ch)
     for (int i = 0; i < b.getNumSamples(); ++i)
         if (std::abs (b.getSample (ch, i)) > best) { best = std::abs (b.getSample (ch, i)); idx = i; }
     return idx;
+}
+
+static void testPluginExceptionFallback()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto* t = addTrack (e, makeBuffer (2, 4096, [] (int, int)
+    {
+        return 0.1f;
+    }), "faulty insert");
+
+    auto faulty = std::make_unique<ThrowingProcessor>();
+    const auto error = e.prepareProcessor (*faulty);
+    check (error.isEmpty(), "plugin exception: processador de teste preparado");
+    if (error.isNotEmpty()) return;
+    e.setInsert (*t, 0, std::move (faulty), nullptr);
+
+    auto mixed = run (e, 512);
+    bool valid = true;
+    for (int channel = 0; channel < 2; ++channel)
+        for (int sample = 0; sample < mixed.getNumSamples(); ++sample)
+            valid = valid && std::isfinite (mixed.getSample (channel, sample));
+    check (valid, "plugin exception: NaN parcial nao contamina o mixer");
+    check (t->inserts[0].bypassed.load() && t->inserts[0].faulted.load()
+           && e.getRealtimeStats().pluginExceptions == 1,
+           "plugin exception: insert marcado ERR, em bypass e falha contada");
+    e.pollLatencyChanges();
+    check (e.getTotalLatency() == 0,
+           "plugin exception: PDC atualizado apos bypass automatico");
+
+    // O callback posterior deve preservar o audio original com insert em bypass.
+    mixed = run (e, 1024);
+    check (std::abs (mixed.getSample (0, 800)) > 0.01f,
+           "plugin exception: playback recuperado por bypass automatico");
+
+    e.resetRealtimeStats();
+    check (e.getRealtimeStats().pluginExceptions == 0,
+           "plugin exception: contador pode ser reiniciado");
+
+    e.setBypass (*t, 0, false); // usuario tenta reativar
+    check (! t->inserts[0].faulted.load() && ! t->inserts[0].bypassed.load(),
+           "plugin exception: retry explicito limpa ERR anterior");
+    run (e, 512);
+    check (t->inserts[0].faulted.load() && t->inserts[0].bypassed.load()
+           && e.getRealtimeStats().pluginExceptions == 1,
+           "plugin exception: nova falha volta ao bypass automaticamente");
 }
 
 static void testMixBasics()
@@ -738,6 +802,85 @@ static void testTruePeakMeter()
            "true peak: medidor recebe o sinal final do master");
 }
 
+static void testScanSupervisor (const juce::File& worker)
+{
+    check (worker.existsAsFile(), "scan supervisor: executavel auxiliar presente");
+    if (! worker.existsAsFile()) return;
+
+    auto argv = [&] (const juce::String& command, const juce::String& value)
+    {
+        juce::StringArray args;
+        args.add (worker.getFullPathName());
+        args.add (command);
+        args.add (value);
+        return args;
+    };
+
+    std::atomic<bool> cancelled { false };
+    const auto success = PluginScanSupervisor::run (
+        argv ("--self-test-exit", "0"), cancelled, 2000);
+    check (success.ok(), "scan supervisor: resultado positivo");
+
+    const auto failure = PluginScanSupervisor::run (
+        argv ("--self-test-exit", "7"), cancelled, 2000);
+    check (failure.status == PluginScanSupervisor::Status::finished
+           && failure.exitCode == 7 && ! failure.ok(),
+           "scan supervisor: falha de processo retorna codigo sem derrubar host");
+
+    const auto started = juce::Time::getMillisecondCounter();
+    const auto timeout = PluginScanSupervisor::run (
+        argv ("--self-test-sleep", "3000"), cancelled, 250);
+    const auto elapsed = juce::Time::getMillisecondCounter() - started;
+    check (timeout.status == PluginScanSupervisor::Status::timedOut
+           && elapsed < 1800,
+           "scan supervisor: mata scanner travado dentro do prazo");
+
+    cancelled = true;
+    const auto alreadyCancelled = PluginScanSupervisor::run (
+        argv ("--self-test-sleep", "3000"), cancelled, 2000);
+    check (alreadyCancelled.status == PluginScanSupervisor::Status::cancelled,
+           "scan supervisor: nao inicia processo com pedido de cancelamento");
+    cancelled = false;
+
+    std::thread cancelThread ([&]
+    {
+        juce::Thread::sleep (160);
+        cancelled.store (true, std::memory_order_release);
+    });
+    const auto interrupted = PluginScanSupervisor::run (
+        argv ("--self-test-sleep", "3000"), cancelled, 2000);
+    cancelThread.join();
+    check (interrupted.status == PluginScanSupervisor::Status::cancelled,
+           "scan supervisor: cancelamento encerra filho ja em execucao");
+}
+
+static void testPluginScanQuarantine()
+{
+    auto failed = PluginScanPolicy::deserialize (
+        "C:/VST3/Crashing.vst3\nC:/VST3/CRASHING.vst3\n\n");
+    check (failed.size() == 1,
+           "scan quarantine: entradas duplicadas ignoradas sem diferenciar maiusculas");
+    check (! PluginScanPolicy::shouldScan (failed, "c:/vst3/crashing.vst3", false),
+           "scan quarantine: plugin previamente falho e ignorado por padrao");
+    check (PluginScanPolicy::shouldScan (failed, "c:/vst3/crashing.vst3", true),
+           "scan quarantine: usuario pode reavaliar plugin falho");
+    check (! PluginScanPolicy::shouldScan (failed, "C:/VST3/NewlyDiscovered.vst3", true),
+           "scan quarantine: reavaliacao nao examina plugins sem falhas previas");
+    check (PluginScanPolicy::shouldScan (failed, "C:/VST3/NewlyDiscovered.vst3", false),
+           "scan quarantine: varredura normal examina novos plugins");
+
+    PluginScanPolicy::reportResult (failed, "C:/VST3/new.vst3", false);
+    PluginScanPolicy::reportResult (failed, "C:/VST3/new.vst3", false);
+    check (failed.size() == 2, "scan quarantine: falhas registradas uma unica vez");
+    const auto stored = PluginScanPolicy::serialize (failed);
+    auto restored = PluginScanPolicy::deserialize (stored);
+    check (restored.size() == 2, "scan quarantine: persistencia recupera candidatos");
+    PluginScanPolicy::reportResult (restored, "c:/VST3/Crashing.vst3", true);
+    check (restored.size() == 1
+           && PluginScanPolicy::shouldScan (restored, "C:/VST3/Crashing.vst3", false),
+           "scan quarantine: sucesso remove bloqueio anterior");
+}
+
 static void test128TrackStress()
 {
     Engine e;
@@ -785,6 +928,8 @@ int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    testPluginExceptionFallback();
+    testPluginScanQuarantine();
     testTruePeakMeter();
     testMomentaryLoudness();
     test128TrackStress();
@@ -803,6 +948,8 @@ int main (int argc, char** argv)
     else std::printf ("(sem caminho do plugin de teste: hospedagem VST3 nao testada)\n");
     if (argc > 2 && scannedDescXml.isNotEmpty()) // opcional: grava a descricao do plugin de teste
         juce::File (juce::String::fromUTF8 (argv[2])).replaceWithText (scannedDescXml);
+    if (argc > 3)
+        testScanSupervisor (juce::File (juce::String::fromUTF8 (argv[3])));
     std::printf ("\n%s (%d falha(s))\n", failures == 0 ? "TODOS OS TESTES PASSARAM" : "HOUVE FALHAS", failures);
     return failures == 0 ? 0 : 1;
 }

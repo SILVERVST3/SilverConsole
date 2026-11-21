@@ -91,6 +91,32 @@ if(MSVC)
 endif()
 
 #------------------------------------------------------------------------------
+# Executavel separado para inspecao de metadados de plugins nao confiaveis.
+# A UI principal nao carrega o plugin durante essa varredura.
+juce_add_console_app(ScPluginScanWorker PRODUCT_NAME "SilverConsole Plugin Scan Worker")
+set_target_properties(ScPluginScanWorker PROPERTIES OUTPUT_NAME "ScPluginScanWorker")
+juce_generate_juce_header(ScPluginScanWorker)
+target_sources(ScPluginScanWorker PRIVATE Source/PluginScanWorker.cpp)
+target_compile_definitions(ScPluginScanWorker PRIVATE ${SC_COMMON_DEFS})
+target_link_libraries(ScPluginScanWorker PRIVATE
+    juce::juce_audio_utils juce::juce_audio_processors
+    juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+if(MSVC)
+    target_compile_options(ScPluginScanWorker PRIVATE /utf-8)
+endif()
+
+# Na execucao local (fora do ZIP do CI), manter o helper junto do app.
+# Fazer o build do executavel auxiliar antes de copiar no POST_BUILD.
+add_dependencies(SilverConsole ScPluginScanWorker)
+if(WIN32)
+    add_custom_command(TARGET SilverConsole POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:ScPluginScanWorker>"
+          "$<TARGET_FILE_DIR:SilverConsole>/ScPluginScanWorker.exe"
+        COMMENT "Copiando helper isolado para a pasta do SilverConsole")
+endif()
+
+#------------------------------------------------------------------------------
 if(SILVERCONSOLE_TESTS)
     include(CTest)
 
@@ -124,8 +150,47 @@ if(SILVERCONSOLE_TESTS)
     if(MSVC)
         target_compile_options(SilverConsoleTests PRIVATE /utf-8)
     endif()
-    add_dependencies(SilverConsoleTests SCTestPlugin_VST3)
+    add_dependencies(SilverConsoleTests SCTestPlugin_VST3 ScPluginScanWorker)
 
     add_test(NAME Engine
-        COMMAND SilverConsoleTests "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>")
+        COMMAND SilverConsoleTests
+          "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
+          "${CMAKE_CURRENT_BINARY_DIR}/engine-scan-description.xml"
+          "$<TARGET_FILE:ScPluginScanWorker>")
+
+    # O plugin do proprio projeto e testado no PROCESSO do helper, nunca
+    # dentro do SilverConsole GUI. O XML e validado separadamente.
+    add_dependencies(ScPluginScanWorker SCTestPlugin_VST3)
+    add_test(NAME PluginScanIsolated
+        COMMAND ScPluginScanWorker
+          "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
+          "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-ci.xml")
+    add_test(NAME PluginScanXml
+        COMMAND ${CMAKE_COMMAND}
+          "-DXML_FILE=${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-ci.xml"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/Tests/VerifyPluginScan.cmake")
+    set_tests_properties(PluginScanXml PROPERTIES DEPENDS PluginScanIsolated)
+    # Caminho ausente nunca gera metadados validos e precisa retornar erro
+    # controlado, sem travar nem criar XML de plugin inexistente.
+    add_test(NAME PluginScanInvalidPath
+        COMMAND ScPluginScanWorker
+          "${CMAKE_CURRENT_BINARY_DIR}/silverconsole-plugin-does-not-exist.vst3"
+          "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-invalid.xml")
+    set_tests_properties(PluginScanInvalidPath PROPERTIES WILL_FAIL TRUE TIMEOUT 15)
+    set_tests_properties(PluginScanIsolated PROPERTIES TIMEOUT 45)
+
+    # Testa que o scanner auxiliar TAMBEM consegue instanciar e executar
+    # blocos DSP sem carregar o plugin no SilverConsole principal.
+    add_test(NAME PluginDspProbeIsolated
+        COMMAND ScPluginScanWorker
+          --probe
+          "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
+          "${CMAKE_CURRENT_BINARY_DIR}/plugin-dsp-probe-ci.xml")
+    add_test(NAME PluginDspProbeXml
+        COMMAND ${CMAKE_COMMAND}
+          "-DXML_FILE=${CMAKE_CURRENT_BINARY_DIR}/plugin-dsp-probe-ci.xml"
+          "-DREQUIRE_DSP_PROBE=ON"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/Tests/VerifyPluginScan.cmake")
+    set_tests_properties(PluginDspProbeXml PROPERTIES DEPENDS PluginDspProbeIsolated)
+    set_tests_properties(PluginDspProbeIsolated PROPERTIES TIMEOUT 45)
 endif()

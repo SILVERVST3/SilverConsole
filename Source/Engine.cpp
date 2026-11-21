@@ -348,6 +348,7 @@ std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, s
         if (desc != nullptr) s.description = *desc;
         s.missingState.reset();
         s.bypassed = false;
+        s.faulted.store (false, std::memory_order_relaxed);
         if (auto* np = s.processor.get())
         {
             s.bufferChannels = juce::jlimit (2, kMaxPluginChannels,
@@ -401,7 +402,9 @@ void Engine::swapInserts (Channel& c, int a, int b)
 void Engine::setBypass (Channel& c, int slot, bool b)
 {
     const juce::ScopedLock sl (lock);
-    c.inserts[(size_t) slot].bypassed = b;
+    auto& insert = c.inserts[(size_t) slot];
+    insert.bypassed = b;
+    if (! b) insert.faulted.store (false, std::memory_order_relaxed); // retry explicito
     updateLatency();
 }
 
@@ -669,10 +672,32 @@ void Engine::runInserts (Channel& c, int n,
         for (int i = 2; i < ch; ++i) work.clear (i, 0, n);
         juce::AudioBuffer<float> view (work.getArrayOfWritePointers(), ch, n);
         eventMidi.clear();
+        bool failed = false;
         {
             const juce::ScopedLock pl (p->getCallbackLock());
             if (p->isSuspended()) continue;
-            p->processBlock (view, eventMidi);
+            // Uma excecao C++ de plugin nao pode atravessar o callback da
+            // interface de audio. Falhas de processo (SEH/access violation),
+            // deadlocks e loops infinitos AINDA exigem DSP fora do processo.
+            try
+            {
+                p->processBlock (view, eventMidi);
+            }
+            catch (...)
+            {
+                failed = true;
+            }
+        }
+        if (failed)
+        {
+            // Silencia somente o bloco afetado; nos callbacks seguintes o
+            // insert com falha fica automaticamente em bypass.
+            s.faulted.store (true, std::memory_order_relaxed);
+            s.bypassed.store (true, std::memory_order_relaxed);
+            latencyDirty.store (true, std::memory_order_relaxed); // PDC refeito pela thread de controle
+            pluginExceptions.fetch_add (1, std::memory_order_relaxed);
+            work.clear (0, n);
+            continue;
         }
         if (s.mainOutChannels == 1) work.copyFrom (1, 0, work, 0, 0, n);
     }

@@ -62,6 +62,20 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Projetos `.sconsole` em XML. O projeto guarda o caminho dos áudios, relativo à pasta do projeto, e não copia os arquivos.
 - **Exportar mix** para WAV de 16, 24 ou 32 bits float, renderizada offline (mais rápido que tempo real e sem falhas). Inclui 3 s de cauda e já descontada a latência dos plugins. Avisa se a mix passou de 0 dBFS.
 
+## Escaneamento isolado de VST3 (Etapa 4 - experimental)
+
+- No menu **Plugins**, escolha **Escanear VST3 com processo isolado**. A descoberta de cada arquivo VST3 ocorre em `ScPluginScanWorker.exe`, um executavel auxiliar distribuído ao lado de `SilverConsole.exe`.
+- O SilverConsole pesquisa os caminhos VST3 padrao e inicia **um processo filho por candidato**. Se um plugin falhar ou nao responder em 20 segundos, a varredura continua nos proximos plugins sem executar o codigo desse candidato no processo principal.
+- O resultado e um XML atomico com as descricoes dos plugins; o mixer importa apenas metadados validos. Um teste no GitHub Actions verifica o scanner isolado com o VST3 de teste do projeto.
+- Os candidatos com crash, falha de leitura ou timeout sao colocados numa **lista persistente de quarentena**. O scanner normal pula esses arquivos nas verificacoes seguintes; **Plugins > Reavaliar VST3 com falha anterior...** testa **apenas os candidatos nessa lista**, sem repetir toda a varredura. Plugins recuperados saem da quarentena automaticamente.
+- O botao **Cancelar** interrompe tambem o processo filho que estiver em andamento, sem precisar aguardar os 20 segundos. A supervisao tem testes automaticos de timeout real, codigo de erro do processo e cancelamento durante a execucao. Resultados XML acima de 4 MiB, corrompidos ou com formato/schema invalido nao sao importados.
+- **Teste opcional de DSP em outro processo:** o comando **Plugins > Testar DSP dos VST3 em processo isolado...** abre cada candidato no `ScPluginScanWorker.exe`, instancia o plugin a 48 kHz/256 amostras e executa oito blocos silenciosos. Códigos de erro, amostras não finitas ou travamentos deixam o candidato em quarentena. O teste de integração usa o VST3 do próprio projeto.
+- Esse teste é apenas uma verificação de inicialização e resposta. Não mede latência nem estabilidade prolongada, não testa parâmetros/automação em tempo real e **não move o DSP da mixagem para outro processo**. Plugins que exijam licença, entrada MIDI ou configuração específica podem falhar nesse teste sem estarem defeituosos.
+- O gerenciador legado JUCE ainda oferece uma opcao de scan interno (sem isolamento), sinalizada como tal. Prefira o scan isolado.
+- **Tratamento parcial de falhas DSP:** se o `processBlock` de um insert lancar uma **excecao C++**, a engine silencia o bloco possivelmente corrompido, coloca esse insert em bypass automaticamente e exibe a ocorrencia no contador `PLUG ERR`. Os proximos blocos podem seguir sem o insert problemático. Existe teste de regressao com plugin simulado que lança exceção e escreve NaN.
+- **Esse bypass nao substitui isolamento de processo:** erros fatais nativos (access violation/SEH), travamentos, deadlocks e loops infinitos ainda podem bloquear ou derrubar o host. O tratamento nao garante recuperacao de todo plugin.\n
+- **Limite de seguranca:** carregar/usar plugins em um insert ainda ocorre no processo principal. Isolamento de *processamento* VST3 e recuperacao de falhas em tempo real requerem uma engine separada e ainda nao foram implementados.
+
 ## Atalhos
 
 | Tecla | Ação |
@@ -119,7 +133,7 @@ Em **Áudio**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Wi
 - **Streaming em disco experimental (Etapa 2):** arquivos com 32 MiB ou mais, na mesma taxa do motor, usam cache limitado de 65.536 amostras por faixa e uma thread de pré-leitura compartilhada; a forma de onda usa um resumo compacto. Arquivos menores e/ou em outra taxa continuam na RAM com reamostragem sinc. Se a taxa do dispositivo mudar, o fallback atual pode carregar o arquivo completo na RAM. A exportação offline lê os blocos necessários antes de renderizar.
 - Na reprodução em streaming, saltos bruscos de cursor e discos lentos podem produzir silêncios momentâneos se o cache não estiver pronto. O streaming ainda precisa de testes prolongados; não é considerado pronto para produção.
 - **Processamento multicore parcial (Etapa 2):** o bounce offline distribui leitura, inserts VST3 e PDC de faixas independentes por ate tres workers adicionais, com somatoria e buses na mesma ordem. A reproducao **em tempo real** ainda e sequencial ate concluir testes de prazo de buffer e seguranca. Sessões muito pesadas podem precisar de um buffer maior.
-- O escaneamento de plugins roda dentro do programa. Se um plugin derrubar o programa no scan, abra de novo e escaneie outra vez; o plugin problemático é pulado.
+- O escaneamento isolado e experimental e o scanner tradicional JUCE continua disponivel. Plugins em inserts continuam hospedados no processo principal, sem isolamento do DSP.
 
 ## Compilar no PC (opcional)
 
