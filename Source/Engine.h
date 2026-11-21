@@ -70,6 +70,7 @@ struct InsertSlot
     bool hasDescription = false;      // plugin externo (pode estar ausente)
     juce::MemoryBlock missingState;   // estado guardado quando o plugin nao abriu
     std::atomic<bool> bypassed { false };
+    std::atomic<bool> faulted { false }; // Falha C++ em processBlock; exibida na interface, sem locks
     int bufferChannels = 2;
     int mainOutChannels = 2;
 
