@@ -669,10 +669,30 @@ void Engine::runInserts (Channel& c, int n,
         for (int i = 2; i < ch; ++i) work.clear (i, 0, n);
         juce::AudioBuffer<float> view (work.getArrayOfWritePointers(), ch, n);
         eventMidi.clear();
+        bool failed = false;
         {
             const juce::ScopedLock pl (p->getCallbackLock());
             if (p->isSuspended()) continue;
-            p->processBlock (view, eventMidi);
+            // Uma excecao C++ de plugin nao pode atravessar o callback da
+            // interface de audio. Falhas de processo (SEH/access violation),
+            // deadlocks e loops infinitos AINDA exigem DSP fora do processo.
+            try
+            {
+                p->processBlock (view, eventMidi);
+            }
+            catch (...)
+            {
+                failed = true;
+            }
+        }
+        if (failed)
+        {
+            // Silencia somente o bloco afetado; nos callbacks seguintes o
+            // insert com falha fica automaticamente em bypass.
+            s.bypassed.store (true, std::memory_order_relaxed);
+            pluginExceptions.fetch_add (1, std::memory_order_relaxed);
+            work.clear (0, n);
+            continue;
         }
         if (s.mainOutChannels == 1) work.copyFrom (1, 0, work, 0, 0, n);
     }
