@@ -537,6 +537,30 @@ static void testDiskStreaming()
                 auto mixed = run (e, 4096);
                 check (near (mixed.getSample (0, 1000), 0.125f * std::sin (10.0f), 0.0001f),
                        "stream: render da engine usa cache");
+
+                // A exportacao percorre o audio muito mais rapido que tempo real.
+                // Testa o final do arquivo, alem da primeira janela de cache.
+                auto exported = juce::File::createTempFile (".wav");
+                std::atomic<float> progress { 0.0f };
+                std::atomic<bool> cancel { false };
+                bool clipped = false;
+                juce::String exportError;
+                const bool exportedOk = e.exportMix (exported, 24, 0.0,
+                                                        progress, cancel, exportError, clipped);
+                check (exportedOk, "stream: bounce offline " + exportError);
+                if (exportedOk)
+                {
+                    juce::AudioFormatManager fm;
+                    registerAudioFormats (fm);
+                    const auto outputFile = loadAudioFile (fm, exported);
+                    check (outputFile.ok() && outputFile.original->getNumSamples() == 120000,
+                           "stream: bounce tem duracao integral");
+                    if (outputFile.ok() && outputFile.original->getNumSamples() > 100000)
+                        check (near (outputFile.original->getSample (0, 100000),
+                                     0.125f * std::sin (100000 * 0.01f), 0.0001f),
+                               "stream: fim do bounce sem silencio causado por cache");
+                }
+                exported.deleteFile();
             }
             else check (false, "stream: reabrir para teste integrado");
         }
