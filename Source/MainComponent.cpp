@@ -304,8 +304,9 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
         juce::PopupMenu menu;
         menu.addItem (1, "Gerenciar plugins VST3...");
         menu.addItem (2, "Escanear VST3 com processo isolado");
+        const juce::Component::SafePointer<MainComponent> self (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pluginsButton),
-                            [self = juce::Component::SafePointer<MainComponent> (this)] (int choice)
+                            [self] (int choice)
         {
             if (self == nullptr) return;
             if (choice == 1) self->showPluginManager (false);
