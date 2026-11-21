@@ -202,6 +202,7 @@ private:
     bool recoveryPromptShown = false;
     juce::int64 lastAutosaveMs = 0;
     juce::File openedRecoveryFile;
+    juce::String unsavedRecoveryId;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };
