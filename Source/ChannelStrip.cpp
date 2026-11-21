@@ -380,6 +380,19 @@ void ChannelStrip::refreshAutoButton()
 void ChannelStrip::tick()
 {
     meter.push (channel.peakL.exchange (0.0f), channel.peakR.exchange (0.0f));
+    if (channel.kind == ChannelKind::master)
+    {
+        auto& masterChannel = static_cast<Master&> (channel);
+        const auto peak = juce::jmax (masterChannel.truePeakL.exchange (0.0f),
+                                      masterChannel.truePeakR.exchange (0.0f));
+        const auto db = peak > 1.0e-9f
+                            ? juce::String (juce::Decibels::gainToDecibels (peak), 1)
+                            : juce::String ("-inf");
+        const auto label = "TP " + db + " dBTP";
+        if (infoLabel.getText() != label)
+            infoLabel.setText (label, juce::dontSendNotification);
+    }
+
 
     // a automacao move os controles
     if (! fader.isMouseButtonDown() && std::abs (fader.getValue() - channel.gainDb.load()) > 0.005)
