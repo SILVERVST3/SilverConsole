@@ -6,6 +6,7 @@
 #include "Project.h"
 #include "AutomationRecorder.h"
 #include <cstdio>
+#include <thread>
 
 using namespace sc;
 
@@ -521,6 +522,30 @@ static void testDiskStreaming()
             stream->copy (left, right, 0, 100000, 256);
             check (near (left[10], 0.125f * std::sin (100010 * 0.01f), 0.0001f),
                    "stream: reposicionamento com nova janela");
+
+            // Testa publicacao/aposentadoria de janelas enquanto a leitura
+            // do callback ocorre em paralelo. Falhas seriam UAF ou corrupcao.
+            std::atomic<bool> keepServicing { true };
+            std::thread io ([&]
+            {
+                while (keepServicing.load (std::memory_order_acquire))
+                {
+                    stream->service();
+                    std::this_thread::yield();
+                }
+            });
+            bool finiteRead = true;
+            for (int step = 0; step < 2000; ++step)
+            {
+                std::fill (std::begin (left), std::end (left), 0.0f);
+                std::fill (std::begin (right), std::end (right), 0.0f);
+                stream->copy (left, right, 0, step % 2 == 0 ? 1000 : 100000, 256);
+                for (int i : { 0, 100, 255 })
+                    finiteRead = finiteRead && std::isfinite (left[i]) && std::isfinite (right[i]);
+            }
+            keepServicing.store (false, std::memory_order_release);
+            io.join();
+            check (finiteRead, "stream: publicacao concorrente sem amostras invalidas");
 
             Engine e;
             e.prepare (48000.0, 256);
