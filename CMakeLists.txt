@@ -1,0 +1,103 @@
+cmake_minimum_required(VERSION 3.22)
+project(SilverConsole VERSION 0.1.0 LANGUAGES C CXX)
+
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+# Executavel independente no Windows (sem instalar o VC++ Runtime).
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
+option(SILVERCONSOLE_TESTS "Compila os testes do motor e o plugin VST3 de teste" ON)
+
+include(FetchContent)
+# JUCE 8.0.6 fixado (mesmo commit usado no SilverMix). Atualizar somente com novo teste.
+FetchContent_Declare(JUCE
+    URL https://github.com/juce-framework/JUCE/archive/51a8a6d7aeae7326956d747737ccf1575e61e209.tar.gz
+    URL_HASH SHA256=20b740351cc030086951d87614bc08b42d072f1e4db68db1ef1d988e66dbbdbe
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+FetchContent_MakeAvailable(JUCE)
+
+set(SC_COMMON_DEFS
+    JUCE_WEB_BROWSER=0
+    JUCE_USE_CURL=0
+    JUCE_USE_FLAC=1
+    JUCE_USE_OGGVORBIS=1
+    JUCE_USE_MP3AUDIOFORMAT=1
+    JUCE_PLUGINHOST_VST3=1
+    JUCE_PLUGINHOST_VST=0
+    JUCE_PLUGINHOST_LADSPA=0
+    JUCE_PLUGINHOST_LV2=0
+    JUCE_PLUGINHOST_AU=0
+    JUCE_DISPLAY_SPLASH_SCREEN=0)
+
+set(SC_ENGINE_SOURCES
+    Source/Engine.cpp Source/Engine.h
+    Source/AudioLoader.cpp Source/AudioLoader.h
+    Source/Project.cpp Source/Project.h)
+
+#------------------------------------------------------------------------------
+juce_add_gui_app(SilverConsole
+    PRODUCT_NAME "SilverConsole"
+    COMPANY_NAME "Silver Audio"
+    BUNDLE_ID "audio.silver.silverconsole"
+    VERSION ${PROJECT_VERSION}
+    ICON_BIG "${CMAKE_CURRENT_SOURCE_DIR}/Resources/icon.png")
+juce_generate_juce_header(SilverConsole)
+target_sources(SilverConsole PRIVATE
+    ${SC_ENGINE_SOURCES}
+    Source/Main.cpp
+    Source/MainComponent.cpp Source/MainComponent.h
+    Source/ChannelStrip.cpp Source/ChannelStrip.h
+    Source/SilverLookAndFeel.h
+    Source/PluginHost.h
+    Source/PluginWindow.h)
+target_compile_definitions(SilverConsole PRIVATE ${SC_COMMON_DEFS}
+    JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SilverConsole,JUCE_PRODUCT_NAME>"
+    JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SilverConsole,JUCE_VERSION>")
+target_link_libraries(SilverConsole PRIVATE
+    juce::juce_audio_utils
+    juce::juce_audio_processors
+    juce::juce_recommended_config_flags
+    juce::juce_recommended_warning_flags)
+if(MSVC)
+    target_compile_options(SilverConsole PRIVATE /utf-8)
+endif()
+
+#------------------------------------------------------------------------------
+if(SILVERCONSOLE_TESTS)
+    include(CTest)
+
+    # Plugin VST3 minimo, usado so para testar a hospedagem (ganho + latencia).
+    juce_add_plugin(SCTestPlugin
+        PRODUCT_NAME "SC Test Delay"
+        COMPANY_NAME "Silver Audio"
+        BUNDLE_ID "audio.silver.sctestplugin"
+        PLUGIN_MANUFACTURER_CODE Slvr
+        PLUGIN_CODE Sctd
+        FORMATS VST3
+        IS_SYNTH FALSE
+        NEEDS_MIDI_INPUT FALSE
+        COPY_PLUGIN_AFTER_BUILD FALSE)
+    juce_generate_juce_header(SCTestPlugin)
+    target_sources(SCTestPlugin PRIVATE Tests/TestPlugin.cpp)
+    target_compile_definitions(SCTestPlugin PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0
+        JUCE_VST3_CAN_REPLACE_VST2=0 JUCE_DISPLAY_SPLASH_SCREEN=0)
+    target_link_libraries(SCTestPlugin PRIVATE juce::juce_audio_utils juce::juce_recommended_config_flags)
+    if(MSVC)
+        target_compile_options(SCTestPlugin PRIVATE /utf-8)
+    endif()
+
+    juce_add_console_app(SilverConsoleTests PRODUCT_NAME "SilverConsoleTests")
+    juce_generate_juce_header(SilverConsoleTests)
+    target_sources(SilverConsoleTests PRIVATE Tests/EngineTests.cpp ${SC_ENGINE_SOURCES})
+    target_include_directories(SilverConsoleTests PRIVATE Source)
+    target_compile_definitions(SilverConsoleTests PRIVATE ${SC_COMMON_DEFS})
+    target_link_libraries(SilverConsoleTests PRIVATE
+        juce::juce_audio_utils juce::juce_audio_processors juce::juce_recommended_config_flags)
+    if(MSVC)
+        target_compile_options(SilverConsoleTests PRIVATE /utf-8)
+    endif()
+    add_dependencies(SilverConsoleTests SCTestPlugin_VST3)
+
+    add_test(NAME Engine
+        COMMAND SilverConsoleTests "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>")
+endif()
