@@ -896,6 +896,11 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
     {
         if (cancel.load()) { restore(); writer.reset(); error = "Exportacao cancelada."; return false; }
         const int m = (int) juce::jmin ((juce::int64) bs, toProduce - produced);
+        // O bounce corre mais rapido que o playback. Prefetch sincrono fora da
+        // thread realtime impede silencio por cache vazio em exports longos.
+        for (auto& t : tracks)
+            if (t->diskStream != nullptr && t->playbackRate == sr)
+                t->diskStream->prefetchBlocking (pos, m);
         pos = render (buf.getWritePointer (0), buf.getWritePointer (1), m, pos, true, false);
         const int skip = produced < latency ? (int) juce::jmin ((juce::int64) m, (juce::int64) latency - produced) : 0;
         const int w = m - skip;
