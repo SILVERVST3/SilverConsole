@@ -234,6 +234,9 @@ void Engine::prepare (double newRate, int newBlock)
     deviceBuf.setSize (2, blockSize);
     for (auto& b : busIn) b.setSize (2, blockSize);
     midi.ensureSize (4096);
+    truePeakMeter.reset();
+    master.truePeakL.store (0.0f, std::memory_order_relaxed);
+    master.truePeakR.store (0.0f, std::memory_order_relaxed);
     forEachChannel ([this] (Channel& c) { prepareChannel (c); });
     directDelay.clear();
     updateLatency();
@@ -876,6 +879,10 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     storePeak (master.peakL, ml);
     storePeak (master.peakR, mr);
     if (ml > 1.0f || mr > 1.0f) master.clipped = true;
+
+    const auto tp = truePeakMeter.process (L, R, n);
+    storePeak (master.truePeakL, tp.left);
+    storePeak (master.truePeakR, tp.right);
 
     juce::FloatVectorOperations::copy (outL, L, n);
     juce::FloatVectorOperations::copy (outR, R, n);
