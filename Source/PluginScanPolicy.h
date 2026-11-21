@@ -25,7 +25,10 @@ struct PluginScanPolicy
     static bool shouldScan (const juce::StringArray& failed,
                             const juce::String& candidate, bool retryFailed)
     {
-        return retryFailed || ! failed.contains (candidate, true);
+        const bool quarantined = failed.contains (candidate, true);
+        // O comando "Reavaliar" examina SOMENTE os candidatos previamente
+        // falhos. O escaneamento normal nunca os carrega sem consentimento.
+        return retryFailed ? quarantined : ! quarantined;
     }
 
     static void reportResult (juce::StringArray& failed,
