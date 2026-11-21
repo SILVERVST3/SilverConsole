@@ -636,6 +636,51 @@ static void testMulticoreOfflineMix()
     out.deleteFile();
 }
 
+// LUFS momentaneo: K weighting, estabilidade e diferenca de 20 dB
+// para uma reducao de amplitude por fator 10. Nao testa LUFS integrado.
+static void testMomentaryLoudness()
+{
+    constexpr int n = 48000;
+    juce::AudioBuffer<float> stereo (2, n);
+    auto generate = [&] (float amp, double sr)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const auto v = amp * std::sin ((double) i * 2.0
+                                * juce::MathConstants<double>::pi * 1000.0 / sr);
+            stereo.setSample (0, i, (float) v);
+            stereo.setSample (1, i, (float) v);
+        }
+    };
+    MomentaryLoudness meter;
+    meter.prepare (48000.0);
+    generate (0.1f, 48000.0);
+    for (int i = 0; i < n; i += 256)
+        meter.process (stereo.getReadPointer (0, i),
+                       stereo.getReadPointer (1, i), juce::jmin (256, n - i));
+    const auto loud = meter.getLufsM();
+    check (std::isfinite (loud) && loud > -30.0f && loud < -15.0f,
+           "lufs-m: valor plausivel de senoide 1 kHz em 48k");
+
+    meter.reset();
+    generate (0.01f, 48000.0);
+    meter.process (stereo.getReadPointer (0), stereo.getReadPointer (1), n);
+    check (near (loud - meter.getLufsM(), 20.0f, 0.3f),
+           "lufs-m: diferenca correta de 20 dB");
+
+    meter.reset();
+    stereo.clear();
+    meter.process (stereo.getReadPointer (0), stereo.getReadPointer (1), n);
+    check (meter.getLufsM() <= -110.0f,
+           "lufs-m: silencio apos reset");
+
+    meter.prepare (96000.0);
+    generate (0.1f, 96000.0);
+    meter.process (stereo.getReadPointer (0), stereo.getReadPointer (1), n);
+    check (std::isfinite (meter.getLufsM()) && meter.getLufsM() > -40.0f,
+           "lufs-m: filtro em taxa de amostragem alternativa");
+}
+
 // True Peak: o pico entre amostras de 12 kHz nao coincide com nenhum
 // sample na fase de 45 graus. O sinc 4x deve identifica-lo sem tocar audio.
 static void testTruePeakMeter()
@@ -741,6 +786,7 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
     testTruePeakMeter();
+    testMomentaryLoudness();
     test128TrackStress();
     testMulticoreOfflineMix();
     testDiskStreaming();
