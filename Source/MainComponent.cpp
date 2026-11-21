@@ -326,6 +326,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
 
     setSize (1440, 900);
     updateTitle();
+    unsavedRecoveryId = juce::Uuid().toString();
     lastAutosaveMs = juce::Time::currentTimeMillis();
     startTimerHz (30);
 
@@ -470,9 +471,13 @@ void MainComponent::timerCallback()
     engine.pollLatencyChanges();
 
     // Recuperacao antes de iniciar um novo trabalho. Nao interfere no audio.
-    if (! recoveryPromptShown && tickCount > 35 && ! dirty
-        && juce::ModalComponentManager::getInstance()->getNumModalComponents() == 0)
-        offerRecoveryOnStartup();
+    if (! recoveryPromptShown && tickCount > 35)
+    {
+        // Se o usuario ja comecou a editar, nao interrompa com alerta antigo.
+        if (dirty) recoveryPromptShown = true;
+        else if (juce::ModalComponentManager::getInstance()->getNumModalComponents() == 0)
+            offerRecoveryOnStartup();
+    }
 
     // Snapshot somente quando parado e sem tarefas/modal abertos. Nao altera
     // dirty nem currentFile e jamais substitui o .sconsole principal.
@@ -645,7 +650,7 @@ juce::File MainComponent::recoveryDirectory() const
 juce::File MainComponent::recoveryFileFor (const juce::File& project) const
 {
     const juce::String key = project == juce::File()
-        ? juce::String ("untitled")
+        ? ("untitled-" + unsavedRecoveryId)
         : juce::String::toHexString (project.getFullPathName().hashCode64());
     return recoveryDirectory().getChildFile ("autosave-" + key + juce::String (kProjectExtension));
 }
@@ -1292,6 +1297,7 @@ void MainComponent::newProject()
         resetSession();
         openedRecoveryFile = juce::File();
         currentFile = juce::File();
+        unsavedRecoveryId = juce::Uuid().toString();
         dirty = false;
         rebuildStrips();
         updateTitle();
