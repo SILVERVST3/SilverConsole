@@ -694,6 +694,7 @@ void Engine::runInserts (Channel& c, int n,
             // insert com falha fica automaticamente em bypass.
             s.faulted.store (true, std::memory_order_relaxed);
             s.bypassed.store (true, std::memory_order_relaxed);
+            latencyDirty.store (true, std::memory_order_relaxed); // PDC refeito pela thread de controle
             pluginExceptions.fetch_add (1, std::memory_order_relaxed);
             work.clear (0, n);
             continue;
