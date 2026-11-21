@@ -90,7 +90,7 @@ Em **Áudio**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Wi
 - A automação é aplicada a cada bloco de áudio (alguns milissegundos), com suavização no volume e no pan. Não tem precisão de amostra.
 - **Streaming em disco experimental (Etapa 2):** arquivos com 32 MiB ou mais, na mesma taxa do motor, usam cache limitado de 65.536 amostras por faixa e uma thread de pré-leitura compartilhada; a forma de onda usa um resumo compacto. Arquivos menores e/ou em outra taxa continuam na RAM com reamostragem sinc. Se a taxa do dispositivo mudar, o fallback atual pode carregar o arquivo completo na RAM. A exportação offline lê os blocos necessários antes de renderizar.
 - Na reprodução em streaming, saltos bruscos de cursor e discos lentos podem produzir silêncios momentâneos se o cache não estiver pronto. O streaming ainda precisa de testes prolongados; não é considerado pronto para produção.
-- O processamento roda em um núcleo da CPU. Sessões muito pesadas podem precisar de um buffer maior.
+- **Processamento multicore parcial (Etapa 2):** o bounce offline distribui leitura, inserts VST3 e PDC de faixas independentes por ate tres workers adicionais, com somatoria e buses na mesma ordem. A reproducao **em tempo real** ainda e sequencial ate concluir testes de prazo de buffer e seguranca. Sessões muito pesadas podem precisar de um buffer maior.
 - O escaneamento de plugins roda dentro do programa. Se um plugin derrubar o programa no scan, abra de novo e escaneie outra vez; o plugin problemático é pulado.
 
 ## Compilar no PC (opcional)
