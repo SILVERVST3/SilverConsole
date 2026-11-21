@@ -473,10 +473,41 @@ static void testVst3Hosting (const juce::File& pluginFile)
     check (editorTest != nullptr && e.getTotalLatency() == 0, "remover VST3");
 }
 
+// Regressao de escala: 128 faixas ativas, render repetido e soma finita.
+// Nao mede prazo realtime; mede estabilidade e ausencia de NaN/Inf.
+static void test128TrackStress()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto tone = makeBuffer (2, 4096, [] (int c, int i)
+    {
+        return 0.001f * std::sin (0.017f * (float) i + (float) c * 0.2f);
+    });
+    for (int i = 0; i < kMaxTracks; ++i)
+        addTrack (e, tone, "stress " + juce::String (i + 1));
+    check ((int) e.tracks.size() == kMaxTracks, "stress: 128 faixas criadas");
+    auto output = run (e, 4096);
+    bool finite = true, nonzero = false;
+    for (int c = 0; c < output.getNumChannels(); ++c)
+        for (int i = 0; i < output.getNumSamples(); ++i)
+        {
+            const float v = output.getSample (c, i);
+            finite = finite && std::isfinite (v);
+            nonzero = nonzero || std::abs (v) > 1.0e-7f;
+        }
+    check (finite && nonzero, "stress: mix de 128 faixas finita e nao silenciosa");
+    const auto stats = e.getRealtimeStats();
+    check (stats.lockContentions == 0 && stats.renderSuspensions == 0,
+           "stress: contadores realtime inicializados");
+    e.resetRealtimeStats();
+    check (e.getRealtimeStats().processedCallbacks == 0, "stress: reset de diagnostico");
+}
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    test128TrackStress();
     testStereoBalanceMuteSolo();
     testBusesAndSends();
     testLatencyCompensation();
