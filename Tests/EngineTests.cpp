@@ -130,6 +130,9 @@ static void testPluginExceptionFallback()
     check (t->inserts[0].bypassed.load() && t->inserts[0].faulted.load()
            && e.getRealtimeStats().pluginExceptions == 1,
            "plugin exception: insert marcado ERR, em bypass e falha contada");
+    e.pollLatencyChanges();
+    check (e.getTotalLatency() == 0,
+           "plugin exception: PDC atualizado apos bypass automatico");
 
     // O callback posterior deve preservar o audio original com insert em bypass.
     mixed = run (e, 1024);
