@@ -741,8 +741,21 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
     for (int c = 0; c < numOut; ++c)
         if (out[c] != nullptr) juce::FloatVectorOperations::clear (out[c], n);
 
+    // Nunca bloquear a thread de audio. Contadores ajudam a localizar dropout
+    // por edicao concorrente e suspensao durante exportacao offline.
+    if (n <= 0 || numOut <= 0 || out == nullptr) return;
     const juce::ScopedTryLock sl (lock);
-    if (! sl.isLocked() || rendering.load() || numOut <= 0) return;
+    if (! sl.isLocked())
+    {
+        lockContentions.fetch_add (1, std::memory_order_relaxed);
+        return;
+    }
+    if (rendering.load (std::memory_order_relaxed))
+    {
+        renderSuspensions.fetch_add (1, std::memory_order_relaxed);
+        return;
+    }
+    processedCallbacks.fetch_add (1, std::memory_order_relaxed);
 
     const auto startPos = position.load();
     const bool play = playing.load();
@@ -754,15 +767,15 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
         auto* dl = deviceBuf.getWritePointer (0);
         auto* dr = deviceBuf.getWritePointer (1);
         pos = render (dl, dr, m, pos, play, true);
-        if (numOut == 1 || out[1] == nullptr)
+        if (numOut == 1 || out[1] == nullptr || out[0] == nullptr)
         {
             if (out[0] != nullptr)
                 for (int i = 0; i < m; ++i) out[0][done + i] = 0.5f * (dl[i] + dr[i]);
         }
         else
         {
-            juce::FloatVectorOperations::copyWithMultiply (out[0] + done, dl, 1.0f, m);
-            juce::FloatVectorOperations::copyWithMultiply (out[1] + done, dr, 1.0f, m);
+            juce::FloatVectorOperations::copy (out[0] + done, dl, m);
+            juce::FloatVectorOperations::copy (out[1] + done, dr, m);
         }
         done += m;
     }
