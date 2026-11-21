@@ -47,7 +47,7 @@ struct PluginScanSupervisor
             }
             const int waitMs = juce::jmin (100, timeoutMs - (int) elapsed);
             if (child.waitForProcessToFinish (waitMs))
-                return { Status::finished, child.getExitCode() };
+                return { Status::finished, static_cast<int> (child.getExitCode()) };
         }
     }
 };
