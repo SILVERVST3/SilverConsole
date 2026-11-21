@@ -549,7 +549,8 @@ void MainComponent::timerCallback()
               << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
             const auto rt = engine.getRealtimeStats();
             s << "  |  XRUN " << juce::String (rt.callbackOverruns)
-              << "  |  LOCK " << juce::String (rt.lockContentions);
+              << "  |  LOCK " << juce::String (rt.lockContentions)
+              << "  |  PLUG ERR " << juce::String (rt.pluginExceptions);
         }
         else s = "Sem dispositivo de audio - clique em Audio";
         if (s != statusText) { statusText = s; repaint (getWidth() - 470, kTopBarH, 470, kToolbarH); }
