@@ -129,6 +129,10 @@ struct Track : Channel
     double originalRate = 0.0;
     std::shared_ptr<const juce::AudioBuffer<float>> playback; // na taxa do motor
     std::shared_ptr<StreamingAudio> diskStream; // prefetch em disco, alternativo ao playback RAM
+    // Buffers exclusivos da faixa: inserts/PDC independentes por canal.
+    // Prealocados fora do callback para viabilizar processamento paralelo.
+    juce::AudioBuffer<float> processingBuffer;
+    juce::MidiBuffer processingMidi;
     double playbackRate = 0.0;
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
@@ -269,7 +273,7 @@ private:
     void prepareChannel (Channel&);
     void prepareSlot (InsertSlot&);
     int chainLatencyOf (const Channel&) const;
-    void runInserts (Channel&, int n);
+    void runInserts (Channel&, int n, juce::AudioBuffer<float>&, juce::MidiBuffer&);
     void forEachChannel (const std::function<void (Channel&)>&);
     template <typename Fn> void forEachChannelNoAlloc (Fn&& fn)
     {
