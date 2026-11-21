@@ -38,11 +38,13 @@ namespace
 Engine::Engine()
 {
     master.colour = juce::Colour (0xffe8edf2);
+    streamingWorker = std::make_unique<StreamWorker>();
     prepare (48000.0, 512);
 }
 
 Engine::~Engine()
 {
+    streamingWorker.reset(); // termina I/O antes dos objetos Track
     forEachChannel ([this] (Channel& c)
     {
         for (auto& s : c.inserts)
@@ -307,12 +309,29 @@ void Engine::setTrackAudio (Track& t, std::shared_ptr<const juce::AudioBuffer<fl
 {
     {
         const juce::ScopedLock sl (lock);
+        t.diskStream.reset();
         t.original = std::move (original);
         t.originalRate = rate;
         t.playback = std::move (pb);
         t.playbackRate = pbRate;
         t.sourceChannels = t.original != nullptr ? t.original->getNumChannels() : 0;
     }
+    updateLength();
+}
+
+void Engine::setTrackStream (Track& t, std::shared_ptr<StreamingAudio> stream)
+{
+    if (stream == nullptr) return;
+    {
+        const juce::ScopedLock sl (lock);
+        t.original.reset();
+        t.playback.reset();
+        t.originalRate = stream->getRate();
+        t.playbackRate = stream->getRate();
+        t.sourceChannels = stream->getChannels();
+        t.diskStream = stream;
+    }
+    streamingWorker->add (stream); // fora do lock do callback
     updateLength();
 }
 
@@ -515,7 +534,9 @@ void Engine::updateLength()
         const juce::ScopedLock sl (lock);
         for (auto& t : tracks)
         {
-            if (t->playback != nullptr && t->playbackRate == sr)
+            if (t->diskStream != nullptr && t->playbackRate == sr)
+                len = juce::jmax (len, t->diskStream->getLength());
+            else if (t->playback != nullptr && t->playbackRate == sr)
                 len = juce::jmax (len, (juce::int64) t->playback->getNumSamples());
             else if (t->original != nullptr && t->originalRate > 0)
                 len = juce::jmax (len, (juce::int64) std::ceil (t->original->getNumSamples() * sr / t->originalRate));
@@ -604,7 +625,16 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         juce::FloatVectorOperations::clear (R, n);
 
         const auto* buf = t.playback.get();
-        if (play && buf != nullptr && t.playbackRate == sr)
+        if (play && t.diskStream != nullptr && t.playbackRate == sr)
+        {
+            for (int i = 0; i < numSegs; ++i)
+            {
+                const auto& sg = segs[i];
+                if (sg.src >= 0)
+                    t.diskStream->copy (L, R, sg.dst, sg.src, sg.len);
+            }
+        }
+        else if (play && buf != nullptr && t.playbackRate == sr)
         {
             const auto len = (juce::int64) buf->getNumSamples();
             const bool mono = buf->getNumChannels() == 1;
