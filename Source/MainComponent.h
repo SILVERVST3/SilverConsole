@@ -120,6 +120,12 @@ private:
     void confirmDiscard (std::function<void()> proceed);
     void resetSession();
     void updateTitle();
+    // Recuperacao: snapshots XML separados, sem sobrescrever o projeto normal.
+    juce::File recoveryDirectory() const;
+    juce::File recoveryFileFor (const juce::File&) const;
+    void writeRecoverySnapshot();
+    void offerRecoveryOnStartup();
+
 
     // audio
     void importDialog();
@@ -193,6 +199,10 @@ private:
     juce::String statusText;
     int tickCount = 0;
     bool scanPromptShown = false;
+    bool recoveryPromptShown = false;
+    juce::int64 lastAutosaveMs = 0;
+    juce::File openedRecoveryFile;
+    juce::String unsavedRecoveryId;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };

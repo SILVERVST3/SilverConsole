@@ -636,6 +636,108 @@ static void testMulticoreOfflineMix()
     out.deleteFile();
 }
 
+// LUFS momentaneo: K weighting, estabilidade e diferenca de 20 dB
+// para uma reducao de amplitude por fator 10. Nao testa LUFS integrado.
+static void testMomentaryLoudness()
+{
+    constexpr int n = 48000;
+    juce::AudioBuffer<float> stereo (2, n);
+    auto generate = [&] (float amp, double sr)
+    {
+        for (int i = 0; i < n; ++i)
+        {
+            const auto v = amp * std::sin ((double) i * 2.0
+                                * juce::MathConstants<double>::pi * 1000.0 / sr);
+            stereo.setSample (0, i, (float) v);
+            stereo.setSample (1, i, (float) v);
+        }
+    };
+    MomentaryLoudness meter;
+    meter.prepare (48000.0);
+    generate (0.1f, 48000.0);
+    for (int i = 0; i < n; i += 256)
+        meter.process (stereo.getReadPointer (0, i),
+                       stereo.getReadPointer (1, i), juce::jmin (256, n - i));
+    const auto loud = meter.getLufsM();
+    check (std::isfinite (loud) && loud > -30.0f && loud < -15.0f,
+           "lufs-m: valor plausivel de senoide 1 kHz em 48k");
+
+    meter.reset();
+    generate (0.01f, 48000.0);
+    meter.process (stereo.getReadPointer (0), stereo.getReadPointer (1), n);
+    check (near (loud - meter.getLufsM(), 20.0f, 0.3f),
+           "lufs-m: diferenca correta de 20 dB");
+
+    meter.reset();
+    stereo.clear();
+    meter.process (stereo.getReadPointer (0), stereo.getReadPointer (1), n);
+    check (meter.getLufsM() <= -110.0f,
+           "lufs-m: silencio apos reset");
+
+    meter.prepare (96000.0);
+    generate (0.1f, 96000.0);
+    meter.process (stereo.getReadPointer (0), stereo.getReadPointer (1), n);
+    check (std::isfinite (meter.getLufsM()) && meter.getLufsM() > -40.0f,
+           "lufs-m: filtro em taxa de amostragem alternativa");
+}
+
+// True Peak: o pico entre amostras de 12 kHz nao coincide com nenhum
+// sample na fase de 45 graus. O sinc 4x deve identifica-lo sem tocar audio.
+static void testTruePeakMeter()
+{
+    constexpr int len = 2048;
+    juce::AudioBuffer<float> tone (2, len);
+    float samplePeak = 0.0f;
+    for (int i = 0; i < len; ++i)
+    {
+        const float v = std::sin ((float) i * juce::MathConstants<float>::halfPi
+                                  + juce::MathConstants<float>::pi * 0.25f);
+        tone.setSample (0, i, v);
+        tone.setSample (1, i, v * 0.5f);
+        samplePeak = juce::jmax (samplePeak, std::abs (v));
+    }
+
+    TruePeak4x full;
+    auto tp = full.process (tone.getReadPointer (0), tone.getReadPointer (1), len);
+    check (tp.left > samplePeak + 0.12f && tp.left > 0.95f && tp.left < 1.06f,
+           "true peak: 4x detecta pico entre amostras");
+    check (near (tp.right, tp.left * 0.5f, 0.001f),
+           "true peak: medicao estereo independente");
+
+    TruePeak4x chunked;
+    TruePeak4x::Peaks accumulated;
+    for (int p = 0; p < len; p += 64)
+    {
+        const auto part = chunked.process (tone.getReadPointer (0, p),
+                                           tone.getReadPointer (1, p), 64);
+        accumulated.left = juce::jmax (accumulated.left, part.left);
+        accumulated.right = juce::jmax (accumulated.right, part.right);
+    }
+    check (near (tp.left, accumulated.left, 1.0e-5f)
+           && near (tp.right, accumulated.right, 1.0e-5f),
+           "true peak: estado FIR preservado entre callbacks");
+
+    full.reset();
+    const float silence[256] {};
+    const auto silentPeak = full.process (silence, silence, 256);
+    check (silentPeak.left == 0.0f && silentPeak.right == 0.0f,
+           "true peak: reset nao carrega amostras anteriores");
+
+    Engine e;
+    e.prepare (48000, 256);
+    auto* track = addTrack (e, makeBuffer (2, 2048, [] (int c, int i)
+    {
+        return (c == 0 ? 0.5f : 0.25f) * std::sin (
+            (float) i * juce::MathConstants<float>::halfPi
+            + juce::MathConstants<float>::pi * 0.25f);
+    }), "meter source");
+    (void) track;
+    run (e, 2048);
+    check (e.master.truePeakL.load() > e.master.truePeakR.load()
+           && e.master.truePeakL.load() > 0.0f,
+           "true peak: medidor recebe o sinal final do master");
+}
+
 static void test128TrackStress()
 {
     Engine e;
@@ -683,6 +785,8 @@ int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    testTruePeakMeter();
+    testMomentaryLoudness();
     test128TrackStress();
     testMulticoreOfflineMix();
     testDiskStreaming();

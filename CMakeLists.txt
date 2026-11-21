@@ -7,6 +7,23 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 option(SILVERCONSOLE_TESTS "Compila os testes do motor e o plugin VST3 de teste" ON)
+# Opt-in: JUCE 8.0.6 usa o SDK ASIO externo. Nao distribuir o SDK
+# com o repositorio e revisar seus termos antes de redistribuir binarios.
+option(SILVERCONSOLE_ENABLE_ASIO "Habilita ASIO no Windows usando SDK externo" OFF)
+set(SILVERCONSOLE_ASIO_SDK_DIR "" CACHE PATH "Diretorio raiz do Steinberg ASIO SDK (pastas common/ e host/)")
+
+if(SILVERCONSOLE_ENABLE_ASIO)
+    if(NOT WIN32)
+        message(FATAL_ERROR "ASIO e suportado somente no Windows neste projeto.")
+    endif()
+    if(NOT EXISTS "${SILVERCONSOLE_ASIO_SDK_DIR}/common/iasiodrv.h"
+       OR NOT EXISTS "${SILVERCONSOLE_ASIO_SDK_DIR}/host/asiodrivers.h")
+        message(FATAL_ERROR
+            "ASIO SDK nao encontrado. Defina -DSILVERCONSOLE_ASIO_SDK_DIR=... "
+            "para a raiz que contem common/iasiodrv.h e host/asiodrivers.h")
+    endif()
+endif()
+
 
 include(FetchContent)
 # JUCE 8.0.6 fixado (mesmo commit usado no SilverMix). Atualizar somente com novo teste.
@@ -30,7 +47,7 @@ set(SC_COMMON_DEFS
     JUCE_DISPLAY_SPLASH_SCREEN=0)
 
 set(SC_ENGINE_SOURCES
-    Source/Engine.cpp Source/Engine.h
+    Source/Engine.cpp Source/Engine.h Source/Metering.h
     Source/AudioLoader.cpp Source/AudioLoader.h
     Source/StreamingAudio.cpp Source/StreamingAudio.h
     Source/Project.cpp Source/Project.h
@@ -57,6 +74,13 @@ target_sources(SilverConsole PRIVATE
 target_compile_definitions(SilverConsole PRIVATE ${SC_COMMON_DEFS}
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SilverConsole,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:SilverConsole,JUCE_VERSION>")
+if(SILVERCONSOLE_ENABLE_ASIO)
+    target_compile_definitions(SilverConsole PRIVATE JUCE_ASIO=1)
+    target_include_directories(SilverConsole PRIVATE
+        "${SILVERCONSOLE_ASIO_SDK_DIR}/common"
+        "${SILVERCONSOLE_ASIO_SDK_DIR}/host")
+endif()
+
 target_link_libraries(SilverConsole PRIVATE
     juce::juce_audio_utils
     juce::juce_audio_processors

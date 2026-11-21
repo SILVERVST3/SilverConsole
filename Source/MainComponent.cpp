@@ -326,6 +326,8 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
 
     setSize (1440, 900);
     updateTitle();
+    unsavedRecoveryId = juce::Uuid().toString();
+    lastAutosaveMs = juce::Time::currentTimeMillis();
     startTimerHz (30);
 
 }
@@ -467,6 +469,28 @@ void MainComponent::timerCallback()
     }
 
     engine.pollLatencyChanges();
+
+    // Recuperacao antes de iniciar um novo trabalho. Nao interfere no audio.
+    if (! recoveryPromptShown && tickCount > 35)
+    {
+        // Se o usuario ja comecou a editar, nao interrompa com alerta antigo.
+        if (dirty) recoveryPromptShown = true;
+        else if (juce::ModalComponentManager::getInstance()->getNumModalComponents() == 0)
+            offerRecoveryOnStartup();
+    }
+
+    // Snapshot somente quando parado e sem tarefas/modal abertos. Nao altera
+    // dirty nem currentFile e jamais substitui o .sconsole principal.
+    if (dirty && ! engine.playing.load() && recoveryPromptShown
+        && juce::ModalComponentManager::getInstance()->getNumModalComponents() == 0)
+    {
+        const auto now = juce::Time::currentTimeMillis();
+        if (now - lastAutosaveMs >= 120000)
+        {
+            lastAutosaveMs = now;
+            writeRecoverySnapshot();
+        }
+    }
 
     // Primeiro uso: oferece escanear os plugins (sem sobrepor outros avisos).
     if (! scanPromptShown && tickCount > 15 && pluginHost.known.getNumTypes() == 0
@@ -615,6 +639,70 @@ void MainComponent::lanesChanged()
 void MainComponent::markDirty()
 {
     if (! dirty) { dirty = true; updateTitle(); }
+}
+
+juce::File MainComponent::recoveryDirectory() const
+{
+    return juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+        .getChildFile ("SilverConsole").getChildFile ("Recovery");
+}
+
+juce::File MainComponent::recoveryFileFor (const juce::File& project) const
+{
+    const juce::String key = project == juce::File()
+        ? ("untitled-" + unsavedRecoveryId)
+        : juce::String::toHexString (project.getFullPathName().hashCode64());
+    return recoveryDirectory().getChildFile ("autosave-" + key + juce::String (kProjectExtension));
+}
+
+void MainComponent::writeRecoverySnapshot()
+{
+    auto folder = recoveryDirectory();
+    if (! folder.isDirectory() && ! folder.createDirectory())
+    {
+        juce::Logger::writeToLog ("SilverConsole: nao foi possivel criar pasta Recovery");
+        return;
+    }
+    // Plugins sao capturados enquanto transporte esta parado; o lock evita
+    // concorrencia com a engine. Escrita atomica via writeProject/TemporaryFile.
+    ProjectData snapshot;
+    {
+        const juce::ScopedLock guard (engine.lock);
+        snapshot = captureProject (engine);
+    }
+    juce::String error;
+    if (! writeProject (snapshot, recoveryFileFor (currentFile), error))
+        juce::Logger::writeToLog ("SilverConsole autosave: " + error);
+}
+
+void MainComponent::offerRecoveryOnStartup()
+{
+    recoveryPromptShown = true;
+    const auto folder = recoveryDirectory();
+    if (! folder.isDirectory()) return;
+    juce::Array<juce::File> snapshots;
+    folder.findChildFiles (snapshots, juce::File::findFiles, false, "*.sconsole");
+    if (snapshots.isEmpty()) return;
+
+    juce::File latest;
+    for (const auto& candidate : snapshots)
+        if (latest == juce::File() || candidate.getLastModificationTime() > latest.getLastModificationTime())
+            latest = candidate;
+
+    juce::AlertWindow::showAsync (
+        juce::MessageBoxOptions()
+            .withIconType (juce::MessageBoxIconType::QuestionIcon)
+            .withTitle ("Recuperacao SilverConsole")
+            .withMessage ("Foi encontrada uma copia de recuperacao de projeto.\n"
+                          "Deseja abri-la? Depois use Salvar como para criar um projeto normal.\n"
+                          + latest.getFileName())
+            .withButton ("Recuperar")
+            .withButton ("Depois"),
+        [safe = juce::Component::SafePointer<MainComponent> (this), latest] (int selection)
+        {
+            if (safe != nullptr && selection == 1)
+                safe->openFile (latest);
+        });
 }
 
 void MainComponent::updateTitle()
@@ -1207,7 +1295,9 @@ void MainComponent::newProject()
     confirmDiscard ([this]
     {
         resetSession();
+        openedRecoveryFile = juce::File();
         currentFile = juce::File();
+        unsavedRecoveryId = juce::Uuid().toString();
         dirty = false;
         rebuildStrips();
         updateTitle();
@@ -1295,8 +1385,20 @@ void MainComponent::openFile (const juce::File& file)
         engine.loopOn = data->loopOn;
         juce::MouseCursor::hideWaitCursor();
 
-        currentFile = file;
-        dirty = false;
+        // Snapshots sao recuperados como projetos nao salvos, evitando que
+        // Ctrl+S sobrescreva a unica copia de recuperacao.
+        if (file.getParentDirectory() == recoveryDirectory())
+        {
+            openedRecoveryFile = file;
+            currentFile = juce::File();
+            dirty = true;
+        }
+        else
+        {
+            openedRecoveryFile = juce::File();
+            currentFile = file;
+            dirty = false;
+        }
         rebuildStrips();
         updateTitle();
         if (! problems.isEmpty())
@@ -1309,8 +1411,17 @@ bool MainComponent::writeTo (const juce::File& f)
 {
     juce::String err;
     if (! writeProject (captureProject (engine), f, err)) { alert ("Salvar", err); return false; }
+    // Limpar apenas apos confirmar que a gravacao normal terminou bem.
+    const auto oldSnapshot = recoveryFileFor (currentFile);
+    const auto newSnapshot = recoveryFileFor (f);
+    if (oldSnapshot != f) oldSnapshot.deleteFile();
+    if (newSnapshot != f) newSnapshot.deleteFile();
+    if (openedRecoveryFile != juce::File() && openedRecoveryFile != f)
+        openedRecoveryFile.deleteFile();
+    openedRecoveryFile = juce::File();
     currentFile = f;
     dirty = false;
+    lastAutosaveMs = juce::Time::currentTimeMillis();
     updateTitle();
     return true;
 }

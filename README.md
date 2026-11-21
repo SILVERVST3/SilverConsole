@@ -78,6 +78,34 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 | Ctrl+arrastar o fader | Ajuste fino |
 | Duplo clique no valor em dB | Digitar o volume |
 
+## Recuperacao de projetos (Etapa 3 - experimental)
+
+- Quando o projeto tem alteracoes e o transporte esta parado, o SilverConsole cria um snapshot de recuperacao a cada aproximadamente **2 minutos**.
+- Os snapshots ficam em `%APPDATA%\\SilverConsole\\Recovery` no Windows, separados do arquivo .sconsole normal. O arquivo principal nunca e substituido pelo autosave.
+- Na proxima abertura do programa, se houver um snapshot, o usuario pode optar por recuperar o mais recente. A recuperacao abre como projeto ainda nao salvo; use **Salvar como** para guardar a versao definitiva.
+- Apos salvar normalmente com sucesso, os snapshots correspondentes sao eliminados. Os arquivos de audio originais continuam externos ao projeto e precisam estar acessiveis.
+- A captura e feita com audio parado para nao bloquear o callback durante o salvamento de estados VST3. Enquanto o transporte estiver tocando, nao ha novo snapshot.
+
+## Medidores Master (Etapa 3 - em validacao)
+
+- O MASTER mostra **TP dBTP**, uma estimativa de true peak por sobreamostragem FIR **4x** com historico entre callbacks; ela detecta picos que ocorrem entre amostras de audio.
+- O painel de saida do MASTER mostra **Momentary LUFS (M)** em uma janela de aproximadamente **400 ms**, usando ponderacao K (high-shelf + RLB high-pass) e atualizacao em sub-janelas de 100 ms.
+- Ambos sao somente medidores; nao alteram o sinal nem aplicam limitacao. Os testes verificam pico entre amostras, continuidade de estado, sonoridade em 48/96 kHz, silencio e reducao de 20 dB.
+- **Limite:** a leitura LUFS-M ainda nao implementa medicao integrada com gate EBU R128, loudness range, short-term (3s) ou certificacao normativa. A leitura true peak FIR 4x e aproximada e exige comparacao com medidores de referencia.
+
+## ASIO opcional (Windows, em validacao)
+
+O JUCE 8.0.6 do projeto utiliza um SDK ASIO externo. A compilacao padrao continua com WASAPI e **sem ASIO**. Para habilitar ASIO localmente, instale um SDK ASIO cuja licenca permita o uso pretendido e configure:
+
+```powershell
+cmake -S . -B build-asio -G "Visual Studio 17 2022" -A x64 `
+  -DSILVERCONSOLE_ENABLE_ASIO=ON `
+  -DSILVERCONSOLE_ASIO_SDK_DIR="C:/caminho/para/ASIO_SDK"
+cmake --build build-asio --config Release --target SilverConsole
+```
+
+O diretório informado deve conter `common/iasiodrv.h` e `host/asiodrivers.h`. Esse caminho ainda exige compilacao e testes com drivers ASIO reais; nao esta habilitado no artefato Windows do GitHub Actions.
+
 ## Placa de som
 
 Em **Áudio**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Windows Audio (Exclusive Mode)** para ter latência baixa com a sua interface. O modo compartilhado também funciona.

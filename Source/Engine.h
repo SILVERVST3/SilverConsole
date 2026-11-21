@@ -5,6 +5,7 @@
 #include <JuceHeader.h>
 #include "Automation.h"
 #include "StreamingAudio.h"
+#include "Metering.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -146,6 +147,9 @@ struct Master : Channel
     Master() : Channel (ChannelKind::master) { name = "MASTER"; }
     std::atomic<bool> mono { false };
     std::atomic<bool> clipped { false };
+    // Estimativa de true peak 4x, publicada sem locks para interface.
+    std::atomic<float> truePeakL { 0.0f }, truePeakR { 0.0f };
+    std::atomic<float> momentaryLufs { -120.0f }; // valor LUFS-M, nao integrado
 };
 
 //==============================================================================
@@ -286,6 +290,8 @@ private:
 
     std::unique_ptr<StreamWorker> streamingWorker;
     std::unique_ptr<OfflineTrackPool> offlineTrackPool;
+    TruePeak4x truePeakMeter;
+    MomentaryLoudness momentaryLoudness; // estado exclusivo do motor sob engine.lock
     std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 };
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
