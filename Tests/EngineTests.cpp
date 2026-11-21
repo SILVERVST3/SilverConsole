@@ -127,8 +127,9 @@ static void testPluginExceptionFallback()
         for (int sample = 0; sample < mixed.getNumSamples(); ++sample)
             valid = valid && std::isfinite (mixed.getSample (channel, sample));
     check (valid, "plugin exception: NaN parcial nao contamina o mixer");
-    check (t->inserts[0].bypassed.load() && e.getRealtimeStats().pluginExceptions == 1,
-           "plugin exception: insert desabilitado automaticamente e falha contada");
+    check (t->inserts[0].bypassed.load() && t->inserts[0].faulted.load()
+           && e.getRealtimeStats().pluginExceptions == 1,
+           "plugin exception: insert marcado ERR, em bypass e falha contada");
 
     // O callback posterior deve preservar o audio original com insert em bypass.
     mixed = run (e, 1024);
@@ -138,6 +139,14 @@ static void testPluginExceptionFallback()
     e.resetRealtimeStats();
     check (e.getRealtimeStats().pluginExceptions == 0,
            "plugin exception: contador pode ser reiniciado");
+
+    e.setBypass (*t, 0, false); // usuario tenta reativar
+    check (! t->inserts[0].faulted.load() && ! t->inserts[0].bypassed.load(),
+           "plugin exception: retry explicito limpa ERR anterior");
+    run (e, 512);
+    check (t->inserts[0].faulted.load() && t->inserts[0].bypassed.load()
+           && e.getRealtimeStats().pluginExceptions == 1,
+           "plugin exception: nova falha volta ao bypass automaticamente");
 }
 
 static void testMixBasics()
