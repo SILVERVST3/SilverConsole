@@ -6,6 +6,7 @@
 #include "Project.h"
 #include "AutomationRecorder.h"
 #include "PluginScanPolicy.h"
+#include "PluginScanSupervisor.h"
 #include <cstdio>
 #include <thread>
 
@@ -739,6 +740,58 @@ static void testTruePeakMeter()
            "true peak: medidor recebe o sinal final do master");
 }
 
+static void testScanSupervisor (const juce::File& worker)
+{
+    check (worker.existsAsFile(), "scan supervisor: executavel auxiliar presente");
+    if (! worker.existsAsFile()) return;
+
+    auto argv = [&] (const juce::String& command, const juce::String& value)
+    {
+        juce::StringArray args;
+        args.add (worker.getFullPathName());
+        args.add (command);
+        args.add (value);
+        return args;
+    };
+
+    std::atomic<bool> cancelled { false };
+    const auto success = PluginScanSupervisor::run (
+        argv ("--self-test-exit", "0"), cancelled, 2000);
+    check (success.ok(), "scan supervisor: resultado positivo");
+
+    const auto failure = PluginScanSupervisor::run (
+        argv ("--self-test-exit", "7"), cancelled, 2000);
+    check (failure.status == PluginScanSupervisor::Status::finished
+           && failure.exitCode == 7 && ! failure.ok(),
+           "scan supervisor: falha de processo retorna codigo sem derrubar host");
+
+    const auto started = juce::Time::getMillisecondCounter();
+    const auto timeout = PluginScanSupervisor::run (
+        argv ("--self-test-sleep", "3000"), cancelled, 250);
+    const auto elapsed = juce::Time::getMillisecondCounter() - started;
+    check (timeout.status == PluginScanSupervisor::Status::timedOut
+           && elapsed < 1800,
+           "scan supervisor: mata scanner travado dentro do prazo");
+
+    cancelled = true;
+    const auto alreadyCancelled = PluginScanSupervisor::run (
+        argv ("--self-test-sleep", "3000"), cancelled, 2000);
+    check (alreadyCancelled.status == PluginScanSupervisor::Status::cancelled,
+           "scan supervisor: nao inicia processo com pedido de cancelamento");
+    cancelled = false;
+
+    std::thread cancelThread ([&]
+    {
+        juce::Thread::sleep (160);
+        cancelled.store (true, std::memory_order_release);
+    });
+    const auto interrupted = PluginScanSupervisor::run (
+        argv ("--self-test-sleep", "3000"), cancelled, 2000);
+    cancelThread.join();
+    check (interrupted.status == PluginScanSupervisor::Status::cancelled,
+           "scan supervisor: cancelamento encerra filho ja em execucao");
+}
+
 static void testPluginScanQuarantine()
 {
     auto failed = PluginScanPolicy::deserialize (
@@ -749,6 +802,10 @@ static void testPluginScanQuarantine()
            "scan quarantine: plugin previamente falho e ignorado por padrao");
     check (PluginScanPolicy::shouldScan (failed, "c:/vst3/crashing.vst3", true),
            "scan quarantine: usuario pode reavaliar plugin falho");
+    check (! PluginScanPolicy::shouldScan (failed, "C:/VST3/NewlyDiscovered.vst3", true),
+           "scan quarantine: reavaliacao nao examina plugins sem falhas previas");
+    check (PluginScanPolicy::shouldScan (failed, "C:/VST3/NewlyDiscovered.vst3", false),
+           "scan quarantine: varredura normal examina novos plugins");
 
     PluginScanPolicy::reportResult (failed, "C:/VST3/new.vst3", false);
     PluginScanPolicy::reportResult (failed, "C:/VST3/new.vst3", false);
@@ -828,6 +885,8 @@ int main (int argc, char** argv)
     else std::printf ("(sem caminho do plugin de teste: hospedagem VST3 nao testada)\n");
     if (argc > 2 && scannedDescXml.isNotEmpty()) // opcional: grava a descricao do plugin de teste
         juce::File (juce::String::fromUTF8 (argv[2])).replaceWithText (scannedDescXml);
+    if (argc > 3)
+        testScanSupervisor (juce::File (juce::String::fromUTF8 (argv[3])));
     std::printf ("\n%s (%d falha(s))\n", failures == 0 ? "TODOS OS TESTES PASSARAM" : "HOUVE FALHAS", failures);
     return failures == 0 ? 0 : 1;
 }
