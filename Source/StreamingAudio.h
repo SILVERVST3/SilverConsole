@@ -50,7 +50,12 @@ private:
     std::vector<float> overview;
     std::atomic<juce::int64> requested { 0 };
     std::atomic<juce::uint64> missingSamples { 0 };
-    std::shared_ptr<const Window> visible; // atomic_load/store; nunca alterado apos publicacao
+    // Um ponteiro atomico em vez de atomic_shared_ptr no callback:
+    // nenhuma contagem de referencias, mutex ou destruicao de buffers no audio.
+    std::atomic<const Window*> visible { nullptr };
+    std::atomic<unsigned int> audioReaders { 0 };
+    std::unique_ptr<const Window> activeWindow; // owned by I/O thread
+    std::vector<std::unique_ptr<const Window>> retiredWindows; // only freed by I/O thread
 };
 
 /** Uma thread de I/O compartilhada por todas as faixas (nao uma por faixa). */
