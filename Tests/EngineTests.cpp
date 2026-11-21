@@ -6,6 +6,7 @@
 #include "Project.h"
 #include "AutomationRecorder.h"
 #include <cstdio>
+#include <thread>
 
 using namespace sc;
 
@@ -473,10 +474,218 @@ static void testVst3Hosting (const juce::File& pluginFile)
     check (editorTest != nullptr && e.getTotalLatency() == 0, "remover VST3");
 }
 
+// Regressao de escala: 128 faixas ativas, render repetido e soma finita.
+// Nao mede prazo realtime; mede estabilidade e ausencia de NaN/Inf.
+// Streaming em disco: escrita/abertura/seek e integracao com a engine.
+static void testDiskStreaming()
+{
+    auto file = juce::File::createTempFile (".wav");
+    {
+        auto output = file.createOutputStream();
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatWriter> writer;
+        if (output != nullptr)
+        {
+            writer.reset (wav.createWriterFor (output.get(), 48000.0, 2, 24, {}, 0));
+            if (writer != nullptr) output.release();
+        }
+        check (writer != nullptr, "stream: criar WAV temporario");
+        if (writer == nullptr) { file.deleteFile(); return; }
+        juce::AudioBuffer<float> input (2, 120000);
+        for (int i = 0; i < input.getNumSamples(); ++i)
+        {
+            input.setSample (0, i, 0.125f * std::sin (i * 0.01f));
+            input.setSample (1, i, 0.125f * std::cos (i * 0.01f));
+        }
+        check (writer->writeFromAudioSampleBuffer (input, 0, input.getNumSamples()),
+               "stream: arquivo de teste escrito");
+    }
+    {
+        juce::String error;
+        auto stream = StreamingAudio::open (file, 48000.0, error);
+        check (stream != nullptr, "stream: abrir e preparar janela inicial " + error);
+        if (stream != nullptr)
+        {
+            check (stream->getLength() == 120000 && stream->getChannels() == 2,
+                   "stream: metadados e duracao");
+            float left[256] {}, right[256] {};
+            stream->copy (left, right, 0, 1000, 256);
+            check (near (left[10], 0.125f * std::sin (1010 * 0.01f), 0.0001f)
+                   && near (right[10], 0.125f * std::cos (1010 * 0.01f), 0.0001f),
+                   "stream: leitura no cache inicial");
+            // Seek fora da janela inicial: a thread faz o prefetch,
+            // o callback nunca espera por leitura em disco.
+            stream->copy (left, right, 0, 100000, 256);
+            stream->service(); // simula o worker de I/O (teste deterministico)
+            std::fill (std::begin (left), std::end (left), 0.0f);
+            std::fill (std::begin (right), std::end (right), 0.0f);
+            stream->copy (left, right, 0, 100000, 256);
+            check (near (left[10], 0.125f * std::sin (100010 * 0.01f), 0.0001f),
+                   "stream: reposicionamento com nova janela");
+
+            // Testa publicacao/aposentadoria de janelas enquanto a leitura
+            // do callback ocorre em paralelo. Falhas seriam UAF ou corrupcao.
+            std::atomic<bool> keepServicing { true };
+            std::thread io ([&]
+            {
+                while (keepServicing.load (std::memory_order_acquire))
+                {
+                    stream->service();
+                    std::this_thread::yield();
+                }
+            });
+            bool finiteRead = true;
+            for (int step = 0; step < 2000; ++step)
+            {
+                std::fill (std::begin (left), std::end (left), 0.0f);
+                std::fill (std::begin (right), std::end (right), 0.0f);
+                stream->copy (left, right, 0, step % 2 == 0 ? 1000 : 100000, 256);
+                for (int i : { 0, 100, 255 })
+                    finiteRead = finiteRead && std::isfinite (left[i]) && std::isfinite (right[i]);
+            }
+            keepServicing.store (false, std::memory_order_release);
+            io.join();
+            check (finiteRead, "stream: publicacao concorrente sem amostras invalidas");
+
+            Engine e;
+            e.prepare (48000.0, 256);
+            auto track = std::make_unique<Track>();
+            track->name = "disk test";
+            auto* raw = e.addTrack (std::move (track));
+            auto freshStream = StreamingAudio::open (file, 48000.0, error);
+            if (freshStream != nullptr)
+            {
+                e.setTrackStream (*raw, freshStream);
+                check (raw->playback == nullptr && raw->original == nullptr
+                       && e.getLengthSamples() == 120000,
+                       "stream: engine usa disco sem buffer completo na RAM");
+                auto mixed = run (e, 4096);
+                check (near (mixed.getSample (0, 1000), 0.125f * std::sin (10.0f), 0.0001f),
+                       "stream: render da engine usa cache");
+
+                // A exportacao percorre o audio muito mais rapido que tempo real.
+                // Testa o final do arquivo, alem da primeira janela de cache.
+                auto exported = juce::File::createTempFile (".wav");
+                std::atomic<float> progress { 0.0f };
+                std::atomic<bool> cancel { false };
+                bool clipped = false;
+                juce::String exportError;
+                const bool exportedOk = e.exportMix (exported, 24, 0.0,
+                                                        progress, cancel, exportError, clipped);
+                check (exportedOk, "stream: bounce offline " + exportError);
+                if (exportedOk)
+                {
+                    juce::AudioFormatManager fm;
+                    registerAudioFormats (fm);
+                    const auto outputFile = loadAudioFile (fm, exported);
+                    check (outputFile.ok() && outputFile.original->getNumSamples() == 120000,
+                           "stream: bounce tem duracao integral");
+                    if (outputFile.ok() && outputFile.original->getNumSamples() > 100000)
+                        check (near (outputFile.original->getSample (0, 100000),
+                                     0.125f * std::sin (100000 * 0.01f), 0.0001f),
+                               "stream: fim do bounce sem silencio causado por cache");
+                }
+                exported.deleteFile();
+            }
+            else check (false, "stream: reabrir para teste integrado");
+        }
+        auto wrongRate = StreamingAudio::open (file, 44100.0, error);
+        check (wrongRate == nullptr, "stream: taxa diferente usa caminho de fallback");
+    }
+    check (file.deleteFile(), "stream: limpeza do arquivo de teste");
+}
+
+// Garante que a soma do bounce com workers multicore seja igual ao render
+// sequencial (após acomodacao dos smoothing ramps).
+static void testMulticoreOfflineMix()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto source = makeBuffer (2, 12000, [] (int ch, int i)
+    {
+        return 0.012f * std::sin ((float) i * 0.012f + (float) ch * 0.3f);
+    });
+    for (int i = 0; i < 8; ++i)
+        addTrack (e, source, "parallel " + juce::String (i));
+    const auto reference = run (e, 12000);
+
+    const auto out = juce::File::createTempFile (".wav");
+    std::atomic<float> progress { 0.0f };
+    std::atomic<bool> cancel { false };
+    juce::String error;
+    bool clipped = false;
+    const bool success = e.exportMix (out, 24, 0.0, progress, cancel, error, clipped);
+    check (success, "multicore: exportacao em oito faixas " + error);
+    if (success)
+    {
+        juce::AudioFormatManager fm;
+        registerAudioFormats (fm);
+        auto wav = loadAudioFile (fm, out);
+        check (wav.ok() && wav.original->getNumSamples() == 12000,
+               "multicore: duracao preservada");
+        if (wav.ok() && wav.original->getNumSamples() == 12000)
+        {
+            bool same = true;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i : { 2000, 4500, 9000, 11500 })
+                    same = same && near (reference.getSample (ch, i),
+                                        wav.original->getSample (ch, i), 0.0002f);
+            check (same, "multicore: amostras coincidem com render sequencial");
+        }
+    }
+    out.deleteFile();
+}
+
+static void test128TrackStress()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto tone = makeBuffer (2, 4096, [] (int c, int i)
+    {
+        return 0.001f * std::sin (0.017f * (float) i + (float) c * 0.2f);
+    });
+    for (int i = 0; i < kMaxTracks; ++i)
+        addTrack (e, tone, "stress " + juce::String (i + 1));
+    check ((int) e.tracks.size() == kMaxTracks, "stress: 128 faixas criadas");
+    auto output = run (e, 4096);
+    // Medicao repetivel de custo de render offline; nao equivale a teste
+    // realtime em hardware, mas revela regressoes severas de desempenho.
+    constexpr int iterations = 32;
+    const auto t0 = juce::Time::getHighResolutionTicks();
+    for (int i = 0; i < iterations; ++i)
+        run (e, 4096);
+    const auto ticks = juce::Time::getHighResolutionTicks() - t0;
+    const double elapsedMs = juce::Time::highResolutionTicksToSeconds (ticks) * 1000.0;
+    const double audioMs = iterations * 4096.0 / e.getSampleRate() * 1000.0;
+    const double realtimeFactor = elapsedMs > 0.0 ? audioMs / elapsedMs : 0.0;
+    std::printf ("[PERF] 128 tracks: %.1f ms processing %.1f ms audio, %.2fx realtime (offline)\\n",
+                 elapsedMs, audioMs, realtimeFactor);
+    check (std::isfinite (realtimeFactor) && realtimeFactor > 0.0,
+           "stress: medicao de desempenho valida");
+    bool finite = true, nonzero = false;
+    for (int c = 0; c < output.getNumChannels(); ++c)
+        for (int i = 0; i < output.getNumSamples(); ++i)
+        {
+            const float v = output.getSample (c, i);
+            finite = finite && std::isfinite (v);
+            nonzero = nonzero || std::abs (v) > 1.0e-7f;
+        }
+    check (finite && nonzero, "stress: mix de 128 faixas finita e nao silenciosa");
+    const auto stats = e.getRealtimeStats();
+    check (stats.lockContentions == 0 && stats.renderSuspensions == 0 && stats.callbackOverruns == 0,
+           "stress: contadores realtime inicializados");
+    e.resetRealtimeStats();
+    check (e.getRealtimeStats().processedCallbacks == 0 && e.getRealtimeStats().callbackOverruns == 0,
+           "stress: reset de diagnostico");
+}
+
 int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    test128TrackStress();
+    testMulticoreOfflineMix();
+    testDiskStreaming();
     testStereoBalanceMuteSolo();
     testBusesAndSends();
     testLatencyCompensation();

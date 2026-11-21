@@ -32,6 +32,7 @@ set(SC_COMMON_DEFS
 set(SC_ENGINE_SOURCES
     Source/Engine.cpp Source/Engine.h
     Source/AudioLoader.cpp Source/AudioLoader.h
+    Source/StreamingAudio.cpp Source/StreamingAudio.h
     Source/Project.cpp Source/Project.h
     Source/Automation.h
     Source/AutomationRecorder.cpp Source/AutomationRecorder.h)

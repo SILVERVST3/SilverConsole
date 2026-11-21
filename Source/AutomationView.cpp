@@ -337,9 +337,10 @@ public:
         {
             auto& t = static_cast<Track&> (channel);
             const auto& peaks = owner.peaksFor (t);
-            if (! peaks.empty() && t.playback != nullptr)
+            if (! peaks.empty() && (t.playback != nullptr || t.diskStream != nullptr))
             {
-                const double len = (double) t.playback->getNumSamples() / owner.engine.getSampleRate();
+                const double len = (double) (t.diskStream != nullptr ? t.diskStream->getLength()
+                                                                        : t.playback->getNumSamples()) / owner.engine.getSampleRate();
                 g.setColour (channel.colour.withAlpha (0.18f));
                 const float mid = a.getCentreY(), half = a.getHeight() * 0.48f;
                 for (int x = (int) a.getX(); x < (int) a.getRight(); ++x)
@@ -659,6 +660,7 @@ void AutomationView::scrollBy (double seconds)
 const std::vector<float>& AutomationView::peaksFor (const Track& t)
 {
     static const std::vector<float> none;
+    if (t.diskStream != nullptr) return t.diskStream->getOverview();
     const auto* buf = t.playback.get();
     if (buf == nullptr) return none;
     auto it = peakCache.find (buf);

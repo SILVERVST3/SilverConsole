@@ -42,12 +42,21 @@ namespace
         juce::File file;
         LoadedAudio audio;
         std::shared_ptr<const juce::AudioBuffer<float>> playback;
+        std::shared_ptr<StreamingAudio> stream;
     };
 
     void decodeInto (DecodedFile& d, double sr)
     {
         juce::AudioFormatManager fm;
         registerAudioFormats (fm);
+        // Arquivos grandes na taxa nativa: leitura com cache; os demais
+        // preservam o decodificador e reamostrador sinc originais.
+        if (d.file.getSize() >= StreamingAudio::minimumFileBytes)
+        {
+            juce::String reason;
+            d.stream = StreamingAudio::open (d.file, sr, reason);
+            if (d.stream != nullptr) return;
+        }
         d.audio = loadAudioFile (fm, d.file);
         if (d.audio.ok()) d.playback = resampleBuffer (d.audio.original, d.audio.rate, sr);
     }
@@ -497,6 +506,9 @@ void MainComponent::timerCallback()
               << bs << " amostras (" << juce::String (bs * 1000.0 / sr, 1) << " ms)  |  CPU "
               << juce::roundToInt (deviceManager.getCpuUsage() * 100.0) << "%  |  PDC "
               << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
+            const auto rt = engine.getRealtimeStats();
+            s << "  |  XRUN " << juce::String (rt.callbackOverruns)
+              << "  |  LOCK " << juce::String (rt.lockContentions);
         }
         else s = "Sem dispositivo de audio - clique em Audio";
         if (s != statusText) { statusText = s; repaint (getWidth() - 470, kTopBarH, 470, kToolbarH); }
@@ -1024,13 +1036,14 @@ void MainComponent::importFiles (const juce::Array<juce::File>& files)
         juce::StringArray errors;
         for (auto& d : *items)
         {
-            if (! d.audio.ok()) { if (d.audio.error.isNotEmpty()) errors.add (d.audio.error); continue; }
+            if (! d.audio.ok() && d.stream == nullptr) { if (d.audio.error.isNotEmpty()) errors.add (d.audio.error); continue; }
             auto t = std::make_unique<Track>();
             t->name = d.file.getFileNameWithoutExtension().substring (0, 40);
             t->colour = colours::trackPalette ((int) engine.tracks.size());
             t->sourceFile = d.file;
             auto* raw = engine.addTrack (std::move (t));
-            engine.setTrackAudio (*raw, d.audio.original, d.audio.rate, d.playback, sr);
+            if (d.stream != nullptr) engine.setTrackStream (*raw, d.stream);
+            else engine.setTrackAudio (*raw, d.audio.original, d.audio.rate, d.playback, sr);
         }
         rebuildStrips();
         markDirty();
@@ -1055,9 +1068,10 @@ void MainComponent::replaceAudio (Track& t)
                 [this, item, tp, sr] (Job&)
         {
             if (! channelExists (tp)) return;
-            if (! item->audio.ok()) { alert ("Audio", item->audio.error); return; }
+            if (! item->audio.ok() && item->stream == nullptr) { alert ("Audio", item->audio.error); return; }
             tp->sourceFile = item->file;
-            engine.setTrackAudio (*tp, item->audio.original, item->audio.rate, item->playback, sr);
+            if (item->stream != nullptr) engine.setTrackStream (*tp, item->stream);
+            else engine.setTrackAudio (*tp, item->audio.original, item->audio.rate, item->playback, sr);
             refreshStrips();
             markDirty();
         });
@@ -1068,18 +1082,42 @@ void MainComponent::startResampleIfNeeded()
 {
     if (job != nullptr) return;
     const double sr = engine.getSampleRate();
-    struct Item { Track* track; std::shared_ptr<const juce::AudioBuffer<float>> original, result; double rate; };
+    struct Item
+    {
+        Track* track;
+        std::shared_ptr<const juce::AudioBuffer<float>> original, result;
+        double rate;
+        juce::File file;
+    };
     auto items = std::make_shared<std::vector<Item>>();
     for (auto& t : engine.tracks)
-        if (t->original != nullptr && t->playbackRate != sr)
-            items->push_back ({ t.get(), t->original, nullptr, t->originalRate });
+        if ((t->original != nullptr || t->diskStream != nullptr) && t->playbackRate != sr)
+            items->push_back ({ t.get(), t->original, nullptr, t->originalRate, t->sourceFile });
     if (items->empty()) return;
 
     runJob ("Ajustando a taxa de amostragem (" + juce::String (sr / 1000.0, 1) + " kHz)...", false,
-            [items, sr] (Job& j) { parallelFor ((int) items->size(), j, [&] (int i) { auto& it = (*items)[(size_t) i]; it.result = resampleBuffer (it.original, it.rate, sr); }); },
+            [items, sr] (Job& j)
+            {
+                parallelFor ((int) items->size(), j, [&] (int i)
+                {
+                    auto& it = (*items)[(size_t) i];
+                    // Streaming nao faz reamostragem: se o dispositivo mudou de taxa,
+                    // usa temporariamente o caminho original de decodificacao + sinc.
+                    if (it.original == nullptr && it.file.existsAsFile())
+                    {
+                        juce::AudioFormatManager fm;
+                        registerAudioFormats (fm);
+                        auto decoded = loadAudioFile (fm, it.file);
+                        it.original = decoded.original;
+                        it.rate = decoded.rate;
+                    }
+                    if (it.original != nullptr)
+                        it.result = resampleBuffer (it.original, it.rate, sr);
+                });
+            },
             [this, items, sr] (Job&)
     {
-        if (sr != engine.getSampleRate()) return; // mudou de novo: o timer refaz
+        if (sr != engine.getSampleRate()) return;
         for (auto& it : *items)
             if (channelExists (it.track) && it.result != nullptr)
                 engine.setTrackAudio (*it.track, it.original, it.rate, it.result, sr);
@@ -1243,7 +1281,8 @@ void MainComponent::openFile (const juce::File& file)
                 t->sends[(size_t) s].preFader = td.sends[(size_t) s].pre;
             }
             auto* raw = engine.addTrack (std::move (t));
-            if (d.audio.ok()) engine.setTrackAudio (*raw, d.audio.original, d.audio.rate, d.playback, sr);
+            if (d.stream != nullptr) engine.setTrackStream (*raw, d.stream);
+            else if (d.audio.ok()) engine.setTrackAudio (*raw, d.audio.original, d.audio.rate, d.playback, sr);
             else problems.add (raw->name + ": " + (d.audio.error.isNotEmpty() ? d.audio.error : juce::String ("sem arquivo de audio")));
             loadInserts (*raw, td.ch, problems);
         }

@@ -4,6 +4,7 @@
 
 #include <JuceHeader.h>
 #include "Automation.h"
+#include "StreamingAudio.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -127,6 +128,11 @@ struct Track : Channel
     std::shared_ptr<const juce::AudioBuffer<float>> original; // na taxa do arquivo
     double originalRate = 0.0;
     std::shared_ptr<const juce::AudioBuffer<float>> playback; // na taxa do motor
+    std::shared_ptr<StreamingAudio> diskStream; // prefetch em disco, alternativo ao playback RAM
+    // Buffers exclusivos da faixa: inserts/PDC independentes por canal.
+    // Prealocados fora do callback para viabilizar processamento paralelo.
+    juce::AudioBuffer<float> processingBuffer;
+    juce::MidiBuffer processingMidi;
     double playbackRate = 0.0;
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
@@ -143,6 +149,8 @@ struct Master : Channel
 };
 
 //==============================================================================
+class OfflineTrackPool; // pool somente para bounce, nunca usado pelo callback realtime
+
 class Engine : public juce::AudioIODeviceCallback,
                private juce::AudioProcessorListener
 {
@@ -174,6 +182,7 @@ public:
     void setBypass (Channel&, int slot, bool);
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
                         std::shared_ptr<const juce::AudioBuffer<float>> playback, double playbackRate);
+    void setTrackStream (Track&, std::shared_ptr<StreamingAudio>);
 
     // ---- Automacao (thread de mensagens) --------------------------------------
     AutoLane* findLane (Channel&, AutoTarget, int slot = -1, int param = -1) const;
@@ -213,6 +222,29 @@ public:
     int getBlockSize() const noexcept { return blockSize; }
     bool sampleRateChanged() { return srChanged.exchange (false); }
 
+    // ---- Diagnostico realtime (leituras lock-free pela interface) -------------
+    struct RealtimeStats
+    {
+        juce::uint64 lockContentions = 0;
+        juce::uint64 renderSuspensions = 0;
+        juce::uint64 processedCallbacks = 0;
+        juce::uint64 callbackOverruns = 0;
+    };
+    RealtimeStats getRealtimeStats() const noexcept
+    {
+        return { lockContentions.load (std::memory_order_relaxed),
+                 renderSuspensions.load (std::memory_order_relaxed),
+                 processedCallbacks.load (std::memory_order_relaxed),
+                 callbackOverruns.load (std::memory_order_relaxed) };
+    }
+    void resetRealtimeStats() noexcept
+    {
+        lockContentions.store (0, std::memory_order_relaxed);
+        renderSuspensions.store (0, std::memory_order_relaxed);
+        processedCallbacks.store (0, std::memory_order_relaxed);
+        callbackOverruns.store (0, std::memory_order_relaxed);
+    }
+
     // ---- Render ---------------------------------------------------------------
     void prepare (double sampleRate, int blockSize); // pega o lock
     /** Renderiza n amostras estereo. Requer lock. Retorna a nova posicao. */
@@ -243,7 +275,7 @@ private:
     void prepareChannel (Channel&);
     void prepareSlot (InsertSlot&);
     int chainLatencyOf (const Channel&) const;
-    void runInserts (Channel&, int n);
+    void runInserts (Channel&, int n, juce::AudioBuffer<float>&, juce::MidiBuffer&);
     void forEachChannel (const std::function<void (Channel&)>&);
     template <typename Fn> void forEachChannelNoAlloc (Fn&& fn)
     {
@@ -252,6 +284,9 @@ private:
         fn (master);
     }
 
+    std::unique_ptr<StreamWorker> streamingWorker;
+    std::unique_ptr<OfflineTrackPool> offlineTrackPool;
+    std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 };
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
     std::atomic<bool> srChanged { false };

@@ -1,8 +1,98 @@
 // SilverConsole - motor de mixagem. Codigo original (MIT).
 #include "Engine.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 
 namespace sc
 {
+// Workers iniciados UMA vez por exportacao, nunca na thread de audio da placa.
+// Cada faixa possui buffers e plugins independentes. A soma/envios permanece
+// sequencial, na ordem original, para preservar resultados e roteamento.
+class OfflineTrackPool
+{
+public:
+    explicit OfflineTrackPool (int workers)
+    {
+        for (int i = 0; i < workers; ++i)
+            threads.emplace_back ([this] { worker(); });
+    }
+    ~OfflineTrackPool()
+    {
+        {
+            std::lock_guard<std::mutex> guard (mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        for (auto& thread : threads)
+            if (thread.joinable()) thread.join();
+    }
+
+    void run (int count, const std::function<void(int)>& process)
+    {
+        if (count <= 0) return;
+        if (threads.empty())
+        {
+            for (int i = 0; i < count; ++i) process (i);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard (mutex);
+            job = &process;
+            jobCount = count;
+            next.store (0, std::memory_order_relaxed);
+            workersFinished.store (0, std::memory_order_relaxed);
+            ++generation;
+        }
+        wake.notify_all();
+        processAvailable (process, count); // export thread also works
+        std::unique_lock<std::mutex> hold (mutex);
+        finished.wait (hold, [this]
+        {
+            return workersFinished.load (std::memory_order_acquire) == (int) threads.size();
+        });
+        // Todos os workers terminaram antes de o ponteiro 'process' expirar.
+    }
+
+private:
+    void processAvailable (const std::function<void(int)>& fn, int count)
+    {
+        for (;;)
+        {
+            const int index = next.fetch_add (1, std::memory_order_relaxed);
+            if (index >= count) break;
+            fn (index);
+        }
+    }
+    void worker()
+    {
+        unsigned long long seen = 0;
+        for (;;)
+        {
+            std::unique_lock<std::mutex> hold (mutex);
+            wake.wait (hold, [this, &seen] { return stopping || generation != seen; });
+            if (stopping) return;
+            seen = generation;
+            const auto* currentJob = job;
+            const int count = jobCount;
+            hold.unlock();
+
+            processAvailable (*currentJob, count);
+            if (workersFinished.fetch_add (1, std::memory_order_acq_rel) + 1 == (int) threads.size())
+                finished.notify_one();
+        }
+    }
+
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable wake, finished;
+    std::atomic<int> next { 0 }, workersFinished { 0 };
+    unsigned long long generation = 0;
+    bool stopping = false;
+    int jobCount = 0;
+    const std::function<void(int)>* job = nullptr;
+};
 namespace
 {
     void panGains (float pan, bool monoSource, float& l, float& r) noexcept
@@ -38,11 +128,14 @@ namespace
 Engine::Engine()
 {
     master.colour = juce::Colour (0xffe8edf2);
+    streamingWorker = std::make_unique<StreamWorker>();
     prepare (48000.0, 512);
 }
 
 Engine::~Engine()
 {
+    offlineTrackPool.reset();
+    streamingWorker.reset(); // termina I/O antes dos objetos Track
     forEachChannel ([this] (Channel& c)
     {
         for (auto& s : c.inserts)
@@ -114,12 +207,17 @@ void Engine::prepareChannel (Channel& c)
         sm->setCurrentAndTargetValue (target);
     }
     if (c.kind == ChannelKind::track)
-        for (auto& s : static_cast<Track&> (c).sends)
+    {
+        auto& t = static_cast<Track&> (c);
+        t.processingBuffer.setSize (kMaxPluginChannels + 1, blockSize);
+        t.processingMidi.ensureSize (4096);
+        for (auto& s : t.sends)
         {
             const float target = s.smooth.getTargetValue();
             s.smooth.reset (sr, 0.02);
             s.smooth.setCurrentAndTargetValue (target);
         }
+    }
     for (auto& s : c.inserts) prepareSlot (s);
     c.pdc.clear();
 }
@@ -307,12 +405,29 @@ void Engine::setTrackAudio (Track& t, std::shared_ptr<const juce::AudioBuffer<fl
 {
     {
         const juce::ScopedLock sl (lock);
+        t.diskStream.reset();
         t.original = std::move (original);
         t.originalRate = rate;
         t.playback = std::move (pb);
         t.playbackRate = pbRate;
         t.sourceChannels = t.original != nullptr ? t.original->getNumChannels() : 0;
     }
+    updateLength();
+}
+
+void Engine::setTrackStream (Track& t, std::shared_ptr<StreamingAudio> stream)
+{
+    if (stream == nullptr) return;
+    {
+        const juce::ScopedLock sl (lock);
+        t.original.reset();
+        t.playback.reset();
+        t.originalRate = stream->getRate();
+        t.playbackRate = stream->getRate();
+        t.sourceChannels = stream->getChannels();
+        t.diskStream = stream;
+    }
+    streamingWorker->add (stream); // fora do lock do callback
     updateLength();
 }
 
@@ -515,7 +630,9 @@ void Engine::updateLength()
         const juce::ScopedLock sl (lock);
         for (auto& t : tracks)
         {
-            if (t->playback != nullptr && t->playbackRate == sr)
+            if (t->diskStream != nullptr && t->playbackRate == sr)
+                len = juce::jmax (len, t->diskStream->getLength());
+            else if (t->playback != nullptr && t->playbackRate == sr)
                 len = juce::jmax (len, (juce::int64) t->playback->getNumSamples());
             else if (t->original != nullptr && t->originalRate > 0)
                 len = juce::jmax (len, (juce::int64) std::ceil (t->original->getNumSamples() * sr / t->originalRate));
@@ -535,7 +652,8 @@ void Engine::setLoop (juce::int64 start, juce::int64 end)
 }
 
 //==============================================================================
-void Engine::runInserts (Channel& c, int n)
+void Engine::runInserts (Channel& c, int n,
+                         juce::AudioBuffer<float>& work, juce::MidiBuffer& eventMidi)
 {
     for (auto& s : c.inserts)
     {
@@ -543,15 +661,15 @@ void Engine::runInserts (Channel& c, int n)
         if (p == nullptr || s.bypassed.load(std::memory_order_relaxed)) continue;
 
         const int ch = s.bufferChannels;
-        for (int i = 2; i < ch; ++i) scratch.clear (i, 0, n);
-        juce::AudioBuffer<float> view (scratch.getArrayOfWritePointers(), ch, n);
-        midi.clear();
+        for (int i = 2; i < ch; ++i) work.clear (i, 0, n);
+        juce::AudioBuffer<float> view (work.getArrayOfWritePointers(), ch, n);
+        eventMidi.clear();
         {
             const juce::ScopedLock pl (p->getCallbackLock());
             if (p->isSuspended()) continue;
-            p->processBlock (view, midi);
+            p->processBlock (view, eventMidi);
         }
-        if (s.mainOutChannels == 1) scratch.copyFrom (1, 0, scratch, 0, 0, n);
+        if (s.mainOutChannels == 1) work.copyFrom (1, 0, work, 0, 0, n);
     }
 }
 
@@ -596,15 +714,30 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     auto* L = scratch.getWritePointer (0);
     auto* R = scratch.getWritePointer (1);
 
-    // ---------------- Faixas ----------------
-    for (auto& tp : tracks)
+    // Pre-processamento de leitura/inserts/PDC independente por faixa.
+    // Na exportacao offline, distribui-se entre nucleos; no callback da
+    // placa, roda sequencialmente, sem barreiras nem waits na thread realtime.
+    const auto processTrack = [&] (int trackIndex)
     {
-        auto& t = *tp;
-        juce::FloatVectorOperations::clear (L, n);
-        juce::FloatVectorOperations::clear (R, n);
+        auto& t = *tracks[(size_t) trackIndex];
+        // Scratch por faixa: elimina compartilhamento de estado de plugin
+        // com as outras faixas; sem alocacao dentro do callback.
+        auto* TL = t.processingBuffer.getWritePointer (0);
+        auto* TR = t.processingBuffer.getWritePointer (1);
+        juce::FloatVectorOperations::clear (TL, n);
+        juce::FloatVectorOperations::clear (TR, n);
 
         const auto* buf = t.playback.get();
-        if (play && buf != nullptr && t.playbackRate == sr)
+        if (play && t.diskStream != nullptr && t.playbackRate == sr)
+        {
+            for (int i = 0; i < numSegs; ++i)
+            {
+                const auto& sg = segs[i];
+                if (sg.src >= 0)
+                    t.diskStream->copy (TL, TR, sg.dst, sg.src, sg.len);
+            }
+        }
+        else if (play && buf != nullptr && t.playbackRate == sr)
         {
             const auto len = (juce::int64) buf->getNumSamples();
             const bool mono = buf->getNumChannels() == 1;
@@ -613,19 +746,35 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
                 const auto& sg = segs[i];
                 if (sg.src >= len || sg.src < 0) continue;
                 const int cnt = (int) juce::jmin ((juce::int64) sg.len, len - sg.src);
-                juce::FloatVectorOperations::copy (L + sg.dst, buf->getReadPointer (0, (int) sg.src), cnt);
-                juce::FloatVectorOperations::copy (R + sg.dst, buf->getReadPointer (mono ? 0 : 1, (int) sg.src), cnt);
+                juce::FloatVectorOperations::copy (TL + sg.dst, buf->getReadPointer (0, (int) sg.src), cnt);
+                juce::FloatVectorOperations::copy (TR + sg.dst, buf->getReadPointer (mono ? 0 : 1, (int) sg.src), cnt);
             }
         }
         if (t.phase.load (std::memory_order_relaxed))
         {
-            juce::FloatVectorOperations::negate (L, L, n);
-            juce::FloatVectorOperations::negate (R, R, n);
+            juce::FloatVectorOperations::negate (TL, TL, n);
+            juce::FloatVectorOperations::negate (TR, TR, n);
         }
 
-        runInserts (t, n);
-        t.pdc.process (L, R, n);
+        runInserts (t, n, t.processingBuffer, t.processingMidi);
+        t.pdc.process (TL, TR, n);
 
+    };
+    if (offlineTrackPool != nullptr)
+    {
+        const std::function<void(int)> job = processTrack;
+        offlineTrackPool->run ((int) tracks.size(), job);
+    }
+    else
+        for (int index = 0; index < (int) tracks.size(); ++index)
+            processTrack (index);
+
+    // Somatoria deterministica: envios, faders e buses na ordem original.
+    for (auto& tp : tracks)
+    {
+        auto& t = *tp;
+        auto* TL = t.processingBuffer.getWritePointer (0);
+        auto* TR = t.processingBuffer.getWritePointer (1);
         const bool audible = ! t.mute.load (std::memory_order_relaxed) && (! anySolo || t.solo.load (std::memory_order_relaxed));
         const float g = audible ? dbToGain (t.gainDb.load (std::memory_order_relaxed)) : 0.0f;
         float pl, pr;
@@ -642,18 +791,18 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             if (! valid) { s.smooth.skip (n); continue; }
             if (! s.preFader.load (std::memory_order_relaxed)) continue;
             auto& dst = busIn[(size_t) b];
-            auto sm = s.smooth; // mesma rampa para L e R
-            addWithRamp (dst.getWritePointer (0), L, n, sm);
-            addWithRamp (dst.getWritePointer (1), R, n, s.smooth);
+            auto sm = s.smooth; // mesma rampa para TL e TR
+            addWithRamp (dst.getWritePointer (0), TL, n, sm);
+            addWithRamp (dst.getWritePointer (1), TR, n, s.smooth);
         }
 
         // fader + pan
         if (t.smoothL.isSmoothing() || t.smoothR.isSmoothing())
-            for (int i = 0; i < n; ++i) { L[i] *= t.smoothL.getNextValue(); R[i] *= t.smoothR.getNextValue(); }
+            for (int i = 0; i < n; ++i) { TL[i] *= t.smoothL.getNextValue(); TR[i] *= t.smoothR.getNextValue(); }
         else
         {
-            juce::FloatVectorOperations::multiply (L, t.smoothL.getTargetValue(), n);
-            juce::FloatVectorOperations::multiply (R, t.smoothR.getTargetValue(), n);
+            juce::FloatVectorOperations::multiply (TL, t.smoothL.getTargetValue(), n);
+            juce::FloatVectorOperations::multiply (TR, t.smoothR.getTargetValue(), n);
         }
 
         // envios pos-fader
@@ -663,17 +812,17 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             if (b < 0 || b >= numBuses || s.preFader.load (std::memory_order_relaxed)) continue;
             auto& dst = busIn[(size_t) b];
             auto sm = s.smooth;
-            addWithRamp (dst.getWritePointer (0), L, n, sm);
-            addWithRamp (dst.getWritePointer (1), R, n, s.smooth);
+            addWithRamp (dst.getWritePointer (0), TL, n, sm);
+            addWithRamp (dst.getWritePointer (1), TR, n, s.smooth);
         }
 
         const int ob = t.outputBus.load (std::memory_order_relaxed);
         auto& out = (ob >= 0 && ob < numBuses) ? busIn[(size_t) ob] : direct;
-        out.addFrom (0, 0, L, n);
-        out.addFrom (1, 0, R, n);
+        out.addFrom (0, 0, TL, n);
+        out.addFrom (1, 0, TR, n);
 
-        storePeak (t.peakL, scratch.getMagnitude (0, 0, n));
-        storePeak (t.peakR, scratch.getMagnitude (1, 0, n));
+        storePeak (t.peakL, t.processingBuffer.getMagnitude (0, 0, n));
+        storePeak (t.peakR, t.processingBuffer.getMagnitude (1, 0, n));
     }
 
     // ---------------- Buses ----------------
@@ -688,7 +837,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             juce::FloatVectorOperations::negate (L, L, n);
             juce::FloatVectorOperations::negate (R, R, n);
         }
-        runInserts (b, n);
+        runInserts (b, n, scratch, midi);
         b.pdc.process (L, R, n);
 
         const float g = b.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (b.gainDb.load (std::memory_order_relaxed));
@@ -712,7 +861,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     // ---------------- Master ----------------
     juce::FloatVectorOperations::copy (L, masterBuf.getReadPointer (0), n);
     juce::FloatVectorOperations::copy (R, masterBuf.getReadPointer (1), n);
-    runInserts (master, n);
+    runInserts (master, n, scratch, midi);
     {
         const float g = master.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (master.gainDb.load (std::memory_order_relaxed));
         float pl, pr;
@@ -738,11 +887,26 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
 void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* const* out, int numOut, int n,
                                                const juce::AudioIODeviceCallbackContext&)
 {
+    if (out == nullptr || n <= 0 || numOut <= 0) return;
     for (int c = 0; c < numOut; ++c)
         if (out[c] != nullptr) juce::FloatVectorOperations::clear (out[c], n);
 
+    // Nunca bloquear a thread de audio. Contadores ajudam a localizar dropout
+    // por edicao concorrente e suspensao durante exportacao offline.
+    if (n <= 0 || numOut <= 0 || out == nullptr) return;
     const juce::ScopedTryLock sl (lock);
-    if (! sl.isLocked() || rendering.load() || numOut <= 0) return;
+    if (! sl.isLocked())
+    {
+        lockContentions.fetch_add (1, std::memory_order_relaxed);
+        return;
+    }
+    if (rendering.load (std::memory_order_relaxed))
+    {
+        renderSuspensions.fetch_add (1, std::memory_order_relaxed);
+        return;
+    }
+    processedCallbacks.fetch_add (1, std::memory_order_relaxed);
+    const auto callbackStartTicks = juce::Time::getHighResolutionTicks();
 
     const auto startPos = position.load();
     const bool play = playing.load();
@@ -754,15 +918,15 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
         auto* dl = deviceBuf.getWritePointer (0);
         auto* dr = deviceBuf.getWritePointer (1);
         pos = render (dl, dr, m, pos, play, true);
-        if (numOut == 1 || out[1] == nullptr)
+        if (numOut == 1 || out[1] == nullptr || out[0] == nullptr)
         {
             if (out[0] != nullptr)
                 for (int i = 0; i < m; ++i) out[0][done + i] = 0.5f * (dl[i] + dr[i]);
         }
         else
         {
-            juce::FloatVectorOperations::copyWithMultiply (out[0] + done, dl, 1.0f, m);
-            juce::FloatVectorOperations::copyWithMultiply (out[1] + done, dr, 1.0f, m);
+            juce::FloatVectorOperations::copy (out[0] + done, dl, m);
+            juce::FloatVectorOperations::copy (out[1] + done, dr, m);
         }
         done += m;
     }
@@ -770,6 +934,13 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
     // Saida de hardware limitada em +-1 (o motor interno e float).
     for (int c = 0; c < juce::jmin (2, numOut); ++c)
         if (out[c] != nullptr) juce::FloatVectorOperations::clip (out[c], out[c], -1.0f, 1.0f, n);
+
+    // Conta callbacks cujo processamento ultrapassou a duracao do buffer.
+    // Medicao apenas diagnostica; nao modifica o sinal nem bloqueia o audio.
+    const double elapsed = juce::Time::highResolutionTicksToSeconds (
+        juce::Time::getHighResolutionTicks() - callbackStartTicks);
+    if (elapsed > (double) n / juce::jmax (1.0, sampleRate.load (std::memory_order_relaxed)))
+        callbackOverruns.fetch_add (1, std::memory_order_relaxed);
 
     if (play)
     {
@@ -801,6 +972,7 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
 
     auto restore = [this]
     {
+        offlineTrackPool.reset(); // workers encerrados antes de resetar os plugins
         forEachChannel ([] (Channel& c)
         {
             for (auto& s : c.inserts)
@@ -833,6 +1005,13 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
     });
     directDelay.clear();
 
+    // Um pequeno pool persistente apenas durante o bounce; nunca criado
+    // em audioDeviceIOCallback. A etapa de buses/master continua serial.
+    const auto cores = std::thread::hardware_concurrency();
+    const int workers = cores > 1 ? juce::jmin (3, (int) cores - 1) : 0;
+    if (workers > 0 && tracks.size() >= 4)
+        offlineTrackPool = std::make_unique<OfflineTrackPool> (workers);
+
     const juce::int64 length = lengthSamples.load();
     const juce::int64 total = length + (juce::int64) (tailSeconds * sr);
     const int latency = totalLatency.load();
@@ -844,6 +1023,11 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
     {
         if (cancel.load()) { restore(); writer.reset(); error = "Exportacao cancelada."; return false; }
         const int m = (int) juce::jmin ((juce::int64) bs, toProduce - produced);
+        // O bounce corre mais rapido que o playback. Prefetch sincrono fora da
+        // thread realtime impede silencio por cache vazio em exports longos.
+        for (auto& t : tracks)
+            if (t->diskStream != nullptr && t->playbackRate == sr)
+                t->diskStream->prefetchBlocking (pos, m);
         pos = render (buf.getWritePointer (0), buf.getWritePointer (1), m, pos, true, false);
         const int skip = produced < latency ? (int) juce::jmin ((juce::int64) m, (juce::int64) latency - produced) : 0;
         const int w = m - skip;

@@ -347,6 +347,7 @@ void ChannelStrip::refresh()
         else
         {
             info = t.sourceChannels == 1 ? "MONO" : "ESTEREO";
+            if (t.diskStream != nullptr) info << " / DISK";
             if (t.originalRate > 0 && std::abs (t.originalRate - engine.getSampleRate()) > 0.5)
                 info << "  " << juce::String (t.originalRate / 1000.0, 1) << "k";
         }
