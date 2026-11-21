@@ -219,18 +219,21 @@ public:
         juce::uint64 lockContentions = 0;
         juce::uint64 renderSuspensions = 0;
         juce::uint64 processedCallbacks = 0;
+        juce::uint64 callbackOverruns = 0;
     };
     RealtimeStats getRealtimeStats() const noexcept
     {
         return { lockContentions.load (std::memory_order_relaxed),
                  renderSuspensions.load (std::memory_order_relaxed),
-                 processedCallbacks.load (std::memory_order_relaxed) };
+                 processedCallbacks.load (std::memory_order_relaxed),
+                 callbackOverruns.load (std::memory_order_relaxed) };
     }
     void resetRealtimeStats() noexcept
     {
         lockContentions.store (0, std::memory_order_relaxed);
         renderSuspensions.store (0, std::memory_order_relaxed);
         processedCallbacks.store (0, std::memory_order_relaxed);
+        callbackOverruns.store (0, std::memory_order_relaxed);
     }
 
     // ---- Render ---------------------------------------------------------------
@@ -272,7 +275,7 @@ private:
         fn (master);
     }
 
-    std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 };
+    std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 };
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
     std::atomic<bool> srChanged { false };
