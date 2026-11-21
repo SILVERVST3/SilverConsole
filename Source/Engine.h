@@ -149,6 +149,8 @@ struct Master : Channel
 };
 
 //==============================================================================
+class OfflineTrackPool; // pool somente para bounce, nunca usado pelo callback realtime
+
 class Engine : public juce::AudioIODeviceCallback,
                private juce::AudioProcessorListener
 {
@@ -283,6 +285,7 @@ private:
     }
 
     std::unique_ptr<StreamWorker> streamingWorker;
+    std::unique_ptr<OfflineTrackPool> offlineTrackPool;
     std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 };
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
