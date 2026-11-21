@@ -757,6 +757,7 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
         return;
     }
     processedCallbacks.fetch_add (1, std::memory_order_relaxed);
+    const auto callbackStartTicks = juce::Time::getHighResolutionTicks();
 
     const auto startPos = position.load();
     const bool play = playing.load();
@@ -784,6 +785,13 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
     // Saida de hardware limitada em +-1 (o motor interno e float).
     for (int c = 0; c < juce::jmin (2, numOut); ++c)
         if (out[c] != nullptr) juce::FloatVectorOperations::clip (out[c], out[c], -1.0f, 1.0f, n);
+
+    // Conta callbacks cujo processamento ultrapassou a duracao do buffer.
+    // Medicao apenas diagnostica; nao modifica o sinal nem bloqueia o audio.
+    const double elapsed = juce::Time::highResolutionTicksToSeconds (
+        juce::Time::getHighResolutionTicks() - callbackStartTicks);
+    if (elapsed > (double) n / juce::jmax (1.0, sampleRate.load (std::memory_order_relaxed)))
+        callbackOverruns.fetch_add (1, std::memory_order_relaxed);
 
     if (play)
     {
