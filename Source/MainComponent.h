@@ -143,6 +143,7 @@ private:
     void closeEditorsFor (Channel&);
     void closeAllEditors();
     void showPluginManager (bool startScan);
+    void scanPluginsIsolated();
     void showAudioSettings();
 
     // estrutura
