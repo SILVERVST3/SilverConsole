@@ -738,6 +738,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
 void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* const* out, int numOut, int n,
                                                const juce::AudioIODeviceCallbackContext&)
 {
+    if (out == nullptr || n <= 0 || numOut <= 0) return;
     for (int c = 0; c < numOut; ++c)
         if (out[c] != nullptr) juce::FloatVectorOperations::clear (out[c], n);
 
