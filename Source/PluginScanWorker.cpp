@@ -56,7 +56,7 @@ int main (int argc, char** argv)
             auto plugin = manager.createPluginInstance (*description, 48000.0, 256, error);
             if (plugin == nullptr)
             {
-                std::fprintf (stderr, "Falha ao instanciar plugin em processo separado.\\n");
+                std::fprintf (stderr, "Falha ao instanciar plugin em processo separado.\n");
                 return 5;
             }
 
@@ -80,7 +80,7 @@ int main (int argc, char** argv)
                         for (int i = 0; i < 256; ++i)
                             if (! std::isfinite (ptr[i]))
                             {
-                                std::fprintf (stderr, "DSP retornou amostras invalidas.\\n");
+                                std::fprintf (stderr, "DSP retornou amostras invalidas.\n");
                                 return 6;
                             }
                     }
@@ -89,7 +89,7 @@ int main (int argc, char** argv)
             }
             catch (...)
             {
-                std::fprintf (stderr, "Excecao C++ no DSP durante teste isolado.\\n");
+                std::fprintf (stderr, "Excecao C++ no DSP durante teste isolado.\n");
                 return 7;
             }
         }
