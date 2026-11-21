@@ -510,7 +510,7 @@ void ChannelStrip::paint (juce::Graphics& g)
                         juce::Justification::centred);
         }
         else
-            g.drawText (juce::String::fromUTF8 ("\\xe2\\x86\\x92 MASTER"),
+            g.drawText (juce::String ("MASTER"),
                         sendsHeader.withHeight (117), juce::Justification::centred);
     }
 
