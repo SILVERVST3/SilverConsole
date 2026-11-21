@@ -9,6 +9,8 @@
 #include "PluginScanSupervisor.h"
 #include <cstdio>
 #include <thread>
+#include <stdexcept>
+#include <limits>
 
 using namespace sc;
 
@@ -51,6 +53,20 @@ private:
     DelayLine line;
 };
 
+// Simula uma excecao de um insert de terceiros. Um crash de processo
+// real nao pode ser tratado assim e exige isolamento IPC (pendente).
+class ThrowingProcessor : public InternalDelay
+{
+public:
+    ThrowingProcessor() : InternalDelay (1) {}
+    void processBlock (juce::AudioBuffer<float>& audio, juce::MidiBuffer&) override
+    {
+        // Um plugin pode deixar um bloco parcialmente corrompido ao falhar.
+        audio.setSample (0, 0, std::numeric_limits<float>::quiet_NaN());
+        throw std::runtime_error ("Falha de teste em plugin VST3");
+    }
+};
+
 static std::shared_ptr<const juce::AudioBuffer<float>> makeBuffer (int channels, int len, std::function<float (int, int)> fn)
 {
     auto b = std::make_shared<juce::AudioBuffer<float>> (channels, len);
@@ -88,6 +104,40 @@ static int peakIndex (const juce::AudioBuffer<float>& b, int ch)
     for (int i = 0; i < b.getNumSamples(); ++i)
         if (std::abs (b.getSample (ch, i)) > best) { best = std::abs (b.getSample (ch, i)); idx = i; }
     return idx;
+}
+
+static void testPluginExceptionFallback()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto* t = addTrack (e, makeBuffer (2, 4096, [] (int, int)
+    {
+        return 0.1f;
+    }), "faulty insert");
+
+    auto faulty = std::make_unique<ThrowingProcessor>();
+    const auto error = e.prepareProcessor (*faulty);
+    check (error.isEmpty(), "plugin exception: processador de teste preparado");
+    if (error.isNotEmpty()) return;
+    e.setInsert (*t, 0, std::move (faulty), nullptr);
+
+    auto mixed = run (e, 512);
+    bool valid = true;
+    for (int channel = 0; channel < 2; ++channel)
+        for (int sample = 0; sample < mixed.getNumSamples(); ++sample)
+            valid = valid && std::isfinite (mixed.getSample (channel, sample));
+    check (valid, "plugin exception: NaN parcial nao contamina o mixer");
+    check (t->inserts[0].bypassed.load() && e.getRealtimeStats().pluginExceptions == 1,
+           "plugin exception: insert desabilitado automaticamente e falha contada");
+
+    // O callback posterior deve preservar o audio original com insert em bypass.
+    mixed = run (e, 1024);
+    check (std::abs (mixed.getSample (0, 800)) > 0.01f,
+           "plugin exception: playback recuperado por bypass automatico");
+
+    e.resetRealtimeStats();
+    check (e.getRealtimeStats().pluginExceptions == 0,
+           "plugin exception: contador pode ser reiniciado");
 }
 
 static void testMixBasics()
@@ -866,6 +916,7 @@ int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    testPluginExceptionFallback();
     testPluginScanQuarantine();
     testTruePeakMeter();
     testMomentaryLoudness();
