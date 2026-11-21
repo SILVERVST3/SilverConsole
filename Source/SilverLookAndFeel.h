@@ -6,9 +6,9 @@ namespace sc
 {
 namespace colours
 {
-    const juce::Colour background  { 0xff15181c };
-    const juce::Colour panel       { 0xff1f2328 };
-    const juce::Colour panelLine   { 0xff2c3238 };
+    const juce::Colour background  { 0xff11161c };
+    const juce::Colour panel       { 0xff202832 };
+    const juce::Colour panelLine   { 0xff35414d };
     const juce::Colour silverTop   { 0xffdfe3e7 };
     const juce::Colour silverBot   { 0xffa9b0b8 };
     const juce::Colour silverDark  { 0xff7d858e };
@@ -18,7 +18,7 @@ namespace colours
     const juce::Colour textDim     { 0xff8b949e };
     const juce::Colour lcd         { 0xff12161a };
     const juce::Colour lcdText     { 0xff8fd8ff };
-    const juce::Colour accent      { 0xff2fb4f0 };
+    const juce::Colour accent      { 0xff46b9ed };
     const juce::Colour mute        { 0xffe0892c };
     const juce::Colour solo        { 0xffe8c42a };
     const juce::Colour danger      { 0xffe2453c };
@@ -63,6 +63,10 @@ public:
         setColour (juce::TextEditor::textColourId, lcdText);
         setColour (juce::TextEditor::highlightColourId, accent.withAlpha (0.4f));
         setColour (juce::ScrollBar::thumbColourId, silverDark);
+        setColour (juce::ScrollBar::trackColourId, background);
+        setColour (juce::Slider::textBoxTextColourId, lcdText);
+        setColour (juce::Slider::textBoxBackgroundColourId, lcd);
+        setColour (juce::Slider::textBoxOutlineColourId, panelLine);
         setColour (juce::ListBox::backgroundColourId, panel);
         setColour (juce::ComboBox::backgroundColourId, lcd);
         setColour (juce::ProgressBar::foregroundColourId, accent);
@@ -80,9 +84,11 @@ public:
         if (down) base = base.darker (0.25f);
         else if (over) base = base.brighter (0.12f);
         g.setGradientFill ({ base.brighter (0.10f), 0, r.getY(), base.darker (0.12f), 0, r.getBottom(), false });
-        g.fillRoundedRectangle (r, 3.0f);
+        g.fillRoundedRectangle (r, 5.0f);
+        g.setColour (juce::Colours::white.withAlpha (over ? 0.18f : 0.07f));
+        g.drawRoundedRectangle (r.reduced (1.0f), 4.0f, 1.0f);
         g.setColour (juce::Colours::black.withAlpha (0.45f));
-        g.drawRoundedRectangle (r, 3.0f, 1.0f);
+        g.drawRoundedRectangle (r, 5.0f, 1.0f);
     }
 
     void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h, float pos, float, float,

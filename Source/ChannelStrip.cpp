@@ -84,8 +84,16 @@ void LevelMeter::paint (juce::Graphics& g)
         const float hy = bars.getY() + dbToY (juce::Decibels::gainToDecibels (holds[c], -100.0f), h);
         if (holds[c] > 0.001f) { g.setColour (juce::Colours::white.withAlpha (0.8f)); g.fillRect (col.getX(), hy, bw, 1.5f); }
     }
+    // Clip latch remains visible until reset, even after a transient peak.
     g.setColour (clip ? colours::danger : juce::Colour (0xff3a1d1b));
     g.fillRoundedRectangle (r.reduced (2.0f).withHeight (4.0f), 1.0f);
+    // Reference lines: 0, -6, -18 and -36 dBFS. Purely visual; no DSP changes.
+    g.setColour (juce::Colours::white.withAlpha (0.38f));
+    for (float db : { 0.0f, -6.0f, -18.0f, -36.0f })
+    {
+        const float yy = bars.getY() + dbToY (db, h);
+        g.drawHorizontalLine ((int) yy, bars.getX(), bars.getRight());
+    }
 }
 
 //==============================================================================
@@ -449,6 +457,12 @@ void ChannelStrip::paint (juce::Graphics& g)
 
     g.setColour (channel.colour);
     g.fillRoundedRectangle (r.getX() + 4, 2.0f, r.getWidth() - 8, 4.0f, 1.5f);
+    // Distinct master/bus outline for quicker navigation in large sessions.
+    if (isBus || isMaster)
+    {
+        g.setColour ((isMaster ? colours::accent : colours::busTint).withAlpha (0.65f));
+        g.drawRoundedRectangle (r.reduced (1.0f), 4.0f, 1.5f);
+    }
 
     auto header = [&g] (juce::Rectangle<int> a, const juce::String& t)
     {
