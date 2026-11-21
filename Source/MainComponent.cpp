@@ -497,6 +497,9 @@ void MainComponent::timerCallback()
               << bs << " amostras (" << juce::String (bs * 1000.0 / sr, 1) << " ms)  |  CPU "
               << juce::roundToInt (deviceManager.getCpuUsage() * 100.0) << "%  |  PDC "
               << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
+            const auto rt = engine.getRealtimeStats();
+            s << "  |  XRUN " << juce::String (rt.callbackOverruns)
+              << "  |  LOCK " << juce::String (rt.lockContentions);
         }
         else s = "Sem dispositivo de audio - clique em Audio";
         if (s != statusText) { statusText = s; repaint (getWidth() - 470, kTopBarH, 470, kToolbarH); }
