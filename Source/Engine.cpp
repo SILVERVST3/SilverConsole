@@ -1,8 +1,98 @@
 // SilverConsole - motor de mixagem. Codigo original (MIT).
 #include "Engine.h"
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 
 namespace sc
 {
+// Workers iniciados UMA vez por exportacao, nunca na thread de audio da placa.
+// Cada faixa possui buffers e plugins independentes. A soma/envios permanece
+// sequencial, na ordem original, para preservar resultados e roteamento.
+class OfflineTrackPool
+{
+public:
+    explicit OfflineTrackPool (int workers)
+    {
+        for (int i = 0; i < workers; ++i)
+            threads.emplace_back ([this] { worker(); });
+    }
+    ~OfflineTrackPool()
+    {
+        {
+            std::lock_guard<std::mutex> guard (mutex);
+            stopping = true;
+        }
+        wake.notify_all();
+        for (auto& thread : threads)
+            if (thread.joinable()) thread.join();
+    }
+
+    void run (int count, const std::function<void(int)>& process)
+    {
+        if (count <= 0) return;
+        if (threads.empty())
+        {
+            for (int i = 0; i < count; ++i) process (i);
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> guard (mutex);
+            job = &process;
+            jobCount = count;
+            next.store (0, std::memory_order_relaxed);
+            workersFinished.store (0, std::memory_order_relaxed);
+            ++generation;
+        }
+        wake.notify_all();
+        processAvailable (process, count); // export thread also works
+        std::unique_lock<std::mutex> hold (mutex);
+        finished.wait (hold, [this]
+        {
+            return workersFinished.load (std::memory_order_acquire) == (int) threads.size();
+        });
+        // Todos os workers terminaram antes de o ponteiro 'process' expirar.
+    }
+
+private:
+    void processAvailable (const std::function<void(int)>& fn, int count)
+    {
+        for (;;)
+        {
+            const int index = next.fetch_add (1, std::memory_order_relaxed);
+            if (index >= count) break;
+            fn (index);
+        }
+    }
+    void worker()
+    {
+        unsigned long long seen = 0;
+        for (;;)
+        {
+            std::unique_lock<std::mutex> hold (mutex);
+            wake.wait (hold, [this, &seen] { return stopping || generation != seen; });
+            if (stopping) return;
+            seen = generation;
+            const auto* currentJob = job;
+            const int count = jobCount;
+            hold.unlock();
+
+            processAvailable (*currentJob, count);
+            if (workersFinished.fetch_add (1, std::memory_order_acq_rel) + 1 == (int) threads.size())
+                finished.notify_one();
+        }
+    }
+
+    std::vector<std::thread> threads;
+    std::mutex mutex;
+    std::condition_variable wake, finished;
+    std::atomic<int> next { 0 }, workersFinished { 0 };
+    unsigned long long generation = 0;
+    bool stopping = false;
+    int jobCount = 0;
+    const std::function<void(int)>* job = nullptr;
+};
 namespace
 {
     void panGains (float pan, bool monoSource, float& l, float& r) noexcept
@@ -44,6 +134,7 @@ Engine::Engine()
 
 Engine::~Engine()
 {
+    offlineTrackPool.reset();
     streamingWorker.reset(); // termina I/O antes dos objetos Track
     forEachChannel ([this] (Channel& c)
     {
@@ -623,10 +714,12 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     auto* L = scratch.getWritePointer (0);
     auto* R = scratch.getWritePointer (1);
 
-    // ---------------- Faixas ----------------
-    for (auto& tp : tracks)
+    // Pre-processamento de leitura/inserts/PDC independente por faixa.
+    // Na exportacao offline, distribui-se entre nucleos; no callback da
+    // placa, roda sequencialmente, sem barreiras nem waits na thread realtime.
+    const auto processTrack = [&] (int trackIndex)
     {
-        auto& t = *tp;
+        auto& t = *tracks[(size_t) trackIndex];
         // Scratch por faixa: elimina compartilhamento de estado de plugin
         // com as outras faixas; sem alocacao dentro do callback.
         auto* TL = t.processingBuffer.getWritePointer (0);
@@ -666,6 +759,22 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         runInserts (t, n, t.processingBuffer, t.processingMidi);
         t.pdc.process (TL, TR, n);
 
+    };
+    if (offlineTrackPool != nullptr)
+    {
+        const std::function<void(int)> job = processTrack;
+        offlineTrackPool->run ((int) tracks.size(), job);
+    }
+    else
+        for (int index = 0; index < (int) tracks.size(); ++index)
+            processTrack (index);
+
+    // Somatoria deterministica: envios, faders e buses na ordem original.
+    for (auto& tp : tracks)
+    {
+        auto& t = *tp;
+        auto* TL = t.processingBuffer.getWritePointer (0);
+        auto* TR = t.processingBuffer.getWritePointer (1);
         const bool audible = ! t.mute.load (std::memory_order_relaxed) && (! anySolo || t.solo.load (std::memory_order_relaxed));
         const float g = audible ? dbToGain (t.gainDb.load (std::memory_order_relaxed)) : 0.0f;
         float pl, pr;
@@ -863,6 +972,7 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
 
     auto restore = [this]
     {
+        offlineTrackPool.reset(); // workers encerrados antes de resetar os plugins
         forEachChannel ([] (Channel& c)
         {
             for (auto& s : c.inserts)
@@ -894,6 +1004,13 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
         c.smoothR.setCurrentAndTargetValue (c.smoothR.getTargetValue());
     });
     directDelay.clear();
+
+    // Um pequeno pool persistente apenas durante o bounce; nunca criado
+    // em audioDeviceIOCallback. A etapa de buses/master continua serial.
+    const auto cores = std::thread::hardware_concurrency();
+    const int workers = cores > 1 ? juce::jmin (3, (int) cores - 1) : 0;
+    if (workers > 0 && tracks.size() >= 4)
+        offlineTrackPool = std::make_unique<OfflineTrackPool> (workers);
 
     const juce::int64 length = lengthSamples.load();
     const juce::int64 total = length + (juce::int64) (tailSeconds * sr);
