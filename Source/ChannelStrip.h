@@ -97,6 +97,7 @@ private:
     StripHost& host;
     juce::Label nameLabel, infoLabel, gainLabel, panLabel;
     juce::OwnedArray<InsertSlotComponent> slots;
+    std::array<int, kNumInserts> lastInsertVisualState {}; // evita 30x repaints/s por faixa sem mudancas
     juce::OwnedArray<SendRow> sends;
     void refreshAutoButton();
     juce::TextButton autoButton;
