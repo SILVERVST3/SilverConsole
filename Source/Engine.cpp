@@ -235,6 +235,8 @@ void Engine::prepare (double newRate, int newBlock)
     for (auto& b : busIn) b.setSize (2, blockSize);
     midi.ensureSize (4096);
     truePeakMeter.reset();
+    momentaryLoudness.prepare (sampleRate.load (std::memory_order_relaxed));
+    master.momentaryLufs.store (-120.0f, std::memory_order_relaxed);
     master.truePeakL.store (0.0f, std::memory_order_relaxed);
     master.truePeakR.store (0.0f, std::memory_order_relaxed);
     forEachChannel ([this] (Channel& c) { prepareChannel (c); });
@@ -883,6 +885,8 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     const auto tp = truePeakMeter.process (L, R, n);
     storePeak (master.truePeakL, tp.left);
     storePeak (master.truePeakR, tp.right);
+    momentaryLoudness.process (L, R, n);
+    master.momentaryLufs.store (momentaryLoudness.getLufsM(), std::memory_order_relaxed);
 
     juce::FloatVectorOperations::copy (outL, L, n);
     juce::FloatVectorOperations::copy (outR, R, n);
