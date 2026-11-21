@@ -94,6 +94,7 @@ endif()
 # Executavel separado para inspecao de metadados de plugins nao confiaveis.
 # A UI principal nao carrega o plugin durante essa varredura.
 juce_add_console_app(ScPluginScanWorker PRODUCT_NAME "SilverConsole Plugin Scan Worker")
+set_target_properties(ScPluginScanWorker PROPERTIES OUTPUT_NAME "ScPluginScanWorker")
 juce_generate_juce_header(ScPluginScanWorker)
 target_sources(ScPluginScanWorker PRIVATE Source/PluginScanWorker.cpp)
 target_compile_definitions(ScPluginScanWorker PRIVATE ${SC_COMMON_DEFS})
