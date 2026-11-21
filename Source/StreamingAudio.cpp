@@ -78,7 +78,7 @@ void StreamingAudio::buildOverview()
 bool StreamingAudio::prime()
 {
     service();
-    return std::atomic_load_explicit (&visible, std::memory_order_acquire) != nullptr;
+    return visible.load (std::memory_order_acquire) != nullptr;
 }
 
 void StreamingAudio::service()
@@ -86,8 +86,12 @@ void StreamingAudio::service()
     // O export offline pode requerer o bloco imediatamente; protege o reader
     // contra leituras simultaneas pelo worker (o callback nunca usa mutex).
     std::lock_guard<std::mutex> readerLock (readerMutex);
+    // Liberacao de janelas antigas e exclusivamente tarefa do worker.
+    // Depois da troca de ponteiro, novos leitores nunca adquirem janela antiga.
+    if (audioReaders.load (std::memory_order_acquire) == 0)
+        retiredWindows.clear();
     const auto requestedAt = juce::jlimit ((juce::int64) 0, length, requested.load (std::memory_order_relaxed));
-    auto prior = std::atomic_load_explicit (&visible, std::memory_order_acquire);
+    const auto* prior = visible.load (std::memory_order_acquire);
     constexpr juce::int64 margin = windowSamples / 4;
     if (prior != nullptr
         && requestedAt >= prior->start + margin
@@ -98,7 +102,7 @@ void StreamingAudio::service()
 
     const int count = (int) juce::jmin ((juce::int64) windowSamples, length - start);
     if (count <= 0) return;
-    auto next = std::make_shared<Window> (channels, start, count);
+    auto next = std::make_unique<Window> (channels, start, count);
     if (! reader->read (&next->samples, 0, count, start, true, channels > 1))
         return; // nao publica dados parciais em caso de falha de I/O
     for (int c = 0; c < channels; ++c)
@@ -107,8 +111,14 @@ void StreamingAudio::service()
         for (int i = 0; i < count; ++i)
             if (! std::isfinite (dst[i])) dst[i] = 0.0f;
     }
-    std::shared_ptr<const Window> published = std::move (next);
-    std::atomic_store_explicit (&visible, std::move (published), std::memory_order_release);
+    // Manter antiga janela ate que todos os callbacks anteriores terminem.
+    // Sem desalocacao, alocacao ou shared_ptr refcount na thread realtime.
+    if (activeWindow != nullptr)
+        retiredWindows.push_back (std::move (activeWindow));
+    activeWindow = std::move (next);
+    visible.store (activeWindow.get(), std::memory_order_release);
+    if (audioReaders.load (std::memory_order_acquire) == 0)
+        retiredWindows.clear();
 }
 
 void StreamingAudio::prefetchBlocking (juce::int64 start, int count)
@@ -127,7 +137,15 @@ void StreamingAudio::copy (float* left, float* right, int destOffset,
                      sourceStart + count),
                      std::memory_order_relaxed);
 
-    auto window = std::atomic_load_explicit (&visible, std::memory_order_acquire);
+    // Incrementar antes de ler visible; o worker somente recicla janelas
+    // quando nenhum callback as referencia.
+    audioReaders.fetch_add (1, std::memory_order_acq_rel);
+    struct ReaderGuard
+    {
+        std::atomic<unsigned int>& readers;
+        ~ReaderGuard() { readers.fetch_sub (1, std::memory_order_release); }
+    } guard { audioReaders };
+    const auto* window = visible.load (std::memory_order_acquire);
     if (window == nullptr)
     {
         missingSamples.fetch_add ((juce::uint64) count, std::memory_order_relaxed);
