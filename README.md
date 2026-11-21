@@ -88,7 +88,8 @@ Em **Áudio**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Wi
 - **ASIO não está incluído.** Use WASAPI exclusivo. Dá para adicionar ASIO depois.
 - O programa só mixa: não grava áudio, não tem MIDI/instrumentos, edição de clipes nem undo (inclusive nas edições de automação).
 - A automação é aplicada a cada bloco de áudio (alguns milissegundos), com suavização no volume e no pan. Não tem precisão de amostra.
-- O áudio fica todo na memória RAM: sessões muito longas com muitas faixas consomem bastante memória.
+- **Streaming em disco experimental (Etapa 2):** arquivos com 32 MiB ou mais, na mesma taxa do motor, usam cache limitado de 65.536 amostras por faixa e uma thread de pré-leitura compartilhada; a forma de onda usa um resumo compacto. Arquivos menores e/ou em outra taxa continuam na RAM com reamostragem sinc. Se a taxa do dispositivo mudar, o fallback atual pode carregar o arquivo completo na RAM. A exportação offline lê os blocos necessários antes de renderizar.
+- Na reprodução em streaming, saltos bruscos de cursor e discos lentos podem produzir silêncios momentâneos se o cache não estiver pronto. O streaming ainda precisa de testes prolongados; não é considerado pronto para produção.
 - O processamento roda em um núcleo da CPU. Sessões muito pesadas podem precisar de um buffer maior.
 - O escaneamento de plugins roda dentro do programa. Se um plugin derrubar o programa no scan, abra de novo e escaneie outra vez; o plugin problemático é pulado.
 
@@ -106,6 +107,7 @@ O .exe fica em `build/SilverConsole_artefacts/Release/SilverConsole.exe`.
 
 - `Source/Engine.*`: motor de mixagem em tempo real (faixas, inserts, envios, buses, master, PDC, transporte, exportação offline).
 - `Source/AudioLoader.*`: leitura de arquivos e reamostragem.
+- `Source/StreamingAudio.*`: cache por janela, pré-leitura assíncrona e visão resumida de forma de onda.
 - `Source/Project.*`: formato `.sconsole`.
 - `Source/Automation.h`, `Source/AutomationRecorder.*`, `Source/AutomationView.*`: linhas de automação, gravação TOUCH/LATCH/WRITE e editor.
 - `Source/ChannelStrip.*`, `Source/MainComponent.*`, `Source/SilverLookAndFeel.h`: interface.
