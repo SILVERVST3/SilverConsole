@@ -5,6 +5,21 @@
 
 int main (int argc, char** argv)
 {
+    // Modos internos para CTest exercitar prazo de vida, cancelamento e
+    // retorno de falha sem instalar VST3 de terceiros no runner Windows.
+    if (argc == 3)
+    {
+        const juce::String mode = juce::String::fromUTF8 (argv[1]);
+        const int parameter = juce::String::fromUTF8 (argv[2]).getIntValue();
+        if (mode == "--self-test-sleep")
+        {
+            juce::Thread::sleep (juce::jlimit (0, 10000, parameter));
+            return 0;
+        }
+        if (mode == "--self-test-exit")
+            return juce::jlimit (0, 100, parameter);
+    }
+
     juce::ScopedJuceInitialiser_GUI init;
 
     // Cada invocacao examina somente um candidato, isolando eventuais crashes
