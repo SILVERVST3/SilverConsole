@@ -1,0 +1,16 @@
+# Testa a estrutura da saida do scan e garante o plugin esperado.
+if(NOT EXISTS "${XML_FILE}")
+    message(FATAL_ERROR "Scanner nao gerou arquivo XML: ${XML_FILE}")
+endif()
+
+file(READ "${XML_FILE}" SCAN_CONTENT)
+if(NOT SCAN_CONTENT MATCHES "SILVERCONSOLE_PLUGIN_SCAN")
+    message(FATAL_ERROR "XML de scanner com raiz invalida")
+endif()
+if(NOT SCAN_CONTENT MATCHES "<PLUGIN")
+    message(FATAL_ERROR "Scanner nao descobriu nenhum PluginDescription")
+endif()
+if(NOT SCAN_CONTENT MATCHES "SC Test Delay")
+    message(FATAL_ERROR "O VST3 de teste nao aparece no XML gerado")
+endif()
+message(STATUS "Scanner isolado encontrou o plugin de teste com XML valido.")
