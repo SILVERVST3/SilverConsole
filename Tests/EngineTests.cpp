@@ -475,6 +475,77 @@ static void testVst3Hosting (const juce::File& pluginFile)
 
 // Regressao de escala: 128 faixas ativas, render repetido e soma finita.
 // Nao mede prazo realtime; mede estabilidade e ausencia de NaN/Inf.
+// Streaming em disco: escrita/abertura/seek e integracao com a engine.
+static void testDiskStreaming()
+{
+    auto file = juce::File::createTempFile (".wav");
+    {
+        auto output = file.createOutputStream();
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatWriter> writer;
+        if (output != nullptr)
+        {
+            writer.reset (wav.createWriterFor (output.get(), 48000.0, 2, 24, {}, 0));
+            if (writer != nullptr) output.release();
+        }
+        check (writer != nullptr, "stream: criar WAV temporario");
+        if (writer == nullptr) { file.deleteFile(); return; }
+        juce::AudioBuffer<float> input (2, 120000);
+        for (int i = 0; i < input.getNumSamples(); ++i)
+        {
+            input.setSample (0, i, 0.125f * std::sin (i * 0.01f));
+            input.setSample (1, i, 0.125f * std::cos (i * 0.01f));
+        }
+        check (writer->writeFromAudioSampleBuffer (input, 0, input.getNumSamples()),
+               "stream: arquivo de teste escrito");
+    }
+    {
+        juce::String error;
+        auto stream = StreamingAudio::open (file, 48000.0, error);
+        check (stream != nullptr, "stream: abrir e preparar janela inicial " + error);
+        if (stream != nullptr)
+        {
+            check (stream->getLength() == 120000 && stream->getChannels() == 2,
+                   "stream: metadados e duracao");
+            float left[256] {}, right[256] {};
+            stream->copy (left, right, 0, 1000, 256);
+            check (near (left[10], 0.125f * std::sin (1010 * 0.01f), 0.0001f)
+                   && near (right[10], 0.125f * std::cos (1010 * 0.01f), 0.0001f),
+                   "stream: leitura no cache inicial");
+            // Seek fora da janela inicial: a thread faz o prefetch,
+            // o callback nunca espera por leitura em disco.
+            stream->copy (left, right, 0, 100000, 256);
+            stream->service(); // simula o worker de I/O (teste deterministico)
+            std::fill (std::begin (left), std::end (left), 0.0f);
+            std::fill (std::begin (right), std::end (right), 0.0f);
+            stream->copy (left, right, 0, 100000, 256);
+            check (near (left[10], 0.125f * std::sin (100010 * 0.01f), 0.0001f),
+                   "stream: reposicionamento com nova janela");
+
+            Engine e;
+            e.prepare (48000.0, 256);
+            auto track = std::make_unique<Track>();
+            track->name = "disk test";
+            auto* raw = e.addTrack (std::move (track));
+            auto freshStream = StreamingAudio::open (file, 48000.0, error);
+            if (freshStream != nullptr)
+            {
+                e.setTrackStream (*raw, freshStream);
+                check (raw->playback == nullptr && raw->original == nullptr
+                       && e.getLengthSamples() == 120000,
+                       "stream: engine usa disco sem buffer completo na RAM");
+                auto mixed = run (e, 4096);
+                check (near (mixed.getSample (0, 1000), 0.125f * std::sin (10.0f), 0.0001f),
+                       "stream: render da engine usa cache");
+            }
+            else check (false, "stream: reabrir para teste integrado");
+        }
+        auto wrongRate = StreamingAudio::open (file, 44100.0, error);
+        check (wrongRate == nullptr, "stream: taxa diferente usa caminho de fallback");
+    }
+    check (file.deleteFile(), "stream: limpeza do arquivo de teste");
+}
+
 static void test128TrackStress()
 {
     Engine e;
@@ -523,6 +594,7 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
     test128TrackStress();
+    testDiskStreaming();
     testStereoBalanceMuteSolo();
     testBusesAndSends();
     testLatencyCompensation();
