@@ -167,4 +167,12 @@ if(SILVERCONSOLE_TESTS)
           "-DXML_FILE=${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-ci.xml"
           -P "${CMAKE_CURRENT_SOURCE_DIR}/Tests/VerifyPluginScan.cmake")
     set_tests_properties(PluginScanXml PROPERTIES DEPENDS PluginScanIsolated)
+    # Caminho ausente nunca gera metadados validos e precisa retornar erro
+    # controlado, sem travar nem criar XML de plugin inexistente.
+    add_test(NAME PluginScanInvalidPath
+        COMMAND ScPluginScanWorker
+          "${CMAKE_CURRENT_BINARY_DIR}/silverconsole-plugin-does-not-exist.vst3"
+          "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-invalid.xml")
+    set_tests_properties(PluginScanInvalidPath PROPERTIES WILL_FAIL TRUE TIMEOUT 15)
+    set_tests_properties(PluginScanIsolated PROPERTIES TIMEOUT 45)
 endif()
