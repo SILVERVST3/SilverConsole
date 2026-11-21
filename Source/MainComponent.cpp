@@ -2,6 +2,7 @@
 #include "MainComponent.h"
 #include "AudioLoader.h"
 #include "PluginScanPolicy.h"
+#include "PluginScanSupervisor.h"
 #include <thread>
 
 namespace sc
@@ -1110,6 +1111,11 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
 
     const auto remembered = PluginScanPolicy::deserialize (
         props.getUserSettings()->getValue (PluginScanPolicy::settingsKey));
+    if (retryFailed && remembered.isEmpty())
+    {
+        alert ("Scanner VST3", "Nao existem plugins em quarentena para reavaliar.");
+        return;
+    }
 
     struct Result
     {
@@ -1151,36 +1157,18 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
             args.add (destination.getFullPathName());
 
             bool passed = false;
-            juce::ChildProcess child;
-            if (child.start (args, 0))
-            {
-                // Pequenos intervalos permitem cancelar um scanner TRAVADO
-                // sem aguardar os 20s; nunca espera no callback de audio.
-                bool exited = false;
-                for (int ms = 0; ms < 20000; ms += 100)
-                {
-                    if (j.cancel.load())
-                    {
-                        result->cancelled = true;
-                        child.kill();
-                        break;
-                    }
-                    if (child.waitForProcessToFinish (100))
-                    {
-                        exited = true;
-                        break;
-                    }
-                }
-                if (! exited && ! result->cancelled)
-                {
-                    child.kill();
-                    ++result->timedOut;
-                }
+            // Supervisor compartilhado com os testes de falha/cancelamento.
+            // Nao roda na thread realtime e mata o filho em timeout/cancel.
+            const auto scan = PluginScanSupervisor::run (args, j.cancel, 20000);
+            if (scan.status == PluginScanSupervisor::Status::cancelled)
+                result->cancelled = true;
+            if (scan.status == PluginScanSupervisor::Status::timedOut)
+                ++result->timedOut;
 
-                if (exited && child.getExitCode() == 0
-                    && destination.getSize() > 0
-                    && destination.getSize() <= 4 * 1024 * 1024)
-                {
+            if (scan.ok()
+                && destination.getSize() > 0
+                && destination.getSize() <= 4 * 1024 * 1024)
+            {
                     if (auto xml = juce::XmlDocument::parse (destination))
                     {
                         if (xml->hasTagName ("SILVERCONSOLE_PLUGIN_SCAN")
