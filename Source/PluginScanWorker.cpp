@@ -2,6 +2,7 @@
 // Licenca MIT. Este executavel NAO hospeda processamento de audio em realtime.
 #include <JuceHeader.h>
 #include <cstdio>
+#include <cmath>
 
 int main (int argc, char** argv)
 {
@@ -22,16 +23,19 @@ int main (int argc, char** argv)
 
     juce::ScopedJuceInitialiser_GUI init;
 
-    // Cada invocacao examina somente um candidato, isolando eventuais crashes
-    // de construtores de terceiros do processo principal do SilverConsole.
-    if (argc != 3)
+    // Modos:
+    //   descoberta:  worker <candidato.vst3> <resultado.xml>
+    //   DSP probe:   worker --probe <candidato.vst3> <resultado.xml>
+    // O probe NAO transfere audio ao host e nao deve rodar na thread realtime.
+    const bool probeDsp = argc == 4 && juce::String::fromUTF8 (argv[1]) == "--probe";
+    if (argc != 3 && ! probeDsp)
     {
-        std::fprintf (stderr, "Uso: ScPluginScanWorker <arquivo.vst3> <resultado.xml>\n");
+        std::fprintf (stderr, "Uso: ScPluginScanWorker [--probe] <arquivo.vst3> <resultado.xml>\n");
         return 2;
     }
 
-    const juce::String source = juce::String::fromUTF8 (argv[1]);
-    const juce::File output (juce::String::fromUTF8 (argv[2]));
+    const juce::String source = juce::String::fromUTF8 (argv[probeDsp ? 2 : 1]);
+    const juce::File output (juce::String::fromUTF8 (argv[probeDsp ? 3 : 2]));
 
     juce::VST3PluginFormat format;
     juce::OwnedArray<juce::PluginDescription> descriptions;
@@ -42,9 +46,59 @@ int main (int argc, char** argv)
         return 3;
     }
 
+    if (probeDsp)
+    {
+        juce::AudioPluginFormatManager manager;
+        manager.addDefaultFormats();
+        for (auto* description : descriptions)
+        {
+            juce::String error;
+            auto plugin = manager.createPluginInstance (*description, 48000.0, 256, error);
+            if (plugin == nullptr)
+            {
+                std::fprintf (stderr, "Falha ao instanciar plugin em processo separado.\\n");
+                return 5;
+            }
+
+            // Respeita o layout padrao do plugin (mono, stereo ou synth).
+            // Nao configura hardware nem instancia plugins no host principal.
+            const int channels = juce::jlimit (2, 32, juce::jmax (
+                plugin->getTotalNumInputChannels(), plugin->getTotalNumOutputChannels()));
+            juce::AudioBuffer<float> work (channels, 256);
+            juce::MidiBuffer midi;
+            try
+            {
+                plugin->prepareToPlay (48000.0, 256);
+                for (int block = 0; block < 8; ++block)
+                {
+                    work.clear();
+                    midi.clear();
+                    plugin->processBlock (work, midi);
+                    for (int c = 0; c < channels; ++c)
+                    {
+                        const auto* ptr = work.getReadPointer (c);
+                        for (int i = 0; i < 256; ++i)
+                            if (! std::isfinite (ptr[i]))
+                            {
+                                std::fprintf (stderr, "DSP retornou amostras invalidas.\\n");
+                                return 6;
+                            }
+                    }
+                }
+                plugin->releaseResources();
+            }
+            catch (...)
+            {
+                std::fprintf (stderr, "Excecao C++ no DSP durante teste isolado.\\n");
+                return 7;
+            }
+        }
+    }
+
     juce::XmlElement root ("SILVERCONSOLE_PLUGIN_SCAN");
     root.setAttribute ("format", "VST3");
     root.setAttribute ("schemaVersion", 1);
+    if (probeDsp) root.setAttribute ("dspProbe", 1);
     for (auto* description : descriptions)
         if (auto node = description->createXml())
             root.addChildElement (node.release());
