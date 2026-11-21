@@ -26,10 +26,12 @@ public:
     juce::int64 getLength() const noexcept { return length; }
     double getRate() const noexcept { return rate; }
     int getChannels() const noexcept { return channels; }
+    const std::vector<float>& getOverview() const noexcept { return overview; }
     juce::uint64 getMissingSamples() const noexcept { return missingSamples.load (std::memory_order_relaxed); }
 
 private:
     explicit StreamingAudio (std::unique_ptr<juce::AudioFormatReader>);
+    void buildOverview(); // thread de importacao; amplitude aproximada, memoria limitada
     struct Window
     {
         Window (int channels, juce::int64 startIn, int count)
@@ -43,6 +45,7 @@ private:
     juce::int64 length = 0;
     double rate = 0.0;
     int channels = 0;
+    std::vector<float> overview;
     std::atomic<juce::int64> requested { 0 };
     std::atomic<juce::uint64> missingSamples { 0 };
     std::shared_ptr<const Window> visible; // atomic_load/store; nunca alterado apos publicacao
