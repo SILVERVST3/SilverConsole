@@ -487,6 +487,20 @@ static void test128TrackStress()
         addTrack (e, tone, "stress " + juce::String (i + 1));
     check ((int) e.tracks.size() == kMaxTracks, "stress: 128 faixas criadas");
     auto output = run (e, 4096);
+    // Medicao repetivel de custo de render offline; nao equivale a teste
+    // realtime em hardware, mas revela regressoes severas de desempenho.
+    constexpr int iterations = 32;
+    const auto t0 = juce::Time::getHighResolutionTicks();
+    for (int i = 0; i < iterations; ++i)
+        run (e, 4096);
+    const auto ticks = juce::Time::getHighResolutionTicks() - t0;
+    const double elapsedMs = juce::Time::highResolutionTicksToSeconds (ticks) * 1000.0;
+    const double audioMs = iterations * 4096.0 / e.getSampleRate() * 1000.0;
+    const double realtimeFactor = elapsedMs > 0.0 ? audioMs / elapsedMs : 0.0;
+    std::printf ("[PERF] 128 tracks: %.1f ms processing %.1f ms audio, %.2fx realtime (offline)\\n",
+                 elapsedMs, audioMs, realtimeFactor);
+    check (std::isfinite (realtimeFactor) && realtimeFactor > 0.0,
+           "stress: medicao de desempenho valida");
     bool finite = true, nonzero = false;
     for (int c = 0; c < output.getNumChannels(); ++c)
         for (int i = 0; i < output.getNumSamples(); ++i)
