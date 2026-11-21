@@ -83,6 +83,9 @@ bool StreamingAudio::prime()
 
 void StreamingAudio::service()
 {
+    // O export offline pode requerer o bloco imediatamente; protege o reader
+    // contra leituras simultaneas pelo worker (o callback nunca usa mutex).
+    std::lock_guard<std::mutex> readerLock (readerMutex);
     const auto requestedAt = juce::jlimit ((juce::int64) 0, length, requested.load (std::memory_order_relaxed));
     auto prior = std::atomic_load_explicit (&visible, std::memory_order_acquire);
     constexpr juce::int64 margin = windowSamples / 4;
@@ -106,6 +109,13 @@ void StreamingAudio::service()
     }
     std::shared_ptr<const Window> published = std::move (next);
     std::atomic_store_explicit (&visible, std::move (published), std::memory_order_release);
+}
+
+void StreamingAudio::prefetchBlocking (juce::int64 start, int count)
+{
+    if (start < 0 || start >= length || count <= 0) return;
+    requested.store (start + count, std::memory_order_relaxed);
+    service();
 }
 
 void StreamingAudio::copy (float* left, float* right, int destOffset,
