@@ -4,6 +4,7 @@
 
 #include <JuceHeader.h>
 #include "Automation.h"
+#include "StreamingAudio.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -127,6 +128,7 @@ struct Track : Channel
     std::shared_ptr<const juce::AudioBuffer<float>> original; // na taxa do arquivo
     double originalRate = 0.0;
     std::shared_ptr<const juce::AudioBuffer<float>> playback; // na taxa do motor
+    std::shared_ptr<StreamingAudio> diskStream; // prefetch em disco, alternativo ao playback RAM
     double playbackRate = 0.0;
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
@@ -174,6 +176,7 @@ public:
     void setBypass (Channel&, int slot, bool);
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
                         std::shared_ptr<const juce::AudioBuffer<float>> playback, double playbackRate);
+    void setTrackStream (Track&, std::shared_ptr<StreamingAudio>);
 
     // ---- Automacao (thread de mensagens) --------------------------------------
     AutoLane* findLane (Channel&, AutoTarget, int slot = -1, int param = -1) const;
@@ -275,6 +278,7 @@ private:
         fn (master);
     }
 
+    std::unique_ptr<StreamWorker> streamingWorker;
     std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 };
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
