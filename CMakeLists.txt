@@ -178,4 +178,19 @@ if(SILVERCONSOLE_TESTS)
           "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-invalid.xml")
     set_tests_properties(PluginScanInvalidPath PROPERTIES WILL_FAIL TRUE TIMEOUT 15)
     set_tests_properties(PluginScanIsolated PROPERTIES TIMEOUT 45)
+
+    # Testa que o scanner auxiliar TAMBEM consegue instanciar e executar
+    # blocos DSP sem carregar o plugin no SilverConsole principal.
+    add_test(NAME PluginDspProbeIsolated
+        COMMAND ScPluginScanWorker
+          --probe
+          "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
+          "${CMAKE_CURRENT_BINARY_DIR}/plugin-dsp-probe-ci.xml")
+    add_test(NAME PluginDspProbeXml
+        COMMAND ${CMAKE_COMMAND}
+          "-DXML_FILE=${CMAKE_CURRENT_BINARY_DIR}/plugin-dsp-probe-ci.xml"
+          "-DREQUIRE_DSP_PROBE=ON"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/Tests/VerifyPluginScan.cmake")
+    set_tests_properties(PluginDspProbeXml PROPERTIES DEPENDS PluginDspProbeIsolated)
+    set_tests_properties(PluginDspProbeIsolated PROPERTIES TIMEOUT 45)
 endif()
