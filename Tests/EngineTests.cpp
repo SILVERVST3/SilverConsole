@@ -511,10 +511,11 @@ static void test128TrackStress()
         }
     check (finite && nonzero, "stress: mix de 128 faixas finita e nao silenciosa");
     const auto stats = e.getRealtimeStats();
-    check (stats.lockContentions == 0 && stats.renderSuspensions == 0,
+    check (stats.lockContentions == 0 && stats.renderSuspensions == 0 && stats.callbackOverruns == 0,
            "stress: contadores realtime inicializados");
     e.resetRealtimeStats();
-    check (e.getRealtimeStats().processedCallbacks == 0, "stress: reset de diagnostico");
+    check (e.getRealtimeStats().processedCallbacks == 0 && e.getRealtimeStats().callbackOverruns == 0,
+           "stress: reset de diagnostico");
 }
 
 int main (int argc, char** argv)
