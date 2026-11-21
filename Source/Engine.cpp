@@ -116,12 +116,17 @@ void Engine::prepareChannel (Channel& c)
         sm->setCurrentAndTargetValue (target);
     }
     if (c.kind == ChannelKind::track)
-        for (auto& s : static_cast<Track&> (c).sends)
+    {
+        auto& t = static_cast<Track&> (c);
+        t.processingBuffer.setSize (kMaxPluginChannels + 1, blockSize);
+        t.processingMidi.ensureSize (4096);
+        for (auto& s : t.sends)
         {
             const float target = s.smooth.getTargetValue();
             s.smooth.reset (sr, 0.02);
             s.smooth.setCurrentAndTargetValue (target);
         }
+    }
     for (auto& s : c.inserts) prepareSlot (s);
     c.pdc.clear();
 }
@@ -556,7 +561,8 @@ void Engine::setLoop (juce::int64 start, juce::int64 end)
 }
 
 //==============================================================================
-void Engine::runInserts (Channel& c, int n)
+void Engine::runInserts (Channel& c, int n,
+                         juce::AudioBuffer<float>& work, juce::MidiBuffer& eventMidi)
 {
     for (auto& s : c.inserts)
     {
@@ -564,15 +570,15 @@ void Engine::runInserts (Channel& c, int n)
         if (p == nullptr || s.bypassed.load(std::memory_order_relaxed)) continue;
 
         const int ch = s.bufferChannels;
-        for (int i = 2; i < ch; ++i) scratch.clear (i, 0, n);
-        juce::AudioBuffer<float> view (scratch.getArrayOfWritePointers(), ch, n);
-        midi.clear();
+        for (int i = 2; i < ch; ++i) work.clear (i, 0, n);
+        juce::AudioBuffer<float> view (work.getArrayOfWritePointers(), ch, n);
+        eventMidi.clear();
         {
             const juce::ScopedLock pl (p->getCallbackLock());
             if (p->isSuspended()) continue;
-            p->processBlock (view, midi);
+            p->processBlock (view, eventMidi);
         }
-        if (s.mainOutChannels == 1) scratch.copyFrom (1, 0, scratch, 0, 0, n);
+        if (s.mainOutChannels == 1) work.copyFrom (1, 0, work, 0, 0, n);
     }
 }
 
@@ -621,8 +627,12 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     for (auto& tp : tracks)
     {
         auto& t = *tp;
-        juce::FloatVectorOperations::clear (L, n);
-        juce::FloatVectorOperations::clear (R, n);
+        // Scratch por faixa: elimina compartilhamento de estado de plugin
+        // com as outras faixas; sem alocacao dentro do callback.
+        auto* TL = t.processingBuffer.getWritePointer (0);
+        auto* TR = t.processingBuffer.getWritePointer (1);
+        juce::FloatVectorOperations::clear (TL, n);
+        juce::FloatVectorOperations::clear (TR, n);
 
         const auto* buf = t.playback.get();
         if (play && t.diskStream != nullptr && t.playbackRate == sr)
@@ -631,7 +641,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             {
                 const auto& sg = segs[i];
                 if (sg.src >= 0)
-                    t.diskStream->copy (L, R, sg.dst, sg.src, sg.len);
+                    t.diskStream->copy (TL, TR, sg.dst, sg.src, sg.len);
             }
         }
         else if (play && buf != nullptr && t.playbackRate == sr)
@@ -643,18 +653,18 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
                 const auto& sg = segs[i];
                 if (sg.src >= len || sg.src < 0) continue;
                 const int cnt = (int) juce::jmin ((juce::int64) sg.len, len - sg.src);
-                juce::FloatVectorOperations::copy (L + sg.dst, buf->getReadPointer (0, (int) sg.src), cnt);
-                juce::FloatVectorOperations::copy (R + sg.dst, buf->getReadPointer (mono ? 0 : 1, (int) sg.src), cnt);
+                juce::FloatVectorOperations::copy (TL + sg.dst, buf->getReadPointer (0, (int) sg.src), cnt);
+                juce::FloatVectorOperations::copy (TR + sg.dst, buf->getReadPointer (mono ? 0 : 1, (int) sg.src), cnt);
             }
         }
         if (t.phase.load (std::memory_order_relaxed))
         {
-            juce::FloatVectorOperations::negate (L, L, n);
-            juce::FloatVectorOperations::negate (R, R, n);
+            juce::FloatVectorOperations::negate (TL, TL, n);
+            juce::FloatVectorOperations::negate (TR, TR, n);
         }
 
-        runInserts (t, n);
-        t.pdc.process (L, R, n);
+        runInserts (t, n, t.processingBuffer, t.processingMidi);
+        t.pdc.process (TL, TR, n);
 
         const bool audible = ! t.mute.load (std::memory_order_relaxed) && (! anySolo || t.solo.load (std::memory_order_relaxed));
         const float g = audible ? dbToGain (t.gainDb.load (std::memory_order_relaxed)) : 0.0f;
@@ -672,18 +682,18 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             if (! valid) { s.smooth.skip (n); continue; }
             if (! s.preFader.load (std::memory_order_relaxed)) continue;
             auto& dst = busIn[(size_t) b];
-            auto sm = s.smooth; // mesma rampa para L e R
-            addWithRamp (dst.getWritePointer (0), L, n, sm);
-            addWithRamp (dst.getWritePointer (1), R, n, s.smooth);
+            auto sm = s.smooth; // mesma rampa para TL e TR
+            addWithRamp (dst.getWritePointer (0), TL, n, sm);
+            addWithRamp (dst.getWritePointer (1), TR, n, s.smooth);
         }
 
         // fader + pan
         if (t.smoothL.isSmoothing() || t.smoothR.isSmoothing())
-            for (int i = 0; i < n; ++i) { L[i] *= t.smoothL.getNextValue(); R[i] *= t.smoothR.getNextValue(); }
+            for (int i = 0; i < n; ++i) { TL[i] *= t.smoothL.getNextValue(); TR[i] *= t.smoothR.getNextValue(); }
         else
         {
-            juce::FloatVectorOperations::multiply (L, t.smoothL.getTargetValue(), n);
-            juce::FloatVectorOperations::multiply (R, t.smoothR.getTargetValue(), n);
+            juce::FloatVectorOperations::multiply (TL, t.smoothL.getTargetValue(), n);
+            juce::FloatVectorOperations::multiply (TR, t.smoothR.getTargetValue(), n);
         }
 
         // envios pos-fader
@@ -693,16 +703,16 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             if (b < 0 || b >= numBuses || s.preFader.load (std::memory_order_relaxed)) continue;
             auto& dst = busIn[(size_t) b];
             auto sm = s.smooth;
-            addWithRamp (dst.getWritePointer (0), L, n, sm);
-            addWithRamp (dst.getWritePointer (1), R, n, s.smooth);
+            addWithRamp (dst.getWritePointer (0), TL, n, sm);
+            addWithRamp (dst.getWritePointer (1), TR, n, s.smooth);
         }
 
         const int ob = t.outputBus.load (std::memory_order_relaxed);
         auto& out = (ob >= 0 && ob < numBuses) ? busIn[(size_t) ob] : direct;
-        out.addFrom (0, 0, L, n);
-        out.addFrom (1, 0, R, n);
+        out.addFrom (0, 0, TL, n);
+        out.addFrom (1, 0, TR, n);
 
-        storePeak (t.peakL, scratch.getMagnitude (0, 0, n));
+        storePeak (t.peakL, t.processingBuffer.getMagnitude (0, 0, n));
         storePeak (t.peakR, scratch.getMagnitude (1, 0, n));
     }
 
@@ -718,7 +728,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             juce::FloatVectorOperations::negate (L, L, n);
             juce::FloatVectorOperations::negate (R, R, n);
         }
-        runInserts (b, n);
+        runInserts (b, n, scratch, midi);
         b.pdc.process (L, R, n);
 
         const float g = b.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (b.gainDb.load (std::memory_order_relaxed));
@@ -742,7 +752,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     // ---------------- Master ----------------
     juce::FloatVectorOperations::copy (L, masterBuf.getReadPointer (0), n);
     juce::FloatVectorOperations::copy (R, masterBuf.getReadPointer (1), n);
-    runInserts (master, n);
+    runInserts (master, n, scratch, midi);
     {
         const float g = master.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (master.gainDb.load (std::memory_order_relaxed));
         float pl, pr;
