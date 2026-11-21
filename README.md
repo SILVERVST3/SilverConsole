@@ -67,6 +67,8 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - No menu **Plugins**, escolha **Escanear VST3 com processo isolado**. A descoberta de cada arquivo VST3 ocorre em `ScPluginScanWorker.exe`, um executavel auxiliar distribuído ao lado de `SilverConsole.exe`.
 - O SilverConsole pesquisa os caminhos VST3 padrao e inicia **um processo filho por candidato**. Se um plugin falhar ou nao responder em 20 segundos, a varredura continua nos proximos plugins sem executar o codigo desse candidato no processo principal.
 - O resultado e um XML atomico com as descricoes dos plugins; o mixer importa apenas metadados validos. Um teste no GitHub Actions verifica o scanner isolado com o VST3 de teste do projeto.
+- Os candidatos com crash, falha de leitura ou timeout sao colocados numa **lista persistente de quarentena**. O scanner normal pula esses arquivos nas verificacoes seguintes; para tentar de novo escolha **Plugins > Reavaliar VST3 com falha anterior...**. Plugins recuperados saem da lista automaticamente.
+- O botao **Cancelar** interrompe tambem o processo filho que estiver em andamento, sem precisar aguardar os 20 segundos. Resultados XML acima de 4 MiB, corrompidos ou com formato/schema invalido nao sao importados.
 - O gerenciador legado JUCE ainda oferece uma opcao de scan interno (sem isolamento), sinalizada como tal. Prefira o scan isolado.
 - **Limite de seguranca:** carregar/usar plugins em um insert ainda ocorre no processo principal. Isolamento de *processamento* VST3 e recuperacao de falhas em tempo real requerem uma engine separada e ainda nao foram implementados.
 
