@@ -20,7 +20,8 @@ public:
     static std::shared_ptr<StreamingAudio> open (const juce::File&, double engineRate,
                                                   juce::String& error);
     bool prime(); // chamada na thread de importacao, antes de publicar no motor
-    void service(); // exclusivamente na thread de leitura, nunca no callback
+    void service(); // worker de I/O ou thread de exportacao, nunca no callback
+    void prefetchBlocking (juce::int64 start, int count); // apenas render offline, fora do callback
 
     void copy (float* left, float* right, int destOffset, juce::int64 sourceStart, int count) noexcept;
     juce::int64 getLength() const noexcept { return length; }
@@ -41,7 +42,8 @@ private:
         int size;
     };
 
-    std::unique_ptr<juce::AudioFormatReader> reader; // acessado apenas pela thread de I/O
+    std::unique_ptr<juce::AudioFormatReader> reader; // protegido para worker/exportacao
+    std::mutex readerMutex;
     juce::int64 length = 0;
     double rate = 0.0;
     int channels = 0;
