@@ -11,7 +11,7 @@ int main (int argc, char** argv)
     // de construtores de terceiros do processo principal do SilverConsole.
     if (argc != 3)
     {
-        std::fprintf (stderr, "Uso: ScPluginScanWorker <arquivo.vst3> <resultado.xml>\\n");
+        std::fprintf (stderr, "Uso: ScPluginScanWorker <arquivo.vst3> <resultado.xml>\n");
         return 2;
     }
 
@@ -23,7 +23,7 @@ int main (int argc, char** argv)
     format.findAllTypesForFile (descriptions, source);
     if (descriptions.isEmpty())
     {
-        std::fprintf (stderr, "Nenhum VST3 reconhecido nesse arquivo.\\n");
+        std::fprintf (stderr, "Nenhum VST3 reconhecido nesse arquivo.\n");
         return 3;
     }
 
@@ -39,7 +39,7 @@ int main (int argc, char** argv)
     if (! root.writeTo (temporary.getFile())
         || ! temporary.overwriteTargetFileWithTemporary())
     {
-        std::fprintf (stderr, "Falha ao gravar resultado de varredura.\\n");
+        std::fprintf (stderr, "Falha ao gravar resultado de varredura.\n");
         return 4;
     }
 
