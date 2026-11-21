@@ -122,7 +122,7 @@ void InsertSlotComponent::paint (juce::Graphics& g)
         g.fillRect (r.getX() + 1.0f, r.getY() + 2.0f, 2.0f, r.getHeight() - 4.0f);
     }
     juce::Colour c = colours::lcdText;
-    if (s.isMissing()) c = colours::danger;
+    if (s.isMissing() || s.faulted.load (std::memory_order_relaxed)) c = colours::danger;
     else if (s.bypassed.load()) c = colours::textDim;
     g.setColour (c);
     g.drawFittedText (s.getName(), text.toNearestInt(), juce::Justification::centredLeft, 1, 0.85f);
@@ -130,10 +130,14 @@ void InsertSlotComponent::paint (juce::Graphics& g)
     {
         g.setColour (colours::mute);
         g.setFont (uiFont (9.0f, true));
-        g.drawText ("BYP", r.withTrimmedRight (3.0f), juce::Justification::centredRight);
+        g.drawText (s.faulted.load (std::memory_order_relaxed) ? "ERR" : "BYP",
+                    r.withTrimmedRight (3.0f), juce::Justification::centredRight);
     }
     setTooltip (s.isMissing() ? "Plugin nao encontrado: " + s.getName()
-                              : s.getName() + "  -  clique: editor | Shift+clique: bypass | botao direito: opcoes");
+              : s.faulted.load (std::memory_order_relaxed)
+                  ? "Falha de processamento: " + s.getName()
+                    + " (bypass automatico). Shift+clique para tentar reativar."
+                  : s.getName() + "  -  clique: editor | Shift+clique: bypass | botao direito: opcoes");
 }
 
 //==============================================================================
@@ -412,6 +416,8 @@ void ChannelStrip::tick()
         repaint();
     }
     if (shownMode != channel.getAutoMode()) refreshAutoButton();
+    // Estado faulted vem do callback; a interface atualiza sem locks em 30 Hz.
+    for (auto* slot : slots) slot->repaint();
 }
 
 void ChannelStrip::resized()
