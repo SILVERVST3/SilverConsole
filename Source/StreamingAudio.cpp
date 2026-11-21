@@ -42,12 +42,37 @@ std::shared_ptr<StreamingAudio> StreamingAudio::open (const juce::File& file,
         return {};
     }
     auto stream = std::shared_ptr<StreamingAudio> (new StreamingAudio (std::move (reader)));
+    stream->buildOverview();
     if (! stream->prime())
     {
         error = "Falha na leitura inicial do arquivo: " + file.getFileName();
         return {};
     }
     return stream;
+}
+
+void StreamingAudio::buildOverview()
+{
+    // Uma visao de ondas compacta para o editor de automacao.
+    // Amostragem esparsa: nao decodifica o arquivo inteiro na RAM.
+    constexpr int bins = 2048, probeSize = 128;
+    overview.assign ((size_t) bins, 0.0f);
+    juce::AudioBuffer<float> probe (channels, probeSize);
+    for (int i = 0; i < bins; ++i)
+    {
+        const auto start = (juce::int64) i * length / bins;
+        const int count = (int) juce::jmin ((juce::int64) probeSize, length - start);
+        if (count <= 0 || ! reader->read (&probe, 0, count, start, true, channels > 1))
+            continue;
+        float peak = 0.0f;
+        for (int c = 0; c < channels; ++c)
+        {
+            const auto* data = probe.getReadPointer (c);
+            for (int j = 0; j < count; ++j)
+                if (std::isfinite (data[j])) peak = juce::jmax (peak, std::abs (data[j]));
+        }
+        overview[(size_t) i] = peak;
+    }
 }
 
 bool StreamingAudio::prime()
