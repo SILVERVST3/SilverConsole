@@ -275,6 +275,9 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     setupTool (exportButton, "Exportar a mix para WAV (Ctrl+E)");
     setupTool (pluginsButton, "Escanear e gerenciar plugins VST3");
     setupTool (audioButton, "Configurar a placa de som (saida e buffer)");
+    setupTool (automationButton, juce::String::fromUTF8 ("Editor de automa\xc3\xa7\xc3\xa3o (Tab). Clique de novo para voltar ao mixer."));
+    automationButton.setClickingTogglesState (true);
+    automationButton.onClick = [this] { setAutomationVisible (automationButton.getToggleState()); };
     exportButton.setColour (juce::TextButton::buttonColourId, colours::accent.darker (0.35f));
 
     newButton.onClick = [this] { newProject(); };
@@ -297,6 +300,11 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     masterStrip = std::make_unique<ChannelStrip> (engine.master, *this);
     addAndMakeVisible (*masterStrip);
 
+    automationView = std::make_unique<AutomationView> (engine, *this);
+    addChildComponent (*automationView);
+    autoTimer.fn = [this] { recordTick(); };
+    autoTimer.startTimerHz (50);
+
     overlay.cancelButton.onClick = [this] { if (job != nullptr) job->cancel = true; };
     addChildComponent (overlay);
 
@@ -316,12 +324,14 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
 MainComponent::~MainComponent()
 {
     stopTimer();
+    autoTimer.stopTimer();
     if (job != nullptr) { job->cancel = true; job->stopThread (60000); job.reset(); }
     deviceManager.removeChangeListener (this);
     deviceManager.removeAudioCallback (&engine);
     deviceManager.closeAudioDevice();
     closeAllEditors();
     pluginManagerWindow.reset();
+    automationView.reset();
     strips.clear();
     masterStrip.reset();
     juce::LookAndFeel::setDefaultLookAndFeel (nullptr);
@@ -404,7 +414,10 @@ void MainComponent::resized()
     pluginsButton.setBounds (tools.removeFromLeft (80));
     tools.removeFromLeft (4);
     audioButton.setBounds (tools.removeFromLeft (70));
+    tools.removeFromLeft (18);
+    automationButton.setBounds (tools.removeFromLeft (100));
 
+    automationView->setBounds (r);
     r.reduce (8, 8);
     masterStrip->setBounds (r.removeFromRight (ChannelStrip::masterWidth).withTrimmedBottom (10));
     r.removeFromRight (10);
@@ -465,6 +478,7 @@ void MainComponent::timerCallback()
 
     for (auto* s : strips) s->tick();
     masterStrip->tick();
+    if (showAutomation) automationView->tick();
     timeline.repaint();
     repaint (382, 12, 150, 40);
     playButton.showPause = engine.playing.load();
@@ -506,6 +520,7 @@ bool MainComponent::keyPressed (const juce::KeyPress& k)
     if (k == juce::KeyPress::spaceKey) { togglePlay(); return true; }
     if (k == juce::KeyPress::homeKey) { engine.position = 0; playStart = 0; return true; }
     if (k == juce::KeyPress ('l')) { loopButton.triggerClick(); return true; }
+    if (k == juce::KeyPress::tabKey) { automationButton.triggerClick(); return true; }
     if (k == juce::KeyPress ('s', cmd, 0)) { save(); return true; }
     if (k == juce::KeyPress ('s', cmd | juce::ModifierKeys::shiftModifier, 0)) { saveAs(); return true; }
     if (k == juce::KeyPress ('o', cmd, 0)) { openProjectDialog(); return true; }
@@ -523,6 +538,66 @@ void MainComponent::togglePlay()
         playStart = engine.position.load();
         engine.playing = true;
     }
+}
+
+void MainComponent::setAutomationVisible (bool show)
+{
+    showAutomation = show;
+    automationButton.setToggleState (show, juce::dontSendNotification);
+    automationView->setVisible (show);
+    mixerViewport.setVisible (! show);
+    masterStrip->setVisible (! show);
+    if (show) { automationView->rebuild(); automationView->toFront (false); }
+    overlay.toFront (false);
+    repaint();
+}
+
+void MainComponent::recordTick()
+{
+    if (job != nullptr) return;
+    recorder.process ((double) engine.position.load() / engine.getSampleRate(), engine.playing.load(),
+                      juce::Time::getMillisecondCounterHiRes());
+}
+
+void MainComponent::automationTouch (Channel& c, AutoTarget tg, bool down)
+{
+    recorder.touch (c, tg, -1, -1, down, juce::Time::getMillisecondCounterHiRes());
+}
+
+void MainComponent::muteToggled (Channel& c)
+{
+    const auto mode = c.getAutoMode();
+    if (engine.playing.load() && (mode == AutoMode::touch || mode == AutoMode::latch))
+        recorder.recordMuteStep (c, (double) engine.position.load() / engine.getSampleRate());
+}
+
+void MainComponent::autoModeMenu (Channel& c, juce::Component& source)
+{
+    juce::PopupMenu m;
+    m.addSectionHeader (juce::String::fromUTF8 ("Automa\xc3\xa7\xc3\xa3o - ") + c.name);
+    const juce::String tips[] { "desligada (ignora as linhas)",
+                                juce::String::fromUTF8 ("toca a automa\xc3\xa7\xc3\xa3o"),
+                                juce::String::fromUTF8 ("grava enquanto voc\xc3\xaa segura o controle"),
+                                juce::String::fromUTF8 ("grava do toque at\xc3\xa9 parar"),
+                                "grava tudo enquanto toca" };
+    for (int i = 0; i <= (int) AutoMode::write; ++i)
+        m.addColouredItem (1 + i, autoModeName ((AutoMode) i) + "  -  " + tips[i], autoModeColour ((AutoMode) i), true, (int) c.getAutoMode() == i);
+    auto* cp = &c;
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&source), [this, cp] (int r)
+    {
+        if (r == 0 || ! channelExists (cp)) return;
+        cp->autoMode = r - 1;
+        if (auto* s = stripFor (cp)) s->refresh();
+        if (automationView != nullptr) automationView->repaint();
+        markDirty();
+    });
+}
+
+void MainComponent::lanesChanged()
+{
+    recorder.reset();
+    if (automationView != nullptr) automationView->rebuild();
+    markDirty();
 }
 
 void MainComponent::markDirty()
@@ -549,6 +624,7 @@ void MainComponent::runJob (const juce::String& title, bool cancellable, std::fu
 {
     if (job != nullptr) return;
     engine.playing = false;
+    recorder.process ((double) engine.position.load() / engine.getSampleRate(), false, juce::Time::getMillisecondCounterHiRes());
     job = std::make_unique<Job> (std::move (work));
     jobDone = std::move (done);
     overlay.show (title, cancellable);
@@ -559,10 +635,12 @@ void MainComponent::runJob (const juce::String& title, bool cancellable, std::fu
 // Estrutura do mixer
 void MainComponent::rebuildStrips()
 {
+    recorder.reset();
     strips.clear();
     for (auto& t : engine.tracks) mixerContent.addAndMakeVisible (strips.add (new ChannelStrip (*t, *this)));
     for (auto& b : engine.buses) mixerContent.addAndMakeVisible (strips.add (new ChannelStrip (*b, *this)));
     masterStrip->refresh();
+    if (automationView != nullptr) automationView->rebuild();
     resized();
     repaint();
 }
@@ -734,11 +812,13 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
         if (r == 1) openEditor (*cp, slot);
         else if (r == 2) engine.setBypass (*cp, slot, ! sl.bypassed.load());
         else if (r == 3) { if (src != nullptr) showPluginMenu (*cp, slot, *src, true); }
-        else if (r == 4 || r == 5) engine.swapInserts (*cp, slot, slot + (r == 4 ? -1 : 1));
+        else if (r == 4 || r == 5) { engine.swapInserts (*cp, slot, slot + (r == 4 ? -1 : 1)); lanesChanged(); }
         else if (r == 9)
         {
             closeEditor (*cp, slot);
             auto old = engine.clearInsert (*cp, slot);
+            engine.removeLanesForSlot (*cp, slot);
+            lanesChanged();
         }
         if (auto* st = stripFor (cp)) st->refresh();
         markDirty();
@@ -778,8 +858,10 @@ void MainComponent::loadPluginInto (Channel& c, int slot, const juce::PluginDesc
         return;
     }
     closeEditor (c, slot);
+    const bool hadPlugin = c.inserts[(size_t) slot].processor != nullptr || c.inserts[(size_t) slot].isMissing();
     auto old = engine.setInsert (c, slot, std::move (inst), &d);
     old.reset();
+    if (hadPlugin) { engine.removeLanesForSlot (c, slot); lanesChanged(); } // parametros do plugin antigo nao valem mais
     if (auto* s = stripFor (&c)) s->refresh();
     markDirty();
     openEditor (c, slot);
@@ -1051,7 +1133,10 @@ void MainComponent::resetSession()
     std::vector<std::unique_ptr<juce::AudioProcessor>> procs;
     std::vector<std::unique_ptr<Track>> oldTracks;
     std::vector<std::unique_ptr<Bus>> oldBuses;
+    recorder.reset();
     engine.clearSession (procs, oldTracks, oldBuses);
+    engine.master.autoMode = (int) AutoMode::read;
+    engine.editAutomation ([this] { engine.master.lanes.clear(); });
     strips.clear();
     masterStrip->refresh();
     procs.clear();
@@ -1140,7 +1225,7 @@ void MainComponent::openFile (const juce::File& file)
         for (auto& bd : data->buses)
             if (auto* b = engine.addBus (bd.name))
             {
-                applyChannelBasics (*b, bd);
+                applyChannelBasics (engine, *b, bd);
                 loadInserts (*b, bd, problems);
             }
         for (size_t i = 0; i < data->tracks.size(); ++i)
@@ -1148,7 +1233,7 @@ void MainComponent::openFile (const juce::File& file)
             auto& td = data->tracks[i];
             auto& d = (*decoded)[i];
             auto t = std::make_unique<Track>();
-            applyChannelBasics (*t, td.ch);
+            applyChannelBasics (engine, *t, td.ch);
             t->sourceFile = td.file;
             t->outputBus = td.output;
             for (int s = 0; s < kNumSends; ++s)
@@ -1162,7 +1247,7 @@ void MainComponent::openFile (const juce::File& file)
             else problems.add (raw->name + ": " + (d.audio.error.isNotEmpty() ? d.audio.error : juce::String ("sem arquivo de audio")));
             loadInserts (*raw, td.ch, problems);
         }
-        applyChannelBasics (engine.master, data->master);
+        applyChannelBasics (engine, engine.master, data->master);
         engine.master.name = "MASTER";
         engine.master.mono = data->masterMono;
         loadInserts (engine.master, data->master, problems);

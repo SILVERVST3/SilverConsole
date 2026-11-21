@@ -276,6 +276,12 @@ void Engine::swapInserts (Channel& c, int a, int b)
 {
     if (! juce::isPositiveAndBelow (a, kNumInserts) || ! juce::isPositiveAndBelow (b, kNumInserts)) return;
     const juce::ScopedLock sl (lock);
+    for (auto& l : c.lanes) // a automacao acompanha o plugin
+        if (l->target == AutoTarget::plugin)
+        {
+            if (l->slot == a) l->slot = b;
+            else if (l->slot == b) l->slot = a;
+        }
     auto& x = c.inserts[(size_t) a];
     auto& y = c.inserts[(size_t) b];
     std::swap (x.processor, y.processor);
@@ -339,6 +345,131 @@ void Engine::clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& t
     for (auto& b : oldBuses) unlisten (*b);
     updateLength();
 }
+
+//==============================================================================
+// Automacao
+AutoLane* Engine::findLane (Channel& c, AutoTarget tg, int slot, int param) const
+{
+    for (auto& l : c.lanes)
+        if (l->matches (tg, slot, param)) return l.get();
+    return nullptr;
+}
+
+AutoLane* Engine::getOrCreateLane (Channel& c, AutoTarget tg, int slot, int param)
+{
+    if (auto* l = findLane (c, tg, slot, param)) return l;
+    auto lane = std::make_unique<AutoLane>();
+    lane->target = tg;
+    lane->slot = tg == AutoTarget::plugin ? slot : -1;
+    lane->param = tg == AutoTarget::plugin ? param : -1;
+    lane->step = isStepTarget (c, tg, slot, param);
+    auto* raw = lane.get();
+    const juce::ScopedLock sl (lock);
+    c.lanes.push_back (std::move (lane));
+    return raw;
+}
+
+void Engine::removeLane (Channel& c, AutoLane* lane)
+{
+    std::unique_ptr<AutoLane> gone;
+    {
+        const juce::ScopedLock sl (lock);
+        for (auto it = c.lanes.begin(); it != c.lanes.end(); ++it)
+            if (it->get() == lane) { gone = std::move (*it); c.lanes.erase (it); break; }
+    }
+}
+
+void Engine::removeLanesForSlot (Channel& c, int slot)
+{
+    std::vector<std::unique_ptr<AutoLane>> gone;
+    const juce::ScopedLock sl (lock);
+    for (auto it = c.lanes.begin(); it != c.lanes.end();)
+    {
+        if ((*it)->target == AutoTarget::plugin && (*it)->slot == slot) { gone.push_back (std::move (*it)); it = c.lanes.erase (it); }
+        else ++it;
+    }
+}
+
+bool Engine::currentValue (Channel& c, AutoTarget tg, int slot, int param, float& value)
+{
+    switch (tg)
+    {
+        case AutoTarget::volume: value = c.gainDb.load(); return true;
+        case AutoTarget::pan:    value = c.pan.load(); return true;
+        case AutoTarget::mute:   value = c.mute.load() ? 1.0f : 0.0f; return true;
+        case AutoTarget::plugin:
+            if (juce::isPositiveAndBelow (slot, kNumInserts))
+                if (auto* p = c.inserts[(size_t) slot].processor.get())
+                {
+                    auto& params = p->getParameters();
+                    if (juce::isPositiveAndBelow (param, params.size())) { value = params[param]->getValue(); return true; }
+                }
+            return false;
+    }
+    return false;
+}
+
+bool Engine::isStepTarget (Channel& c, AutoTarget tg, int slot, int param)
+{
+    if (tg == AutoTarget::mute) return true;
+    if (tg != AutoTarget::plugin || ! juce::isPositiveAndBelow (slot, kNumInserts)) return false;
+    if (auto* p = c.inserts[(size_t) slot].processor.get())
+    {
+        auto& params = p->getParameters();
+        if (juce::isPositiveAndBelow (param, params.size()))
+            return params[param]->isDiscrete() || params[param]->isBoolean();
+    }
+    return false;
+}
+
+void Engine::applyAutomation (Channel& c, double t)
+{
+    if (c.lanes.empty() || c.getAutoMode() == AutoMode::off) return;
+    for (auto& lp : c.lanes)
+    {
+        auto& l = *lp;
+        if (l.points.empty() || l.writing.load (std::memory_order_relaxed)) continue;
+        const float v = l.valueAt (t);
+        switch (l.target)
+        {
+            case AutoTarget::volume: c.gainDb.store (juce::jlimit (kMinDb, 12.0f, v), std::memory_order_relaxed); break;
+            case AutoTarget::pan:    c.pan.store (juce::jlimit (-1.0f, 1.0f, v), std::memory_order_relaxed); break;
+            case AutoTarget::mute:   c.mute.store (v >= 0.5f, std::memory_order_relaxed); break;
+            case AutoTarget::plugin:
+                if (juce::isPositiveAndBelow (l.slot, kNumInserts))
+                    if (auto* p = c.inserts[(size_t) l.slot].processor.get())
+                    {
+                        auto& params = p->getParameters();
+                        if (juce::isPositiveAndBelow (l.param, params.size()))
+                        {
+                            auto* pr = params[l.param];
+                            const float nv = juce::jlimit (0.0f, 1.0f, v);
+                            if (std::abs (pr->getValue() - nv) > 1.0e-6f) pr->setValue (nv);
+                        }
+                    }
+                break;
+        }
+    }
+}
+
+void Engine::pushParamEvent (juce::AudioProcessor* p, int index, int type)
+{
+    const juce::SpinLock::ScopedLockType sl (paramPushLock);
+    const auto scope = paramFifo.write (1);
+    if (scope.blockSize1 > 0) paramEvents[(size_t) scope.startIndex1] = { p, index, type };
+}
+
+bool Engine::popParamEvent (ParamEvent& e)
+{
+    const auto scope = paramFifo.read (1);
+    if (scope.blockSize1 <= 0) return false;
+    e = paramEvents[(size_t) scope.startIndex1];
+    return true;
+}
+
+void Engine::audioProcessorParameterChanged (juce::AudioProcessor* p, int index, float) { pushParamEvent (p, index, 0); }
+void Engine::audioProcessorParameterChangeGestureBegin (juce::AudioProcessor* p, int index) { pushParamEvent (p, index, 1); }
+void Engine::audioProcessorParameterChangeGestureEnd (juce::AudioProcessor* p, int index) { pushParamEvent (p, index, 2); }
 
 //==============================================================================
 void Engine::audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails& d)
@@ -449,6 +580,11 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             if (loop && p == le) p = ls;
         }
     }
+
+    // Automacao: aplicada tocando ou quando o cursor foi movido.
+    const bool applyAuto = play || pos != lastRenderEnd;
+    const double tSec = (double) pos / sr;
+    if (applyAuto) forEachChannelNoAlloc ([this, tSec] (Channel& c) { applyAutomation (c, tSec); });
 
     const int numBuses = (int) buses.size();
     for (int b = 0; b < numBuses; ++b) busIn[(size_t) b].clear (0, n);
@@ -594,7 +730,8 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
 
     juce::FloatVectorOperations::copy (outL, L, n);
     juce::FloatVectorOperations::copy (outR, R, n);
-    return play ? p : pos;
+    lastRenderEnd = play ? p : pos;
+    return lastRenderEnd;
 }
 
 //==============================================================================
@@ -671,6 +808,7 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
             c.pdc.clear();
         });
         directDelay.clear();
+        lastRenderEnd = -1;
         rendering = false;
     };
 

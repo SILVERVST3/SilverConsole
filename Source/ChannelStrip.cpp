@@ -22,6 +22,19 @@ namespace
     }
 }
 
+juce::Colour autoModeColour (AutoMode m)
+{
+    switch (m)
+    {
+        case AutoMode::off:   return juce::Colour (0xff5a636c);
+        case AutoMode::read:  return juce::Colour (0xff4cc46a);
+        case AutoMode::touch: return juce::Colour (0xffe8c42a);
+        case AutoMode::latch: return juce::Colour (0xffe0892c);
+        case AutoMode::write: return juce::Colour (0xffe2453c);
+    }
+    return juce::Colours::grey;
+}
+
 //==============================================================================
 float LevelMeter::dbToY (float db, float h)
 {
@@ -219,6 +232,8 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
         host.markDirty();
     };
     panKnob.setTooltip (isTrack ? "Pan (duplo clique: centro)" : "Balance (duplo clique: centro)");
+    panKnob.onDragStart = [this] { host.automationTouch (channel, AutoTarget::pan, true); };
+    panKnob.onDragEnd = [this] { host.automationTouch (channel, AutoTarget::pan, false); };
     addAndMakeVisible (panKnob);
     setupSmallLabel (panLabel, 10.5f, colours::ink);
     addAndMakeVisible (panLabel);
@@ -233,7 +248,12 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
         addAndMakeVisible (b);
     };
     setupToggle (muteButton, colours::mute, "Mute");
-    muteButton.onClick = [this] { channel.mute = muteButton.getToggleState(); host.markDirty(); };
+    muteButton.onClick = [this] { channel.mute = muteButton.getToggleState(); host.muteToggled (channel); host.markDirty(); };
+
+    autoButton.setWantsKeyboardFocus (false);
+    autoButton.setTooltip (juce::String::fromUTF8 ("Automa\xc3\xa7\xc3\xa3o: OFF, READ (toca), TOUCH (grava enquanto segura), LATCH (grava at\xc3\xa9 parar), WRITE (grava tudo)"));
+    autoButton.onClick = [this] { host.autoModeMenu (channel, autoButton); };
+    addAndMakeVisible (autoButton);
     if (isTrack)
     {
         setupToggle (soloButton, colours::solo, "Solo");
@@ -263,6 +283,8 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
         host.markDirty();
     };
     fader.setTooltip ("Volume (duplo clique: 0 dB | Ctrl+arrastar: ajuste fino)");
+    fader.onDragStart = [this] { host.automationTouch (channel, AutoTarget::volume, true); };
+    fader.onDragEnd = [this] { host.automationTouch (channel, AutoTarget::volume, false); };
     addAndMakeVisible (fader);
     addAndMakeVisible (meter);
     meter.setTooltip ("Pico L/R (clique: limpa o clip)");
@@ -332,13 +354,41 @@ void ChannelStrip::refresh()
         monoButton.setToggleState (engine.master.mono.load(), juce::dontSendNotification);
     }
     infoLabel.setText (info, juce::dontSendNotification);
+    refreshAutoButton();
     for (auto* s : slots) s->repaint();
     repaint();
+}
+
+void ChannelStrip::refreshAutoButton()
+{
+    shownMode = channel.getAutoMode();
+    autoButton.setButtonText (autoModeName (shownMode));
+    const auto c = autoModeColour (shownMode);
+    autoButton.setColour (juce::TextButton::buttonColourId, shownMode == AutoMode::off ? juce::Colour (0xff3a4148) : c.darker (0.15f));
+    autoButton.setColour (juce::TextButton::textColourOffId, shownMode == AutoMode::off ? colours::textDim : colours::ink);
 }
 
 void ChannelStrip::tick()
 {
     meter.push (channel.peakL.exchange (0.0f), channel.peakR.exchange (0.0f));
+
+    // a automacao move os controles
+    if (! fader.isMouseButtonDown() && std::abs (fader.getValue() - channel.gainDb.load()) > 0.005)
+    {
+        fader.setValue (channel.gainDb.load(), juce::dontSendNotification);
+        updateGainLabel();
+    }
+    if (! panKnob.isMouseButtonDown() && std::abs (panKnob.getValue() - channel.pan.load()) > 0.0005)
+    {
+        panKnob.setValue (channel.pan.load(), juce::dontSendNotification);
+        panLabel.setText (panText(), juce::dontSendNotification);
+    }
+    if (muteButton.getToggleState() != channel.mute.load())
+    {
+        muteButton.setToggleState (channel.mute.load(), juce::dontSendNotification);
+        repaint();
+    }
+    if (shownMode != channel.getAutoMode()) refreshAutoButton();
 }
 
 void ChannelStrip::resized()
@@ -355,21 +405,23 @@ void ChannelStrip::resized()
     panKnob.setBounds (w / 2 - 21, 314, 42, 42);
     panLabel.setBounds (4, 355, w - 8, 13);
 
+    autoButton.setBounds (6, 372, w - 12, 20);
     const int bw = (w - 16) / 3;
+    const int rowY = 396;
     if (channel.kind == ChannelKind::master)
     {
-        muteButton.setBounds (6, 372, 30, 20);
-        monoButton.setBounds (40, 372, w - 46, 20);
+        muteButton.setBounds (6, rowY, 30, 20);
+        monoButton.setBounds (40, rowY, w - 46, 20);
     }
     else
     {
-        muteButton.setBounds (6, 372, bw, 20);
-        if (channel.kind == ChannelKind::track) soloButton.setBounds (8 + bw, 372, bw, 20);
-        phaseButton.setBounds (10 + 2 * bw, 372, bw, 20);
+        muteButton.setBounds (6, rowY, bw, 20);
+        if (channel.kind == ChannelKind::track) soloButton.setBounds (8 + bw, rowY, bw, 20);
+        phaseButton.setBounds (10 + 2 * bw, rowY, bw, 20);
     }
 
     const int bottom = getHeight() - 28;
-    faderArea = { 0, 400, w, juce::jmax (80, bottom - 400) };
+    faderArea = { 0, 426, w, juce::jmax (80, bottom - 426) };
     const int meterW = channel.kind == ChannelKind::master ? 22 : 16;
     meter.setBounds (w - meterW - 6, faderArea.getY(), meterW, faderArea.getHeight());
     fader.setBounds (24, faderArea.getY() - 10, w - meterW - 34, faderArea.getHeight() + 20);

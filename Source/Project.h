@@ -14,6 +14,14 @@ struct InsertData
     juce::MemoryBlock state;
 };
 
+struct LaneData
+{
+    AutoTarget target = AutoTarget::volume;
+    int slot = -1, param = -1;
+    bool step = false;
+    std::vector<AutoPoint> points;
+};
+
 struct ChannelData
 {
     juce::String name;
@@ -21,6 +29,8 @@ struct ChannelData
     float gainDb = 0.0f, pan = 0.0f;
     bool mute = false, solo = false, phase = false;
     std::vector<InsertData> inserts;
+    AutoMode autoMode = AutoMode::read;
+    std::vector<LaneData> lanes;
 };
 
 struct SendData { int bus = -1; float levelDb = 0.0f; bool pre = false; };
@@ -48,7 +58,8 @@ constexpr const char* kProjectExtension = ".sconsole";
 
 /** Copia o estado atual do motor (inclui o estado dos plugins). Thread de mensagens. */
 ProjectData captureProject (Engine&);
-void applyChannelBasics (Channel&, const ChannelData&);
+/** Copia nome, cor, parametros, modo e linhas de automacao (com o lock do motor). */
+void applyChannelBasics (Engine&, Channel&, const ChannelData&);
 
 bool writeProject (const ProjectData&, const juce::File&, juce::String& error);
 bool readProject (const juce::File&, ProjectData&, juce::String& error);

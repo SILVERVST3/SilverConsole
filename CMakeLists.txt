@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(SilverConsole VERSION 0.1.0 LANGUAGES C CXX)
+project(SilverConsole VERSION 0.2.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -32,7 +32,9 @@ set(SC_COMMON_DEFS
 set(SC_ENGINE_SOURCES
     Source/Engine.cpp Source/Engine.h
     Source/AudioLoader.cpp Source/AudioLoader.h
-    Source/Project.cpp Source/Project.h)
+    Source/Project.cpp Source/Project.h
+    Source/Automation.h
+    Source/AutomationRecorder.cpp Source/AutomationRecorder.h)
 
 #------------------------------------------------------------------------------
 juce_add_gui_app(SilverConsole
@@ -47,6 +49,7 @@ target_sources(SilverConsole PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp Source/MainComponent.h
     Source/ChannelStrip.cpp Source/ChannelStrip.h
+    Source/AutomationView.cpp Source/AutomationView.h
     Source/SilverLookAndFeel.h
     Source/PluginHost.h
     Source/PluginWindow.h)

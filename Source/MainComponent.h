@@ -5,6 +5,8 @@
 #include "ChannelStrip.h"
 #include "PluginHost.h"
 #include "PluginWindow.h"
+#include "AutomationRecorder.h"
+#include "AutomationView.h"
 #include "SilverLookAndFeel.h"
 
 namespace sc
@@ -100,6 +102,10 @@ public:
     void outputMenu (Track&, juce::Component&) override;
     bool isEditorOpen (const Channel&, int slot) const override;
     void markDirty() override;
+    void automationTouch (Channel&, AutoTarget, bool down) override;
+    void muteToggled (Channel&) override;
+    void autoModeMenu (Channel&, juce::Component&) override;
+    void lanesChanged() override;
 
 private:
     void timerCallback() override;
@@ -143,6 +149,8 @@ private:
 
     void runJob (const juce::String& title, bool cancellable, std::function<void (Job&)> work, std::function<void (Job&)> done);
     void togglePlay();
+    void setAutomationVisible (bool);
+    void recordTick();
     void alert (const juce::String& title, const juce::String& text, bool warning = true);
 
     juce::ApplicationProperties& props;
@@ -165,6 +173,11 @@ private:
     juce::Component mixerContent;
     juce::OwnedArray<ChannelStrip> strips;
     std::unique_ptr<ChannelStrip> masterStrip;
+    AutomationRecorder recorder { engine };
+    std::unique_ptr<AutomationView> automationView;
+    juce::TextButton automationButton { juce::String::fromUTF8 ("Automa\xc3\xa7\xc3\xa3o") };
+    bool showAutomation = false;
+    struct CallbackTimer : juce::Timer { std::function<void()> fn; void timerCallback() override { if (fn) fn(); } } autoTimer;
     BusyOverlay overlay;
 
     std::vector<std::unique_ptr<PluginWindow>> pluginWindows;

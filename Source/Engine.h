@@ -3,6 +3,7 @@
 #pragma once
 
 #include <JuceHeader.h>
+#include "Automation.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -98,6 +99,11 @@ struct Channel
     // medidores (audio escreve, interface le e zera)
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
 
+    // automacao
+    std::atomic<int> autoMode { (int) AutoMode::read };
+    std::vector<std::unique_ptr<AutoLane>> lanes;
+    AutoMode getAutoMode() const noexcept { return (AutoMode) autoMode.load(); }
+
     // estado de render
     juce::LinearSmoothedValue<float> smoothL, smoothR;
     DelayLine pdc;
@@ -169,6 +175,21 @@ public:
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
                         std::shared_ptr<const juce::AudioBuffer<float>> playback, double playbackRate);
 
+    // ---- Automacao (thread de mensagens) --------------------------------------
+    AutoLane* findLane (Channel&, AutoTarget, int slot = -1, int param = -1) const;
+    AutoLane* getOrCreateLane (Channel&, AutoTarget, int slot = -1, int param = -1);
+    void removeLane (Channel&, AutoLane*);
+    void removeLanesForSlot (Channel&, int slot);
+    /** Executa fn com o lock do motor (para editar pontos). */
+    template <typename Fn> void editAutomation (Fn&& fn) { const juce::ScopedLock sl (lock); fn(); }
+    /** Valor atual do alvo (volume dB, pan, mute 0/1, plugin 0..1). */
+    static bool currentValue (Channel&, AutoTarget, int slot, int param, float& value);
+    static bool isStepTarget (Channel&, AutoTarget, int slot, int param);
+
+    /** Eventos de parametros dos plugins (mexidos pelo usuario na janela do plugin). */
+    struct ParamEvent { juce::AudioProcessor* proc = nullptr; int index = 0; int type = 0; }; // 0 mudou, 1 inicio, 2 fim
+    bool popParamEvent (ParamEvent&);
+
     /** Remove tudo (devolve processadores para destruir fora do lock). */
     void clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& toDelete,
                        std::vector<std::unique_ptr<Track>>& oldTracks,
@@ -213,13 +234,23 @@ public:
 
 private:
     void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override;
-    void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override {}
+    void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override;
+    void audioProcessorParameterChangeGestureBegin (juce::AudioProcessor*, int) override;
+    void audioProcessorParameterChangeGestureEnd (juce::AudioProcessor*, int) override;
+    void pushParamEvent (juce::AudioProcessor*, int index, int type);
+    void applyAutomation (Channel&, double timeSec);
 
     void prepareChannel (Channel&);
     void prepareSlot (InsertSlot&);
     int chainLatencyOf (const Channel&) const;
     void runInserts (Channel&, int n);
     void forEachChannel (const std::function<void (Channel&)>&);
+    template <typename Fn> void forEachChannelNoAlloc (Fn&& fn)
+    {
+        for (auto& t : tracks) fn (*t);
+        for (auto& b : buses) fn (*b);
+        fn (master);
+    }
 
     std::atomic<double> sampleRate { 48000.0 };
     int blockSize = 512;
@@ -232,6 +263,11 @@ private:
     std::array<juce::AudioBuffer<float>, kMaxBuses> busIn;
     juce::MidiBuffer midi;
     DelayLine directDelay;
+    juce::int64 lastRenderEnd = -1;
+
+    std::array<ParamEvent, 1024> paramEvents;
+    juce::AbstractFifo paramFifo { 1024 };
+    juce::SpinLock paramPushLock;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (Engine)
 };

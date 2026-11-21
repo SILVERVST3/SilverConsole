@@ -28,6 +28,12 @@ namespace
             else in.state = s.missingState;
             if (in.hasDesc) d.inserts.push_back (std::move (in));
         }
+        d.autoMode = c.getAutoMode();
+        for (auto& l : c.lanes)
+        {
+            if (l->points.empty()) continue;
+            d.lanes.push_back ({ l->target, l->slot, l->param, l->step, l->points });
+        }
         return d;
     }
 
@@ -47,6 +53,20 @@ namespace
             x->setAttribute ("bypass", in.bypass);
             if (auto desc = in.desc.createXml()) x->addChildElement (desc.release());
             x->createNewChildElement ("STATE")->addTextElement (in.state.toBase64Encoding());
+        }
+        auto* a = e.createNewChildElement ("AUTOMATION");
+        a->setAttribute ("mode", (int) d.autoMode);
+        for (auto& l : d.lanes)
+        {
+            auto* x = a->createNewChildElement ("LANE");
+            x->setAttribute ("target", (int) l.target);
+            x->setAttribute ("slot", l.slot);
+            x->setAttribute ("param", l.param);
+            x->setAttribute ("step", l.step);
+            juce::String pts;
+            pts.preallocateBytes ((size_t) l.points.size() * 20);
+            for (auto& p : l.points) pts << juce::String (p.t, 4) << ',' << juce::String (p.v, 5) << ' ';
+            x->addTextElement (pts.trimEnd());
         }
     }
 
@@ -68,6 +88,29 @@ namespace
             if (auto* p = x->getChildByName ("PLUGIN")) in.hasDesc = in.desc.loadFromXml (*p);
             if (auto* s = x->getChildByName ("STATE")) in.state.fromBase64Encoding (s->getAllSubText().trim());
             if (in.hasDesc) d.inserts.push_back (std::move (in));
+        }
+        if (auto* a = e.getChildByName ("AUTOMATION"))
+        {
+            d.autoMode = (AutoMode) juce::jlimit (0, 4, a->getIntAttribute ("mode", (int) AutoMode::read));
+            for (auto* x : a->getChildWithTagNameIterator ("LANE"))
+            {
+                LaneData l;
+                l.target = (AutoTarget) juce::jlimit (0, 3, x->getIntAttribute ("target"));
+                l.slot = x->getIntAttribute ("slot", -1);
+                l.param = x->getIntAttribute ("param", -1);
+                l.step = x->getBoolAttribute ("step");
+                if (l.target == AutoTarget::plugin && (! juce::isPositiveAndBelow (l.slot, kNumInserts) || l.param < 0)) continue;
+                auto tokens = juce::StringArray::fromTokens (x->getAllSubText(), " \n\r\t", "");
+                for (auto& tok : tokens)
+                {
+                    const auto t = tok.upToFirstOccurrenceOf (",", false, false).getDoubleValue();
+                    const auto v = (float) tok.fromFirstOccurrenceOf (",", false, false).getDoubleValue();
+                    if (std::isfinite (t) && std::isfinite (v) && t >= 0.0 && l.points.size() < 2000000)
+                        l.points.push_back ({ t, v });
+                }
+                std::sort (l.points.begin(), l.points.end(), [] (const AutoPoint& p, const AutoPoint& q) { return p.t < q.t; });
+                if (! l.points.empty()) d.lanes.push_back (std::move (l));
+            }
         }
     }
 }
@@ -98,8 +141,17 @@ ProjectData captureProject (Engine& engine)
     return p;
 }
 
-void applyChannelBasics (Channel& c, const ChannelData& d)
+void applyChannelBasics (Engine& engine, Channel& c, const ChannelData& d)
 {
+    std::vector<std::unique_ptr<AutoLane>> lanes;
+    for (auto& ld : d.lanes)
+    {
+        auto l = std::make_unique<AutoLane>();
+        l->target = ld.target; l->slot = ld.slot; l->param = ld.param; l->step = ld.step; l->points = ld.points;
+        lanes.push_back (std::move (l));
+    }
+    engine.editAutomation ([&] { c.lanes = std::move (lanes); });
+    c.autoMode = (int) d.autoMode;
     c.name = d.name;
     c.colour = d.colour;
     c.gainDb = d.gainDb;

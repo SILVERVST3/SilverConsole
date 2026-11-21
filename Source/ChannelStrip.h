@@ -16,7 +16,14 @@ public:
     virtual void outputMenu (Track&, juce::Component& source) = 0;
     virtual bool isEditorOpen (const Channel&, int slot) const = 0;
     virtual void markDirty() = 0;
+    // automacao
+    virtual void automationTouch (Channel&, AutoTarget, bool down) = 0;
+    virtual void muteToggled (Channel&) = 0;
+    virtual void autoModeMenu (Channel&, juce::Component& source) = 0;
+    virtual void lanesChanged() = 0;
 };
+
+juce::Colour autoModeColour (AutoMode);
 
 //==============================================================================
 class LevelMeter : public juce::Component, public juce::SettableTooltipClient
@@ -91,6 +98,9 @@ private:
     juce::Label nameLabel, infoLabel, gainLabel, panLabel;
     juce::OwnedArray<InsertSlotComponent> slots;
     juce::OwnedArray<SendRow> sends;
+    void refreshAutoButton();
+    juce::TextButton autoButton;
+    AutoMode shownMode = AutoMode::off;
     juce::TextButton outputButton, muteButton { "M" }, soloButton { "S" }, phaseButton { juce::String::fromUTF8 ("\xc3\x98") },
                      monoButton { "MONO" };
     juce::Slider fader { juce::Slider::LinearVertical, juce::Slider::NoTextBox };

@@ -4,6 +4,7 @@
 #include "Engine.h"
 #include "AudioLoader.h"
 #include "Project.h"
+#include "AutomationRecorder.h"
 #include <cstdio>
 
 using namespace sc;
@@ -233,6 +234,108 @@ static void testDeviceCallback()
     check (e.position.load() == 4000, "parado nao avanca");
 }
 
+static void testAutomationRead()
+{
+    Engine e; e.prepare (48000, 256);
+    auto* t = addTrack (e, makeBuffer (1, 96000, [] (int, int) { return 0.5f; }), "dc");
+    const float c = 0.5f * std::cos (juce::MathConstants<float>::pi * 0.25f);
+    auto* l = e.getOrCreateLane (*t, AutoTarget::volume);
+    e.editAutomation ([&] { l->insert (0.0, 0.0f); l->insert (1.0, 0.0f); l->insert (1.0001, kMinDb); });
+    auto out = run (e, 72000);
+    check (near (out.getSample (0, 40000), c) && near (out.getSample (0, 70000), 0.0f), "automacao de volume (0 dB -> -inf em 1 s)");
+    check (t->gainDb.load() <= kMinDb, "fader acompanha a automacao");
+
+    e.editAutomation ([&] { l->points.clear(); l->insert (0.0, 0.0f); l->insert (1.0, -12.0f); });
+    out = run (e, 30000);
+    check (near (out.getSample (0, 24000), c * juce::Decibels::decibelsToGain (-6.0f), 0.01f), "rampa de volume interpolada (-6 dB no meio)");
+
+    t->autoMode = (int) AutoMode::off;
+    t->gainDb = 0.0f;
+    out = run (e, 48000);
+    check (near (out.getSample (0, 45000), c), "modo OFF ignora a automacao");
+
+    t->autoMode = (int) AutoMode::read;
+    l->writing = true;
+    t->gainDb = 0.0f;
+    out = run (e, 48000);
+    check (near (out.getSample (0, 45000), c), "linha sendo gravada nao e aplicada");
+    l->writing = false;
+
+    e.editAutomation ([&] { l->points.clear(); });
+    t->gainDb = 0.0f;
+    auto* m = e.getOrCreateLane (*t, AutoTarget::mute);
+    check (m->step, "mute e em degrau");
+    e.editAutomation ([&] { m->insert (0.0, 0.0f); m->insert (0.5, 1.0f); });
+    out = run (e, 48000);
+    check (near (out.getSample (0, 12000), c) && near (out.getSample (0, 40000), 0.0f), "automacao de mute");
+
+    // parado: so aplica quando o cursor muda de lugar
+    t->mute = false;
+    run (e, 256, 30000, false);
+    check (t->mute.load(), "cursor movido parado aplica a automacao");
+    t->mute = false;
+    {
+        const juce::ScopedLock sl (e.lock);
+        juce::AudioBuffer<float> b (2, 256);
+        e.render (b.getWritePointer (0), b.getWritePointer (1), 256, 30000, false, true);
+    }
+    check (! t->mute.load(), "parado no mesmo lugar nao briga com o usuario");
+}
+
+static void simulatePass (AutomationRecorder& rec, Channel& ch, double from, double to, double touchAt, double releaseAt, float newDb)
+{
+    double now = 0.0;
+    for (double ts = from; ts <= to + 1.0e-9; ts += 0.02)
+    {
+        if (std::abs (ts - touchAt) < 0.005) rec.touch (ch, AutoTarget::volume, -1, -1, true, now);
+        if (ts > touchAt + 0.01 && ts < releaseAt) ch.gainDb = newDb;
+        if (std::abs (ts - releaseAt) < 0.005) rec.touch (ch, AutoTarget::volume, -1, -1, false, now);
+        rec.process (ts, true, now);
+        now += 20.0;
+    }
+    rec.process (to, false, now);
+}
+
+static void testAutomationRecord()
+{
+    Engine e; e.prepare (48000, 256);
+    auto buf = makeBuffer (1, 48000 * 5, [] (int, int) { return 0.1f; });
+    AutomationRecorder rec (e);
+
+    auto* a = addTrack (e, buf, "latch");
+    a->autoMode = (int) AutoMode::latch;
+    simulatePass (rec, *a, 0.0, 4.0, 1.0, 2.0, -10.0f);
+    auto* la = e.findLane (*a, AutoTarget::volume);
+    check (la != nullptr && near (la->valueAt (0.5), 0.0f) && near (la->valueAt (1.5), -10.0f) && near (la->valueAt (3.5), -10.0f),
+           "LATCH grava do toque ate parar");
+    check (la != nullptr && la->points.size() < 12, "pontos afinados (" + juce::String (la != nullptr ? (int) la->points.size() : -1) + ")");
+    check (la != nullptr && ! la->writing.load(), "parar encerra a gravacao");
+
+    auto* b = addTrack (e, buf, "touch");
+    b->autoMode = (int) AutoMode::touch;
+    simulatePass (rec, *b, 0.0, 4.0, 1.0, 2.0, -10.0f);
+    auto* lb = e.findLane (*b, AutoTarget::volume);
+    check (lb != nullptr && near (lb->valueAt (1.5), -10.0f) && near (lb->valueAt (3.5), 0.0f) && near (lb->valueAt (0.5), 0.0f),
+           "TOUCH volta ao valor anterior ao soltar");
+
+    auto* c = addTrack (e, buf, "write");
+    auto* lc = e.getOrCreateLane (*c, AutoTarget::volume);
+    e.editAutomation ([&] { lc->insert (0.0, -20.0f); lc->insert (4.0, -20.0f); });
+    c->autoMode = (int) AutoMode::write;
+    c->gainDb = -3.0f;
+    double now = 0.0;
+    for (double ts = 1.0; ts <= 2.0 + 1.0e-9; ts += 0.02) { rec.process (ts, true, now); now += 20.0; }
+    rec.process (2.0, false, now);
+    check (near (lc->valueAt (0.5), -20.0f) && near (lc->valueAt (1.5), -3.0f) && near (lc->valueAt (3.0), -20.0f),
+           "WRITE substitui so o trecho tocado");
+    check (e.findLane (*c, AutoTarget::pan) != nullptr && e.findLane (*c, AutoTarget::mute) != nullptr, "WRITE grava volume, pan e mute");
+
+    auto* d = addTrack (e, buf, "read");
+    d->autoMode = (int) AutoMode::read;
+    simulatePass (rec, *d, 0.0, 2.0, 0.5, 1.0, -10.0f);
+    check (e.findLane (*d, AutoTarget::volume) == nullptr, "READ nao grava");
+}
+
 static void testResampler()
 {
     auto imp = makeBuffer (1, 44100, [] (int, int i) { return i == 1000 ? 1.0f : 0.0f; });
@@ -264,6 +367,13 @@ static void testProjectRoundTrip()
     juce::MemoryBlock state ("abc", 3);
     e.setMissingInsert (*t, 2, desc, state);
     e.master.mono = true; e.master.gainDb = -1.0f;
+    t->autoMode = (int) AutoMode::touch;
+    auto* vl = e.getOrCreateLane (*t, AutoTarget::volume);
+    auto* pl = e.getOrCreateLane (*t, AutoTarget::plugin, 2, 5);
+    e.editAutomation ([&] { vl->insert (0.5, -6.0f); vl->insert (1.25, -12.5f); pl->insert (2.0, 0.75f); });
+    e.swapInserts (*t, 2, 3);
+    check (pl->slot == 3 && t->inserts[3].isMissing(), "automacao acompanha o plugin ao mover o insert");
+    e.swapInserts (*t, 2, 3);
 
     auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_test.sconsole");
     juce::String err;
@@ -279,6 +389,18 @@ static void testProjectRoundTrip()
         check (td.ch.inserts.size() == 1 && td.ch.inserts[0].slot == 2 && td.ch.inserts[0].desc.name == "Plugin X"
                && td.ch.inserts[0].state == state, "plugin ausente preserva descricao e estado");
         check (td.file == t->sourceFile, "caminho do audio");
+        check (td.ch.autoMode == AutoMode::touch && td.ch.lanes.size() == 2, "modo e linhas de automacao salvos");
+        if (td.ch.lanes.size() == 2)
+        {
+            const auto& v = td.ch.lanes[0];
+            const auto& pp = td.ch.lanes[1];
+            check (v.target == AutoTarget::volume && v.points.size() == 2 && near ((float) v.points[1].t, 1.25f) && near (v.points[1].v, -12.5f),
+                   "pontos de volume");
+            check (pp.target == AutoTarget::plugin && pp.slot == 2 && pp.param == 5 && near (pp.points[0].v, 0.75f), "linha de parametro de plugin");
+            Engine e2; Track t2;
+            applyChannelBasics (e2, t2, td.ch);
+            check (t2.lanes.size() == 2 && t2.getAutoMode() == AutoMode::touch, "aplicar linhas ao abrir");
+        }
     }
     check (p.masterMono && near (p.master.gainDb, -1.0f) && p.buses[0].name == "Reverb", "master e bus");
     file.deleteFile();
@@ -324,6 +446,29 @@ static void testVst3Hosting (const juce::File& pluginFile)
     auto out = run (e, 8000);
     const float expect = 0.5f * (1.0f + juce::Decibels::decibelsToGain (-6.0f));
     check (peakIndex (out, 0) == 1064 && near (out.getSample (0, 1064), expect, 1.0e-3f), "VST3 processa com PDC e ganho");
+    // automacao de parametro do plugin (ganho 0 dB -> -6 dB em 0.1 s) e eventos de gesto
+    {
+        Engine e3; e3.prepare (48000, 256);
+        auto* dc = addTrack (e3, makeBuffer (2, 48000, [] (int, int) { return 0.5f; }), "dc");
+        auto inst3 = fm.createPluginInstance (*found[0], 48000, 256, err);
+        e3.prepareProcessor (*inst3);
+        auto* raw = inst3.get();
+        e3.setInsert (*dc, 0, std::move (inst3), &desc);
+        auto* lane = e3.getOrCreateLane (*dc, AutoTarget::plugin, 0, 0);
+        e3.editAutomation ([&] { lane->insert (0.0, 0.5f); lane->insert (0.1, 0.5f); lane->insert (0.1001, 0.375f); });
+        auto o = run (e3, 9600);
+        check (near (o.getSample (0, 2000), 0.5f, 1.0e-3f) && near (o.getSample (0, 9000), 0.5f * juce::Decibels::decibelsToGain (-6.0f), 2.0e-3f),
+               "automacao de parametro VST3");
+        raw->getParameters()[0]->beginChangeGesture();
+        raw->getParameters()[0]->setValueNotifyingHost (0.25f);
+        raw->getParameters()[0]->endChangeGesture();
+        Engine::ParamEvent ev;
+        int begins = 0, changes = 0, ends = 0;
+        while (e3.popParamEvent (ev))
+            if (ev.proc == raw) { begins += ev.type == 1; changes += ev.type == 0; ends += ev.type == 2; }
+        check (begins == 1 && changes >= 1 && ends == 1, "gestos do plugin chegam ao gravador");
+    }
+
     auto editorTest = e.clearInsert (*a, 0);
     check (editorTest != nullptr && e.getTotalLatency() == 0, "remover VST3");
 }
@@ -336,6 +481,8 @@ int main (int argc, char** argv)
     testBusesAndSends();
     testLatencyCompensation();
     testLoop();
+    testAutomationRead();
+    testAutomationRecord();
     testDeviceCallback();
     testResampler();
     testProjectRoundTrip();
