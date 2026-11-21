@@ -91,6 +91,20 @@ if(MSVC)
 endif()
 
 #------------------------------------------------------------------------------
+# Executavel separado para inspecao de metadados de plugins nao confiaveis.
+# A UI principal nao carrega o plugin durante essa varredura.
+juce_add_console_app(ScPluginScanWorker PRODUCT_NAME "SilverConsole Plugin Scan Worker")
+juce_generate_juce_header(ScPluginScanWorker)
+target_sources(ScPluginScanWorker PRIVATE Source/PluginScanWorker.cpp)
+target_compile_definitions(ScPluginScanWorker PRIVATE ${SC_COMMON_DEFS})
+target_link_libraries(ScPluginScanWorker PRIVATE
+    juce::juce_audio_utils juce::juce_audio_processors
+    juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+if(MSVC)
+    target_compile_options(ScPluginScanWorker PRIVATE /utf-8)
+endif()
+
+#------------------------------------------------------------------------------
 if(SILVERCONSOLE_TESTS)
     include(CTest)
 
@@ -128,4 +142,17 @@ if(SILVERCONSOLE_TESTS)
 
     add_test(NAME Engine
         COMMAND SilverConsoleTests "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>")
+
+    # O plugin do proprio projeto e testado no PROCESSO do helper, nunca
+    # dentro do SilverConsole GUI. O XML e validado separadamente.
+    add_dependencies(ScPluginScanWorker SCTestPlugin_VST3)
+    add_test(NAME PluginScanIsolated
+        COMMAND ScPluginScanWorker
+          "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
+          "${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-ci.xml")
+    add_test(NAME PluginScanXml
+        COMMAND ${CMAKE_COMMAND}
+          "-DXML_FILE=${CMAKE_CURRENT_BINARY_DIR}/plugin-scan-ci.xml"
+          -P "${CMAKE_CURRENT_SOURCE_DIR}/Tests/VerifyPluginScan.cmake")
+    set_tests_properties(PluginScanXml PROPERTIES DEPENDS PluginScanIsolated)
 endif()
