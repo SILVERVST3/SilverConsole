@@ -86,6 +86,13 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Apos salvar normalmente com sucesso, os snapshots correspondentes sao eliminados. Os arquivos de audio originais continuam externos ao projeto e precisam estar acessiveis.
 - A captura e feita com audio parado para nao bloquear o callback durante o salvamento de estados VST3. Enquanto o transporte estiver tocando, nao ha novo snapshot.
 
+## Medidores Master (Etapa 3 - em validacao)
+
+- O MASTER mostra **TP dBTP**, uma estimativa de true peak por sobreamostragem FIR **4x** com historico entre callbacks; ela detecta picos que ocorrem entre amostras de audio.
+- O painel de saida do MASTER mostra **Momentary LUFS (M)** em uma janela de aproximadamente **400 ms**, usando ponderacao K (high-shelf + RLB high-pass) e atualizacao em sub-janelas de 100 ms.
+- Ambos sao somente medidores; nao alteram o sinal nem aplicam limitacao. Os testes verificam pico entre amostras, continuidade de estado, sonoridade em 48/96 kHz, silencio e reducao de 20 dB.
+- **Limite:** a leitura LUFS-M ainda nao implementa medicao integrada com gate EBU R128, loudness range, short-term (3s) ou certificacao normativa. A leitura true peak FIR 4x e aproximada e exige comparacao com medidores de referencia.
+
 ## ASIO opcional (Windows, em validacao)
 
 O JUCE 8.0.6 do projeto utiliza um SDK ASIO externo. A compilacao padrao continua com WASAPI e **sem ASIO**. Para habilitar ASIO localmente, instale um SDK ASIO cuja licenca permita o uso pretendido e configure:
