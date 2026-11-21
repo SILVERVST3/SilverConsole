@@ -815,10 +815,11 @@ void MainComponent::openEditor (Channel& c, int slot)
         if (&w->processor == p) { w->setVisible (true); w->toFront (true); return; }
 
     auto* cp = &c;
-    pluginWindows.push_back (std::make_unique<PluginWindow> (*p, c.name + " - " + p->getName(), [this, cp] (PluginWindow* w)
+    juce::Component::SafePointer<MainComponent> self (this);
+    pluginWindows.push_back (std::make_unique<PluginWindow> (*p, c.name + " - " + p->getName(), [self, cp] (PluginWindow* w)
     {
         w->setVisible (false);
-        juce::MessageManager::callAsync ([sp = juce::Component::SafePointer<MainComponent> (this), w, cp]
+        juce::MessageManager::callAsync ([sp = self, w, cp]
         {
             if (sp == nullptr) return;
             auto& v = sp->pluginWindows;
@@ -883,9 +884,10 @@ void MainComponent::showPluginManager (bool startScan)
 {
     if (pluginManagerWindow == nullptr)
     {
-        pluginManagerWindow = std::make_unique<PluginManagerWindow> (pluginHost, props.getUserSettings(), [this]
+        juce::Component::SafePointer<MainComponent> self (this);
+        pluginManagerWindow = std::make_unique<PluginManagerWindow> (pluginHost, props.getUserSettings(), [self]
         {
-            juce::MessageManager::callAsync ([sp = juce::Component::SafePointer<MainComponent> (this)]
+            juce::MessageManager::callAsync ([sp = self]
             {
                 if (sp != nullptr) sp->pluginManagerWindow.reset();
             });
