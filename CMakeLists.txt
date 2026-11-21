@@ -47,7 +47,7 @@ set(SC_COMMON_DEFS
     JUCE_DISPLAY_SPLASH_SCREEN=0)
 
 set(SC_ENGINE_SOURCES
-    Source/Engine.cpp Source/Engine.h
+    Source/Engine.cpp Source/Engine.h Source/Metering.h
     Source/AudioLoader.cpp Source/AudioLoader.h
     Source/StreamingAudio.cpp Source/StreamingAudio.h
     Source/Project.cpp Source/Project.h
