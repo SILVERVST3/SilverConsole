@@ -89,7 +89,7 @@ void StreamingAudio::copy (float* left, float* right, int destOffset,
     if (count <= 0 || sourceStart >= length) return;
     // Solicitar o proximo trecho ANTES de chegar ao fim da janela.
     requested.store (juce::jmax ((juce::int64) 0,
-                     sourceStart + count + (juce::int64) windowSamples / 4),
+                     sourceStart + count),
                      std::memory_order_relaxed);
 
     auto window = std::atomic_load_explicit (&visible, std::memory_order_acquire);
@@ -119,7 +119,7 @@ void StreamingAudio::copy (float* left, float* right, int destOffset,
 
 StreamWorker::StreamWorker() : juce::Thread ("SilverConsole disk prefetch")
 {
-    startThread (juce::Thread::Priority::normal);
+    startThread();
 }
 
 StreamWorker::~StreamWorker()
