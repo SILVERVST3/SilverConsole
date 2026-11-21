@@ -391,6 +391,7 @@ void ChannelStrip::tick()
         const auto label = "TP " + db + " dBTP";
         if (infoLabel.getText() != label)
             infoLabel.setText (label, juce::dontSendNotification);
+        repaint (sendsHeader.withHeight (117));
     }
 
 
@@ -492,8 +493,25 @@ void ChannelStrip::paint (juce::Graphics& g)
         g.fillRoundedRectangle (sendsHeader.withHeight (117).toFloat(), 3.0f);
         g.setColour (colours::inkSoft.withAlpha (0.7f));
         g.setFont (uiFont (10.0f, true));
-        g.drawText (isMaster ? "SAIDA DO AUDIO" : juce::String::fromUTF8 ("\xe2\x86\x92 MASTER"),
-                    sendsHeader.withHeight (117), juce::Justification::centred);
+        if (isMaster)
+        {
+            const auto& m = static_cast<const Master&> (channel);
+            g.drawText ("LOUDNESS (M)", sendsHeader.withHeight (32), juce::Justification::centred);
+            g.setFont (uiFont (16.0f, true));
+            g.setColour (colours::ink);
+            const auto loudness = m.momentaryLufs.load (std::memory_order_relaxed);
+            const auto value = loudness <= -110.0f
+                                   ? juce::String ("-inf LUFS")
+                                   : juce::String (loudness, 1) + " LUFS";
+            g.drawText (value, sendsHeader.withTrimmedTop (31).withHeight (57),
+                        juce::Justification::centred);
+            g.setFont (uiFont (8.5f));
+            g.drawText ("Momentary / 400ms", sendsHeader.withTrimmedTop (82).withHeight (30),
+                        juce::Justification::centred);
+        }
+        else
+            g.drawText (juce::String::fromUTF8 ("\\xe2\\x86\\x92 MASTER"),
+                        sendsHeader.withHeight (117), juce::Justification::centred);
     }
 
     // escala do fader
