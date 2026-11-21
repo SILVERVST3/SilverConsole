@@ -78,7 +78,7 @@ void StreamingAudio::buildOverview()
 bool StreamingAudio::prime()
 {
     service();
-    return visible.load (std::memory_order_acquire) != nullptr;
+    return visible.load (std::memory_order_seq_cst) != nullptr;
 }
 
 void StreamingAudio::service()
@@ -88,10 +88,10 @@ void StreamingAudio::service()
     std::lock_guard<std::mutex> readerLock (readerMutex);
     // Liberacao de janelas antigas e exclusivamente tarefa do worker.
     // Depois da troca de ponteiro, novos leitores nunca adquirem janela antiga.
-    if (audioReaders.load (std::memory_order_acquire) == 0)
+    if (audioReaders.load (std::memory_order_seq_cst) == 0)
         retiredWindows.clear();
     const auto requestedAt = juce::jlimit ((juce::int64) 0, length, requested.load (std::memory_order_relaxed));
-    const auto* prior = visible.load (std::memory_order_acquire);
+    const auto* prior = visible.load (std::memory_order_seq_cst);
     constexpr juce::int64 margin = windowSamples / 4;
     if (prior != nullptr
         && requestedAt >= prior->start + margin
@@ -116,8 +116,8 @@ void StreamingAudio::service()
     if (activeWindow != nullptr)
         retiredWindows.push_back (std::move (activeWindow));
     activeWindow = std::move (next);
-    visible.store (activeWindow.get(), std::memory_order_release);
-    if (audioReaders.load (std::memory_order_acquire) == 0)
+    visible.store (activeWindow.get(), std::memory_order_seq_cst);
+    if (audioReaders.load (std::memory_order_seq_cst) == 0)
         retiredWindows.clear();
 }
 
@@ -139,13 +139,13 @@ void StreamingAudio::copy (float* left, float* right, int destOffset,
 
     // Incrementar antes de ler visible; o worker somente recicla janelas
     // quando nenhum callback as referencia.
-    audioReaders.fetch_add (1, std::memory_order_acq_rel);
+    audioReaders.fetch_add (1, std::memory_order_seq_cst);
     struct ReaderGuard
     {
         std::atomic<unsigned int>& readers;
-        ~ReaderGuard() { readers.fetch_sub (1, std::memory_order_release); }
+        ~ReaderGuard() { readers.fetch_sub (1, std::memory_order_seq_cst); }
     } guard { audioReaders };
-    const auto* window = visible.load (std::memory_order_acquire);
+    const auto* window = visible.load (std::memory_order_seq_cst);
     if (window == nullptr)
     {
         missingSamples.fetch_add ((juce::uint64) count, std::memory_order_relaxed);
