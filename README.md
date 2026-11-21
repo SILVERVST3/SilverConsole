@@ -70,6 +70,8 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Os candidatos com crash, falha de leitura ou timeout sao colocados numa **lista persistente de quarentena**. O scanner normal pula esses arquivos nas verificacoes seguintes; **Plugins > Reavaliar VST3 com falha anterior...** testa **apenas os candidatos nessa lista**, sem repetir toda a varredura. Plugins recuperados saem da quarentena automaticamente.
 - O botao **Cancelar** interrompe tambem o processo filho que estiver em andamento, sem precisar aguardar os 20 segundos. A supervisao tem testes automaticos de timeout real, codigo de erro do processo e cancelamento durante a execucao. Resultados XML acima de 4 MiB, corrompidos ou com formato/schema invalido nao sao importados.
 - O gerenciador legado JUCE ainda oferece uma opcao de scan interno (sem isolamento), sinalizada como tal. Prefira o scan isolado.
+- **Tratamento parcial de falhas DSP:** se o `processBlock` de um insert lancar uma **excecao C++**, a engine silencia o bloco possivelmente corrompido, coloca esse insert em bypass automaticamente e exibe a ocorrencia no contador `PLUG ERR`. Os proximos blocos podem seguir sem o insert problemático. Existe teste de regressao com plugin simulado que lança exceção e escreve NaN.
+- **Esse bypass nao substitui isolamento de processo:** erros fatais nativos (access violation/SEH), travamentos, deadlocks e loops infinitos ainda podem bloquear ou derrubar o host. O tratamento nao garante recuperacao de todo plugin.\n
 - **Limite de seguranca:** carregar/usar plugins em um insert ainda ocorre no processo principal. Isolamento de *processamento* VST3 e recuperacao de falhas em tempo real requerem uma engine separada e ainda nao foram implementados.
 
 ## Atalhos
