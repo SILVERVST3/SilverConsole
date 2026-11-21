@@ -1059,7 +1059,7 @@ namespace
         {
             setUsingNativeTitleBar (true);
             list = new juce::PluginListComponent (host.formats, host.known, host.getDeadMansPedalFile(), settings, true);
-            list->setOptionsButtonText (juce::String::fromUTF8 ("Op\xc3\xa7\xc3\xb5\x65s / Escanear..."));
+            list->setOptionsButtonText ("Opcoes / Scan interno (sem isolamento)");
             list->setScanDialogText ("Escaneando plugins", "Procurando plugins VST3...");
             setContentOwned (list, false);
             setResizable (true, false);
@@ -1171,9 +1171,9 @@ void MainComponent::scanPluginsIsolated()
         props.getUserSettings()->saveIfNeeded();
         if (pluginManagerWindow != nullptr) pluginManagerWindow->repaint();
         const juce::String summary = "Encontrados " + juce::String ((int) result->types.size())
-            + " tipo(s) VST3 em " + juce::String (result->total) + " candidato(s).\\n"
+            + " tipo(s) VST3 em " + juce::String (result->total) + " candidato(s).\n"
             + juce::String (result->failed) + " arquivo(s) falharam, encerraram ou excederam 20 s."
-            + (result->cancelled ? "\\nVarredura interrompida pelo usuario." : "");
+            + (result->cancelled ? "\nVarredura interrompida pelo usuario." : "");
         alert ("Scanner isolado", summary, result->failed > 0);
     });
 }
