@@ -5,6 +5,7 @@
 #include "AudioLoader.h"
 #include "Project.h"
 #include "AutomationRecorder.h"
+#include "PluginScanPolicy.h"
 #include <cstdio>
 #include <thread>
 
@@ -738,6 +739,29 @@ static void testTruePeakMeter()
            "true peak: medidor recebe o sinal final do master");
 }
 
+static void testPluginScanQuarantine()
+{
+    auto failed = PluginScanPolicy::deserialize (
+        "C:/VST3/Crashing.vst3\nC:/VST3/CRASHING.vst3\n\n");
+    check (failed.size() == 1,
+           "scan quarantine: entradas duplicadas ignoradas sem diferenciar maiusculas");
+    check (! PluginScanPolicy::shouldScan (failed, "c:/vst3/crashing.vst3", false),
+           "scan quarantine: plugin previamente falho e ignorado por padrao");
+    check (PluginScanPolicy::shouldScan (failed, "c:/vst3/crashing.vst3", true),
+           "scan quarantine: usuario pode reavaliar plugin falho");
+
+    PluginScanPolicy::reportResult (failed, "C:/VST3/new.vst3", false);
+    PluginScanPolicy::reportResult (failed, "C:/VST3/new.vst3", false);
+    check (failed.size() == 2, "scan quarantine: falhas registradas uma unica vez");
+    const auto stored = PluginScanPolicy::serialize (failed);
+    auto restored = PluginScanPolicy::deserialize (stored);
+    check (restored.size() == 2, "scan quarantine: persistencia recupera candidatos");
+    PluginScanPolicy::reportResult (restored, "c:/VST3/Crashing.vst3", true);
+    check (restored.size() == 1
+           && PluginScanPolicy::shouldScan (restored, "C:/VST3/Crashing.vst3", false),
+           "scan quarantine: sucesso remove bloqueio anterior");
+}
+
 static void test128TrackStress()
 {
     Engine e;
@@ -785,6 +809,7 @@ int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    testPluginScanQuarantine();
     testTruePeakMeter();
     testMomentaryLoudness();
     test128TrackStress();
