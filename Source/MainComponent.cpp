@@ -307,6 +307,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
         menu.addItem (1, "Gerenciar plugins VST3...");
         menu.addItem (2, "Escanear VST3 com processo isolado");
         menu.addItem (3, "Reavaliar VST3 com falha anterior...");
+        menu.addItem (4, "Testar DSP dos VST3 em processo isolado...");
         const juce::Component::SafePointer<MainComponent> self (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pluginsButton),
                             [self] (int choice)
@@ -315,6 +316,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
             if (choice == 1) self->showPluginManager (false);
             else if (choice == 2) self->scanPluginsIsolated();
             else if (choice == 3) self->scanPluginsIsolated (true);
+            else if (choice == 4) self->scanPluginsIsolated (false, true);
         });
     };
     audioButton.onClick = [this] { showAudioSettings(); };
@@ -1097,7 +1099,7 @@ void MainComponent::showPluginManager (bool startScan)
     if (startScan) scanPluginsIsolated();
 }
 
-void MainComponent::scanPluginsIsolated (bool retryFailed)
+void MainComponent::scanPluginsIsolated (bool retryFailed, bool probeDsp)
 {
     if (job != nullptr) return;
 
@@ -1127,8 +1129,9 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
     };
     auto result = std::make_shared<Result>();
     runJob (retryFailed ? "Reavaliando VST3 com falhas anteriores..."
+                        : probeDsp ? "Testando DSP VST3 em processo isolado..."
                         : "Escaneando VST3 em processo isolado...", true,
-            [worker, result, remembered, retryFailed] (Job& j)
+            [worker, result, remembered, retryFailed, probeDsp] (Job& j)
     {
         // Apenas a enumeracao de caminhos acontece no host. Todo carregamento
         // de VST3 para discovery acontece em processo filho independente.
@@ -1154,6 +1157,7 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
                 .getChildFile ("silverconsole-scan-" + juce::Uuid().toString() + ".xml");
             juce::StringArray args;
             args.add (worker.getFullPathName());
+            if (probeDsp) args.add ("--probe");
             args.add (candidate);
             args.add (destination.getFullPathName());
 
@@ -1203,7 +1207,7 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
             j.progress = (float) (i + 1) / (float) juce::jmax (1, candidates.size());
         }
     },
-            [this, result] (Job&)
+            [this, result, probeDsp] (Job&)
     {
         auto* settings = props.getUserSettings();
         auto failed = PluginScanPolicy::deserialize (
@@ -1223,12 +1227,14 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
         const juce::String summary = "Reconhecidos " + juce::String ((int) result->types.size())
             + " tipo(s) VST3 em " + juce::String (result->scanned) + " candidato(s) examinados.\n"
             + juce::String (result->skipped) + " ignorado(s) por falha anterior.\n"
-            + juce::String (result->failed) + " falha(s), incluindo "
+            + juce::String (result->failed) + (probeDsp ? " falha(s) no teste DSP, incluindo "
+                                                          : " falha(s), incluindo ")
             + juce::String (result->timedOut) + " timeout(s).\n"
             + juce::String (failed.size()) + " candidato(s) na lista de quarentena."
             + (result->cancelled ? "\nVarredura cancelada, inclusive o processo em andamento."
                                  : "\nUse Reavaliar VST3 com falha para tentar novamente.");
-        alert ("Scanner isolado", summary, result->failed > 0);
+        alert (probeDsp ? "Teste DSP isolado" : "Scanner isolado",
+               summary, result->failed > 0);
     });
 }
 
