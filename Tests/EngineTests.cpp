@@ -570,6 +570,47 @@ static void testDiskStreaming()
     check (file.deleteFile(), "stream: limpeza do arquivo de teste");
 }
 
+// Garante que a soma do bounce com workers multicore seja igual ao render
+// sequencial (após acomodacao dos smoothing ramps).
+static void testMulticoreOfflineMix()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto source = makeBuffer (2, 12000, [] (int ch, int i)
+    {
+        return 0.012f * std::sin ((float) i * 0.012f + (float) ch * 0.3f);
+    });
+    for (int i = 0; i < 8; ++i)
+        addTrack (e, source, "parallel " + juce::String (i));
+    const auto reference = run (e, 12000);
+
+    const auto out = juce::File::createTempFile (".wav");
+    std::atomic<float> progress { 0.0f };
+    std::atomic<bool> cancel { false };
+    juce::String error;
+    bool clipped = false;
+    const bool success = e.exportMix (out, 24, 0.0, progress, cancel, error, clipped);
+    check (success, "multicore: exportacao em oito faixas " + error);
+    if (success)
+    {
+        juce::AudioFormatManager fm;
+        registerAudioFormats (fm);
+        auto wav = loadAudioFile (fm, out);
+        check (wav.ok() && wav.original->getNumSamples() == 12000,
+               "multicore: duracao preservada");
+        if (wav.ok() && wav.original->getNumSamples() == 12000)
+        {
+            bool same = true;
+            for (int ch = 0; ch < 2; ++ch)
+                for (int i : { 2000, 4500, 9000, 11500 })
+                    same = same && near (reference.getSample (ch, i),
+                                        wav.original->getSample (ch, i), 0.0002f);
+            check (same, "multicore: amostras coincidem com render sequencial");
+        }
+    }
+    out.deleteFile();
+}
+
 static void test128TrackStress()
 {
     Engine e;
@@ -618,6 +659,7 @@ int main (int argc, char** argv)
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
     test128TrackStress();
+    testMulticoreOfflineMix();
     testDiskStreaming();
     testStereoBalanceMuteSolo();
     testBusesAndSends();
