@@ -1188,7 +1188,6 @@ void MainComponent::scanPluginsIsolated (bool retryFailed)
                             }
                         }
                     }
-                }
             }
             destination.deleteFile();
             if (result->cancelled) break;
