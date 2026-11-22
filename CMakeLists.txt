@@ -123,7 +123,7 @@ if(MSVC)
     target_compile_options(ScDspWorker PRIVATE /utf-8)
 endif()
 
-add_dependencies(SilverConsole ScPluginScanWorker) ScDspWorker
+add_dependencies(SilverConsole ScPluginScanWorker ScDspWorker)
 if(WIN32)
     add_custom_command(TARGET SilverConsole POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
