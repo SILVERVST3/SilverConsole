@@ -6,6 +6,7 @@
 #include "Automation.h"
 #include "StreamingAudio.h"
 #include "Metering.h"
+#include "RemoteDspInsert.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -66,6 +67,7 @@ private:
 struct InsertSlot
 {
     std::unique_ptr<juce::AudioProcessor> processor;
+    std::shared_ptr<RemoteDspInsert> remote; // processo DSP real, sem AudioProcessor no host
     juce::PluginDescription description;
     bool hasDescription = false;      // plugin externo (pode estar ausente)
     juce::MemoryBlock missingState;   // estado guardado quando o plugin nao abriu
@@ -74,8 +76,8 @@ struct InsertSlot
     int bufferChannels = 2;
     int mainOutChannels = 2;
 
-    bool isEmpty() const noexcept     { return processor == nullptr && ! hasDescription; }
-    bool isMissing() const noexcept   { return processor == nullptr && hasDescription; }
+    bool isEmpty() const noexcept     { return processor == nullptr && remote == nullptr && ! hasDescription; }
+    bool isMissing() const noexcept   { return processor == nullptr && remote == nullptr && hasDescription; }
     juce::String getName() const
     {
         if (hasDescription) return description.name;
@@ -181,6 +183,10 @@ public:
     /** Troca o insert; devolve o anterior para ser destruido fora do lock. */
     std::unique_ptr<juce::AudioProcessor> setInsert (Channel&, int slot, std::unique_ptr<juce::AudioProcessor>,
                                                      const juce::PluginDescription* desc);
+    // Instala worker inicializado na thread de controle. A thread de audio
+    // encontra o ponteiro somente sob lock de Engine, nao cria subprocessos.
+    std::unique_ptr<juce::AudioProcessor> setRemoteInsert (
+        Channel&, int slot, std::shared_ptr<RemoteDspInsert>, const juce::PluginDescription&);
     std::unique_ptr<juce::AudioProcessor> clearInsert (Channel&, int slot);
     void setMissingInsert (Channel&, int slot, const juce::PluginDescription&, const juce::MemoryBlock& state);
     void swapInserts (Channel&, int a, int b);
