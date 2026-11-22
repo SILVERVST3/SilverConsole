@@ -70,6 +70,7 @@ struct InsertSlot
     std::shared_ptr<RemoteDspInsert> remote; // processo DSP real, sem AudioProcessor no host
     juce::PluginDescription description;
     bool hasDescription = false;      // plugin externo (pode estar ausente)
+    bool preferRemote = false;         // guarda modo em projetos e plugins ausentes
     juce::MemoryBlock missingState;   // estado guardado quando o plugin nao abriu
     std::atomic<bool> bypassed { false };
     std::atomic<bool> faulted { false }; // Falha C++ em processBlock; exibida na interface, sem locks
@@ -188,7 +189,8 @@ public:
     std::unique_ptr<juce::AudioProcessor> setRemoteInsert (
         Channel&, int slot, std::shared_ptr<RemoteDspInsert>, const juce::PluginDescription&);
     std::unique_ptr<juce::AudioProcessor> clearInsert (Channel&, int slot);
-    void setMissingInsert (Channel&, int slot, const juce::PluginDescription&, const juce::MemoryBlock& state);
+    void setMissingInsert (Channel&, int slot, const juce::PluginDescription&,
+                           const juce::MemoryBlock& state, bool preferRemote = false);
     void swapInserts (Channel&, int a, int b);
     void setBypass (Channel&, int slot, bool);
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
