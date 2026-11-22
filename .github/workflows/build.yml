@@ -24,7 +24,7 @@ jobs:
         run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Compilar Release
-        run: cmake --build build --config Release --parallel 4 --target SilverConsole SilverConsoleTests ScPluginScanWorker
+        run: cmake --build build --config Release --parallel 4 --target SilverConsole SilverConsoleTests ScPluginScanWorker ScDspWorker
 
       - name: Testar motor, hospedagem VST3 e scanner isolado
         run: ctest --test-dir build -C Release --output-on-failure
@@ -36,6 +36,7 @@ jobs:
           New-Item -ItemType Directory -Path $out -Force | Out-Null
           Copy-Item build/SilverConsole_artefacts/Release/SilverConsole.exe $out/
           Copy-Item build/ScPluginScanWorker_artefacts/Release/ScPluginScanWorker.exe $out/
+          Copy-Item build/ScDspWorker_artefacts/Release/ScDspWorker.exe $out/
           Copy-Item README.md,LICENSE,THIRD_PARTY.md $out/
           Copy-Item build/_deps/juce-src/LICENSE.md $out/JUCE-LICENSE.md
           python scripts/create-demo.py "$out/Demo"
