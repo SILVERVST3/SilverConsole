@@ -171,13 +171,14 @@ if(SILVERCONSOLE_TESTS)
     if(MSVC)
         target_compile_options(SilverConsoleTests PRIVATE /utf-8)
     endif()
-    add_dependencies(SilverConsoleTests SCTestPlugin_VST3 ScPluginScanWorker)
+    add_dependencies(SilverConsoleTests SCTestPlugin_VST3 ScPluginScanWorker ScDspWorker)
 
     add_test(NAME Engine
         COMMAND SilverConsoleTests
           "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
           "${CMAKE_CURRENT_BINARY_DIR}/engine-scan-description.xml"
-          "$<TARGET_FILE:ScPluginScanWorker>")
+          "$<TARGET_FILE:ScPluginScanWorker>"
+          "$<TARGET_FILE:ScDspWorker>")
 
     # O plugin do proprio projeto e testado no PROCESSO do helper, nunca
     # dentro do SilverConsole GUI. O XML e validado separadamente.
