@@ -144,6 +144,7 @@ bool RemoteDspInsert::initialise (
     }
     pluginLatency = juce::jlimit (0, 16384, (int) atomicRead (shared->pluginLatency));
     transportFrames = frames;
+    configuredRate = juce::roundToInt (rate);
     dryLength = transportFrames + pluginLatency;
     dryCursor = 0;
     savedState = state;
@@ -283,6 +284,14 @@ void RemoteDspInsert::process (float* l, float* r, int n, bool userBypass) noexc
     delayedDry (l, r, n);
 #endif
     switchFade (l, r, n, wet);
+}
+
+void RemoteDspInsert::simulateWorkerCrashForTests() noexcept
+{
+    if (resources != nullptr && resources->process.isRunning())
+        resources->process.kill(); // explicit test/control thread only
+    failed.store (true, std::memory_order_relaxed);
+    watchdog.fail();
 }
 
 void RemoteDspInsert::pollWorker() noexcept
