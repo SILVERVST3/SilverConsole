@@ -340,9 +340,11 @@ std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, s
     jassert (juce::isPositiveAndBelow (slot, kNumInserts));
     auto& s = c.inserts[(size_t) slot];
     std::unique_ptr<juce::AudioProcessor> old;
+    std::shared_ptr<RemoteDspInsert> retiredRemote;
     {
         const juce::ScopedLock sl (lock);
         old = std::move (s.processor);
+        retiredRemote = std::move (s.remote);
         s.processor = std::move (p);
         s.hasDescription = desc != nullptr;
         if (desc != nullptr) s.description = *desc;
@@ -359,6 +361,35 @@ std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, s
         updateLatency();
     }
     if (old != nullptr) old->removeListener (this);
+    return old;
+}
+
+std::unique_ptr<juce::AudioProcessor> Engine::setRemoteInsert (
+    Channel& c, int slot, std::shared_ptr<RemoteDspInsert> ipcInsert,
+    const juce::PluginDescription& desc)
+{
+    if (! juce::isPositiveAndBelow (slot, kNumInserts) || ipcInsert == nullptr)
+        return {};
+    auto& entry = c.inserts[(size_t) slot];
+    std::unique_ptr<juce::AudioProcessor> old;
+    std::shared_ptr<RemoteDspInsert> oldRemote;
+    {
+        const juce::ScopedLock sl (lock);
+        old = std::move (entry.processor);
+        oldRemote = std::move (entry.remote);
+        entry.remote = std::move (ipcInsert);
+        entry.description = desc;
+        entry.hasDescription = true;
+        entry.missingState = entry.remote->getInitialState();
+        entry.bypassed.store (false, std::memory_order_relaxed);
+        entry.faulted.store (false, std::memory_order_relaxed);
+        entry.bufferChannels = 2;
+        entry.mainOutChannels = 2;
+        updateLatency();
+    }
+    if (old != nullptr) old->removeListener (this);
+    // Worker encerrado e mapeamento liberado FORA do lock da engine.
+    oldRemote.reset();
     return old;
 }
 
@@ -389,6 +420,7 @@ void Engine::swapInserts (Channel& c, int a, int b)
     auto& x = c.inserts[(size_t) a];
     auto& y = c.inserts[(size_t) b];
     std::swap (x.processor, y.processor);
+    std::swap (x.remote, y.remote);
     std::swap (x.description, y.description);
     std::swap (x.hasDescription, y.hasDescription);
     std::swap (x.missingState, y.missingState);
@@ -397,6 +429,9 @@ void Engine::swapInserts (Channel& c, int a, int b)
     const bool bx = x.bypassed.load();
     x.bypassed = y.bypassed.load();
     y.bypassed = bx;
+    const bool fx = x.faulted.load();
+    x.faulted = y.faulted.load();
+    y.faulted = fx;
 }
 
 void Engine::setBypass (Channel& c, int slot, bool b)
@@ -443,6 +478,7 @@ void Engine::clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& t
                            std::vector<std::unique_ptr<Track>>& oldTracks,
                            std::vector<std::unique_ptr<Bus>>& oldBuses)
 {
+    std::vector<std::shared_ptr<RemoteDspInsert>> retiredRemote;
     {
         const juce::ScopedLock sl (lock);
         playing = false;
@@ -455,6 +491,7 @@ void Engine::clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& t
         for (auto& s : master.inserts)
         {
             if (s.processor != nullptr) toDelete.push_back (std::move (s.processor));
+            if (s.remote != nullptr) retiredRemote.push_back (std::move (s.remote));
             s.hasDescription = false;
             s.missingState.reset();
             s.bypassed = false;
@@ -613,8 +650,14 @@ int Engine::chainLatencyOf (const Channel& c) const
 {
     int sum = 0;
     for (auto& s : c.inserts)
-        if (s.processor != nullptr && ! s.bypassed.load())
+    {
+        // Mesmo durante bypass/falha, o DSP remoto devolve o dry atrasado.
+        // A PDC nunca deve pular ao perder o worker.
+        if (s.remote != nullptr)
+            sum += s.remote->getLatencySamples();
+        else if (s.processor != nullptr && ! s.bypassed.load())
             sum += juce::jmax (0, s.processor->getLatencySamples());
+    }
     return sum;
 }
 
@@ -665,6 +708,14 @@ void Engine::runInserts (Channel& c, int n,
 {
     for (auto& s : c.inserts)
     {
+        if (s.remote != nullptr)
+        {
+            s.remote->process (work.getWritePointer (0), work.getWritePointer (1),
+                               n, s.bypassed.load (std::memory_order_relaxed));
+            if (s.remote->isFaulted())
+                s.faulted.store (true, std::memory_order_relaxed);
+            continue;
+        }
         auto* p = s.processor.get();
         if (p == nullptr || s.bypassed.load(std::memory_order_relaxed)) continue;
 
