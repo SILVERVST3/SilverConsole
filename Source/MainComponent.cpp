@@ -916,7 +916,9 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
     juce::PopupMenu m;
     m.addSectionHeader (s.getName() + (s.isMissing() ? juce::String::fromUTF8 (" (n\xc3\xa3o encontrado)") : juce::String()));
     m.addItem (1, "Abrir editor", s.processor != nullptr);
-    m.addItem (2, "Bypass", s.processor != nullptr, s.bypassed.load());
+    m.addItem (2, "Bypass", s.processor != nullptr || s.remote != nullptr, s.bypassed.load());
+    if (s.remote != nullptr)
+        m.addItem (6, "Reiniciar DSP isolado (recuperar falha)");
     m.addSeparator();
     m.addItem (3, "Substituir...");
     m.addItem (4, "Mover para cima", slot > 0);
@@ -932,6 +934,11 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
         if (r == 1) openEditor (*cp, slot);
         else if (r == 2) engine.setBypass (*cp, slot, ! sl.bypassed.load());
         else if (r == 3) { if (src != nullptr) showPluginMenu (*cp, slot, *src, true); }
+        else if (r == 6 && sl.remote != nullptr)
+        {
+            // Reiniciar e feito aqui, na thread de mensagens, nao no callback.
+            loadPluginIntoRemote (*cp, slot, sl.description, sl.missingState);
+        }
         else if (r == 4 || r == 5) { engine.swapInserts (*cp, slot, slot + (r == 4 ? -1 : 1)); lanesChanged(); }
         else if (r == 9)
         {
@@ -954,12 +961,24 @@ void MainComponent::showPluginMenu (Channel& c, int slot, juce::Component& sourc
     else juce::KnownPluginList::addToMenu (m, types, juce::KnownPluginList::sortByManufacturer);
     m.addSeparator();
     m.addItem (-1, "Escanear / gerenciar plugins...");
+    if (! types.isEmpty())
+    {
+        juce::PopupMenu isolated;
+        for (int i = 0; i < types.size(); ++i)
+            isolated.addItem (10000 + i, types.getReference (i).name);
+        m.addSubMenu ("Carregar VST3 isolado (experimental, sem editor)", isolated);
+    }
     auto* cp = &c;
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&source).withMaximumNumColumns (2),
                      [this, cp, slot, types] (int r)
     {
         if (r == 0 || ! channelExists (cp)) return;
         if (r == -1) { showPluginManager (false); return; }
+        if (r >= 10000 && juce::isPositiveAndBelow (r - 10000, types.size()))
+        {
+            loadPluginIntoRemote (*cp, slot, types.getReference (r - 10000));
+            return;
+        }
         const int idx = juce::KnownPluginList::getIndexChosenByMenu (types, r);
         if (juce::isPositiveAndBelow (idx, types.size())) loadPluginInto (*cp, slot, types.getReference (idx));
     });
@@ -978,7 +997,7 @@ void MainComponent::loadPluginInto (Channel& c, int slot, const juce::PluginDesc
         return;
     }
     closeEditor (c, slot);
-    const bool hadPlugin = c.inserts[(size_t) slot].processor != nullptr || c.inserts[(size_t) slot].isMissing();
+    const bool hadPlugin = ! c.inserts[(size_t) slot].isEmpty();
     auto old = engine.setInsert (c, slot, std::move (inst), &d);
     old.reset();
     if (hadPlugin) { engine.removeLanesForSlot (c, slot); lanesChanged(); } // parametros do plugin antigo nao valem mais
@@ -987,11 +1006,60 @@ void MainComponent::loadPluginInto (Channel& c, int slot, const juce::PluginDesc
     openEditor (c, slot);
 }
 
+void MainComponent::loadPluginIntoRemote (
+    Channel& c, int slot, const juce::PluginDescription& d,
+    const juce::MemoryBlock& state)
+{
+    // A criacao pode levar segundos, mas nunca acontece no callback da placa.
+    // Nenhum AudioPluginInstance e carregado no processo principal.
+    const auto worker = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                        .getSiblingFile ("ScDspWorker.exe");
+    juce::String err;
+    juce::MouseCursor::showWaitCursor();
+    auto remote = RemoteDspInsert::start (d, state, worker,
+                                          engine.getSampleRate(),
+                                          engine.getBlockSize(), err);
+    juce::MouseCursor::hideWaitCursor();
+    if (remote == nullptr)
+    {
+        alert ("DSP isolado", "Nao foi possivel abrir " + d.name + " no processo DSP.\n" + err);
+        return;
+    }
+    closeEditor (c, slot);
+    const bool hadPlugin = ! c.inserts[(size_t) slot].isEmpty();
+    auto old = engine.setRemoteInsert (c, slot, std::move (remote), d);
+    old.reset(); // destruicao do plugin antigo fora do lock
+    if (hadPlugin)
+    {
+        engine.removeLanesForSlot (c, slot);
+        lanesChanged();
+    }
+    if (auto* strip = stripFor (&c)) strip->refresh();
+    markDirty();
+}
+
 void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::StringArray& problems)
 {
     for (auto& in : data.inserts)
     {
         juce::String err;
+        if (in.isolated)
+        {
+            const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                                 .getSiblingFile ("ScDspWorker.exe");
+            auto worker = RemoteDspInsert::start (in.desc, in.state, exe,
+                                                 engine.getSampleRate(), engine.getBlockSize(), err);
+            if (worker != nullptr)
+            {
+                engine.setRemoteInsert (c, in.slot, std::move (worker), in.desc);
+                if (in.bypass) engine.setBypass (c, in.slot, true);
+                continue;
+            }
+            engine.setMissingInsert (c, in.slot, in.desc, in.state, true);
+            problems.add (c.name + ": DSP isolado indisponivel - " + in.desc.name
+                          + (err.isNotEmpty() ? " (" + err + ")" : juce::String()));
+            continue;
+        }
         auto inst = pluginHost.create (in.desc, engine.getSampleRate(), engine.getBlockSize(), err);
         if (inst != nullptr)
         {

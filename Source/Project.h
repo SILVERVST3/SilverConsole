@@ -10,6 +10,7 @@ struct InsertData
     int slot = 0;
     bool bypass = false;
     bool hasDesc = false;
+    bool isolated = false; // opcional, compativel com projetos anteriores
     juce::PluginDescription desc;
     juce::MemoryBlock state;
 };

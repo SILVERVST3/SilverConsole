@@ -50,6 +50,8 @@ set(SC_ENGINE_SOURCES
     Source/Engine.cpp Source/Engine.h Source/Metering.h
     Source/AudioLoader.cpp Source/AudioLoader.h
     Source/StreamingAudio.cpp Source/StreamingAudio.h
+    Source/DspIpcProtocol.h Source/DspIpcWatchdog.h
+    Source/RemoteDspInsert.cpp Source/RemoteDspInsert.h
     Source/Project.cpp Source/Project.h
     Source/Automation.h
     Source/AutomationRecorder.cpp Source/AutomationRecorder.h)
@@ -107,13 +109,32 @@ endif()
 
 # Na execucao local (fora do ZIP do CI), manter o helper junto do app.
 # Fazer o build do executavel auxiliar antes de copiar no POST_BUILD.
-add_dependencies(SilverConsole ScPluginScanWorker)
+# Realtime VST3 em processo dedicado; separado do scanner e do mixer.
+juce_add_console_app(ScDspWorker PRODUCT_NAME "SilverConsole DSP Worker")
+set_target_properties(ScDspWorker PROPERTIES OUTPUT_NAME "ScDspWorker")
+juce_generate_juce_header(ScDspWorker)
+target_sources(ScDspWorker PRIVATE
+    Source/DspWorkerMain.cpp Source/DspIpcProtocol.h)
+target_compile_definitions(ScDspWorker PRIVATE ${SC_COMMON_DEFS})
+target_link_libraries(ScDspWorker PRIVATE
+    juce::juce_audio_utils juce::juce_audio_processors
+    juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)
+if(MSVC)
+    target_compile_options(ScDspWorker PRIVATE /utf-8)
+endif()
+
+add_dependencies(SilverConsole ScPluginScanWorker ScDspWorker)
 if(WIN32)
     add_custom_command(TARGET SilverConsole POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
           "$<TARGET_FILE:ScPluginScanWorker>"
           "$<TARGET_FILE_DIR:SilverConsole>/ScPluginScanWorker.exe"
         COMMENT "Copiando helper isolado para a pasta do SilverConsole")
+    add_custom_command(TARGET SilverConsole POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+          "$<TARGET_FILE:ScDspWorker>"
+          "$<TARGET_FILE_DIR:SilverConsole>/ScDspWorker.exe"
+        COMMENT "Copiando processo DSP IPC para a pasta do SilverConsole")
 endif()
 
 #------------------------------------------------------------------------------
@@ -150,13 +171,14 @@ if(SILVERCONSOLE_TESTS)
     if(MSVC)
         target_compile_options(SilverConsoleTests PRIVATE /utf-8)
     endif()
-    add_dependencies(SilverConsoleTests SCTestPlugin_VST3 ScPluginScanWorker)
+    add_dependencies(SilverConsoleTests SCTestPlugin_VST3 ScPluginScanWorker ScDspWorker)
 
     add_test(NAME Engine
         COMMAND SilverConsoleTests
           "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"
           "${CMAKE_CURRENT_BINARY_DIR}/engine-scan-description.xml"
-          "$<TARGET_FILE:ScPluginScanWorker>")
+          "$<TARGET_FILE:ScPluginScanWorker>"
+          "$<TARGET_FILE:ScDspWorker>")
 
     # O plugin do proprio projeto e testado no PROCESSO do helper, nunca
     # dentro do SilverConsole GUI. O XML e validado separadamente.

@@ -7,6 +7,8 @@
 #include "AutomationRecorder.h"
 #include "PluginScanPolicy.h"
 #include "PluginScanSupervisor.h"
+#include "DspIpcWatchdog.h"
+#include "RemoteDspInsert.h"
 #include <cstdio>
 #include <thread>
 #include <stdexcept>
@@ -151,6 +153,114 @@ static void testPluginExceptionFallback()
            && e.getRealtimeStats().pluginExceptions == 1,
            "plugin exception: nova falha volta ao bypass automaticamente");
 }
+
+// IPC: sequencias, expiracao de buffers, bypass e inicializacao explicita.
+static void testDspIpcWatchdog()
+{
+    DspIpcWatchdog watch (2);
+    check (watch.snapshot().state == DspIpcWatchdog::State::starting,
+           "ipc watchdog: nunca opera antes do handshake");
+    watch.start (256, 64);
+    check (watch.snapshot().latencySamples == 320,
+           "ipc watchdog: transporte + PDC do plugin contabilizados");
+    check (watch.onSubmit() == 1, "ipc watchdog: primeira sequencia");
+    watch.onCompletion (999); // resposta futura, potencialmente corrompida
+    check (watch.snapshot().completed == 0,
+           "ipc watchdog: descarta sequencia maior que enviada");
+    watch.onCompletion (1);
+    check (watch.snapshot().completed == 1, "ipc watchdog: aceita resposta valida");
+    watch.onSubmit(); // seq 2
+    watch.onSubmit(); // seq 3
+    check (watch.isHealthy(), "ipc watchdog: tolera buffers em andamento");
+    watch.onSubmit(); // seq 4: 3 > limite de 2
+    check (! watch.isHealthy() &&
+           watch.snapshot().state == DspIpcWatchdog::State::bypassed,
+           "ipc watchdog: troca para dry quando prazo de buffer expira");
+    check (watch.onSubmit() == 0, "ipc watchdog: nao envia novos buffers apos falha");
+    watch.stop();
+    check (watch.snapshot().state == DspIpcWatchdog::State::stopped,
+           "ipc watchdog: parada explicita");
+    watch.start (128, 0);
+    check (watch.snapshot().state == DspIpcWatchdog::State::running &&
+           watch.snapshot().submitted == 0,
+           "ipc watchdog: reinicio descarta sequencias anteriores");
+}
+
+#if JUCE_WINDOWS
+// Testa o caminho REAL de memoria compartilhada com VST3 em processo FILHO.
+static void testRemoteDspWorker (const juce::File& worker, const juce::File& pluginFile)
+{
+    check (worker.existsAsFile(), "ipc worker: executavel separado empacotado");
+    if (! worker.existsAsFile()) return;
+    juce::String error;
+    juce::VST3PluginFormat format;
+    juce::OwnedArray<juce::PluginDescription> descs;
+    format.findAllTypesForFile (descs, pluginFile.getFullPathName());
+    check (! descs.isEmpty(), "ipc worker: plugin de teste VST3 encontrado");
+    if (descs.isEmpty()) return;
+
+    auto missing = RemoteDspInsert::start (*descs[0], {}, worker.getSiblingFile ("no-worker.exe"),
+                                            48000, 256, error);
+    check (missing == nullptr && error.isNotEmpty(),
+           "ipc worker: recusa helper inexistente sem abrir plugin no host");
+
+    auto remote = RemoteDspInsert::start (*descs[0], {}, worker, 48000, 256, error);
+    check (remote != nullptr, "ipc worker: handshake e instanciacao VST3 " + error);
+    if (remote == nullptr) return;
+    check (remote->getPluginLatencySamples() == 64 &&
+           remote->getLatencySamples() == 320,
+           "ipc worker: latencia fixa de 1 buffer + 64 amostras do plugin");
+
+    Engine e;
+    e.prepare (48000.0, 256);
+    // O impulse ocorre DEPOIS da rampa de 20ms do fader/master; no
+    // primeiro sample o mixer intencionalmente faz fade-in e atenua o teste.
+    auto impulse = makeBuffer (2, 3072, [] (int, int i) { return i == 1024 ? 0.5f : 0.0f; });
+    auto* track = addTrack (e, impulse, "ipc test");
+    auto old = e.setRemoteInsert (*track, 0, remote, *descs[0]);
+    check (old == nullptr && track->inserts[0].processor == nullptr
+           && track->inserts[0].remote != nullptr,
+           "ipc worker: DSP nao instancia AudioProcessor no processo principal");
+    check (e.getTotalLatency() == 320,
+           "ipc worker: PDC inclui latencia remota declarada");
+
+    juce::AudioBuffer<float> output (2, 3072);
+    output.clear();
+    juce::int64 pos = 0;
+    for (int b = 0; b < 12; ++b)
+    {
+        pos = e.render (output.getWritePointer (0, b * 256),
+                        output.getWritePointer (1, b * 256), 256, pos, true, false);
+        // O teste NAO e realtime: cede CPU ao worker para exercitar o caminho
+        // assíncrono sem depender de scheduling ultra-baixa latencia no CI.
+        juce::Thread::sleep (12);
+    }
+    check (remote->snapshot().completed > 0 && ! remote->isFaulted(),
+           "ipc worker: worker devolveu blocos sem travar callback");
+    check (output.getSample (0, 1344) > 0.3f &&
+           output.getSample (1, 1344) > 0.3f,
+           "ipc worker: impulso reproduzido com atraso de 1 buffer + PDC do plugin");
+
+    const auto latencyBefore = e.getTotalLatency();
+    remote->simulateWorkerCrashForTests(); // controle/teste, NUNCA callback
+    for (int b = 0; b < 3; ++b)
+    {
+        const auto dry = e.render (output.getWritePointer (0),
+                                   output.getWritePointer (1), 256, pos, true, false);
+        pos = dry;
+    }
+    bool finite = true;
+    for (int c = 0; c < 2; ++c)
+        for (int i = 0; i < 256; ++i)
+            finite = finite && std::isfinite (output.getSample (c, i));
+    check (remote->isFaulted() && finite,
+           "ipc worker: crash aciona dry seguro sem NaNs nem espera");
+    check (e.getTotalLatency() == latencyBefore,
+           "ipc worker: latencia alinhada e PDC preservada durante falha");
+    check (remote->snapshot().state == DspIpcWatchdog::State::bypassed,
+           "ipc worker: falha latched ate reiniciar processo na thread de controle");
+}
+#endif
 
 static void testMixBasics()
 {
@@ -928,6 +1038,7 @@ int main (int argc, char** argv)
 {
     juce::ScopedJuceInitialiser_GUI init;
     testMixBasics();
+    testDspIpcWatchdog();
     testPluginExceptionFallback();
     testPluginScanQuarantine();
     testTruePeakMeter();
@@ -950,6 +1061,11 @@ int main (int argc, char** argv)
         juce::File (juce::String::fromUTF8 (argv[2])).replaceWithText (scannedDescXml);
     if (argc > 3)
         testScanSupervisor (juce::File (juce::String::fromUTF8 (argv[3])));
+#if JUCE_WINDOWS
+    if (argc > 4 && argc > 1)
+        testRemoteDspWorker (juce::File (juce::String::fromUTF8 (argv[4])),
+                             juce::File (juce::String::fromUTF8 (argv[1])));
+#endif
     std::printf ("\n%s (%d falha(s))\n", failures == 0 ? "TODOS OS TESTES PASSARAM" : "HOUVE FALHAS", failures);
     return failures == 0 ? 0 : 1;
 }

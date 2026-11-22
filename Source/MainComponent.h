@@ -137,6 +137,8 @@ private:
     // plugins
     void showPluginMenu (Channel&, int slot, juce::Component&, bool replacing);
     void loadPluginInto (Channel&, int slot, const juce::PluginDescription&);
+    void loadPluginIntoRemote (Channel&, int slot, const juce::PluginDescription&,
+                               const juce::MemoryBlock& state = {});
     void loadInserts (Channel&, const ChannelData&, juce::StringArray& problems);
     void openEditor (Channel&, int slot);
     void closeEditor (Channel&, int slot);

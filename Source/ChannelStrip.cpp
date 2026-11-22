@@ -126,15 +126,18 @@ void InsertSlotComponent::paint (juce::Graphics& g)
     else if (s.bypassed.load()) c = colours::textDim;
     g.setColour (c);
     g.drawFittedText (s.getName(), text.toNearestInt(), juce::Justification::centredLeft, 1, 0.85f);
-    if (s.bypassed.load())
+    if (s.bypassed.load() || s.faulted.load())
     {
-        g.setColour (colours::mute);
+        g.setColour (s.faulted.load() ? colours::danger : colours::mute);
         g.setFont (uiFont (9.0f, true));
         g.drawText (s.faulted.load (std::memory_order_relaxed) ? "ERR" : "BYP",
                     r.withTrimmedRight (3.0f), juce::Justification::centredRight);
     }
     setTooltip (s.isMissing() ? "Plugin nao encontrado: " + s.getName()
-              : s.faulted.load (std::memory_order_relaxed)
+              : s.remote != nullptr
+                ? (s.faulted.load() ? "DSP IPC com falha: " : "DSP IPC isolado: ") + s.getName()
+                  + " | clique direito: reiniciar processo | estado de parametros nao editavel"
+                : s.faulted.load (std::memory_order_relaxed)
                   ? "Falha de processamento: " + s.getName()
                     + " (bypass automatico). Shift+clique para tentar reativar."
                   : s.getName() + "  -  clique: editor | Shift+clique: bypass | botao direito: opcoes");

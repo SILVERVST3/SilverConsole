@@ -23,6 +23,7 @@ namespace
             in.slot = i;
             in.bypass = s.bypassed.load();
             in.hasDesc = s.hasDescription;
+            in.isolated = s.preferRemote;
             in.desc = s.description;
             if (s.processor != nullptr) s.processor->getStateInformation (in.state);
             else in.state = s.missingState;
@@ -51,6 +52,7 @@ namespace
             auto* x = e.createNewChildElement ("INSERT");
             x->setAttribute ("slot", in.slot);
             x->setAttribute ("bypass", in.bypass);
+            x->setAttribute ("isolated", in.isolated);
             if (auto desc = in.desc.createXml()) x->addChildElement (desc.release());
             x->createNewChildElement ("STATE")->addTextElement (in.state.toBase64Encoding());
         }
@@ -84,6 +86,7 @@ namespace
             InsertData in;
             in.slot = x->getIntAttribute ("slot", -1);
             in.bypass = x->getBoolAttribute ("bypass");
+            in.isolated = x->getBoolAttribute ("isolated", false);
             if (! juce::isPositiveAndBelow (in.slot, kNumInserts)) continue;
             if (auto* p = x->getChildByName ("PLUGIN")) in.hasDesc = in.desc.loadFromXml (*p);
             if (auto* s = x->getChildByName ("STATE")) in.state.fromBase64Encoding (s->getAllSubText().trim());

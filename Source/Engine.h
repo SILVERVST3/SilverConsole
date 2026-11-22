@@ -6,6 +6,7 @@
 #include "Automation.h"
 #include "StreamingAudio.h"
 #include "Metering.h"
+#include "RemoteDspInsert.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -66,16 +67,18 @@ private:
 struct InsertSlot
 {
     std::unique_ptr<juce::AudioProcessor> processor;
+    std::shared_ptr<RemoteDspInsert> remote; // processo DSP real, sem AudioProcessor no host
     juce::PluginDescription description;
     bool hasDescription = false;      // plugin externo (pode estar ausente)
+    bool preferRemote = false;         // guarda modo em projetos e plugins ausentes
     juce::MemoryBlock missingState;   // estado guardado quando o plugin nao abriu
     std::atomic<bool> bypassed { false };
     std::atomic<bool> faulted { false }; // Falha C++ em processBlock; exibida na interface, sem locks
     int bufferChannels = 2;
     int mainOutChannels = 2;
 
-    bool isEmpty() const noexcept     { return processor == nullptr && ! hasDescription; }
-    bool isMissing() const noexcept   { return processor == nullptr && hasDescription; }
+    bool isEmpty() const noexcept     { return processor == nullptr && remote == nullptr && ! hasDescription; }
+    bool isMissing() const noexcept   { return processor == nullptr && remote == nullptr && hasDescription; }
     juce::String getName() const
     {
         if (hasDescription) return description.name;
@@ -181,8 +184,13 @@ public:
     /** Troca o insert; devolve o anterior para ser destruido fora do lock. */
     std::unique_ptr<juce::AudioProcessor> setInsert (Channel&, int slot, std::unique_ptr<juce::AudioProcessor>,
                                                      const juce::PluginDescription* desc);
+    // Instala worker inicializado na thread de controle. A thread de audio
+    // encontra o ponteiro somente sob lock de Engine, nao cria subprocessos.
+    std::unique_ptr<juce::AudioProcessor> setRemoteInsert (
+        Channel&, int slot, std::shared_ptr<RemoteDspInsert>, const juce::PluginDescription&);
     std::unique_ptr<juce::AudioProcessor> clearInsert (Channel&, int slot);
-    void setMissingInsert (Channel&, int slot, const juce::PluginDescription&, const juce::MemoryBlock& state);
+    void setMissingInsert (Channel&, int slot, const juce::PluginDescription&,
+                           const juce::MemoryBlock& state, bool preferRemote = false);
     void swapInserts (Channel&, int a, int b);
     void setBypass (Channel&, int slot, bool);
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
