@@ -259,6 +259,85 @@ static void testRemoteDspWorker (const juce::File& worker, const juce::File& plu
            "ipc worker: latencia alinhada e PDC preservada durante falha");
     check (remote->snapshot().state == DspIpcWatchdog::State::bypassed,
            "ipc worker: falha latched ate reiniciar processo na thread de controle");
+
+    // ---- Estado com ganho de -6 dB: distingue o sinal processado (wet) do seco ----
+    juce::MemoryBlock minus6;
+    {
+        juce::VST3PluginFormat fmt;
+        auto local = fmt.createInstanceFromDescription (*descs[0], 48000, 256, error);
+        if (local != nullptr && ! local->getParameters().isEmpty())
+        {
+            local->getParameters()[0]->setValue (0.375f); // -24..+24 dB -> -6 dB
+            local->getStateInformation (minus6);
+        }
+    }
+    check (minus6.getSize() > 0, "ipc worker: estado -6 dB do plugin de teste");
+    const float wetGain = juce::Decibels::decibelsToGain (-6.0f);
+
+    // (a) Ritmo de tempo real: um bloco de 256 a cada 5,33 ms, sem folga extra.
+    //     Com polling por Sleep(1) o worker perdia prazos e o watchdog travava o bypass.
+    {
+        auto rt = RemoteDspInsert::start (*descs[0], minus6, worker, 48000, 256, error);
+        check (rt != nullptr, "ipc tempo real: worker iniciado " + error);
+        if (rt != nullptr)
+        {
+            juce::HeapBlock<float> l (256), r (256);
+            const int blocks = 400; // ~2,1 s
+            const double period = 256.0 * 1000.0 / 48000.0;
+            int wetBlocks = 0;
+            auto next = juce::Time::getMillisecondCounterHiRes();
+            for (int b = 0; b < blocks; ++b)
+            {
+                for (int i = 0; i < 256; ++i) l[i] = r[i] = 0.5f;
+                rt->process (l, r, 256, false);
+                if (std::abs (l[200] - 0.5f * wetGain) < 1.0e-3f) ++wetBlocks;
+                next += period;
+                while (juce::Time::getMillisecondCounterHiRes() < next) {} // espera ativa precisa
+            }
+            const auto snap = rt->snapshot();
+            std::printf ("       (tempo real: %d/%d blocos processados, %llu respostas, %llu perdidas)\n",
+                         wetBlocks, blocks, (unsigned long long) snap.completed, (unsigned long long) rt->getMisses());
+            check (! rt->isFaulted() && wetBlocks >= blocks * 9 / 10,
+                   "ipc tempo real: worker cumpre o prazo de 1 buffer (>= 90% dos blocos processados)");
+        }
+    }
+
+    // (b) Exportacao offline: o bounce e mais rapido que o tempo real e precisa
+    //     esperar o worker; antes, saia o sinal seco (0,5) em vez do processado.
+    {
+        auto ex = RemoteDspInsert::start (*descs[0], minus6, worker, 48000, 256, error);
+        check (ex != nullptr, "ipc export: worker iniciado " + error);
+        if (ex != nullptr)
+        {
+            Engine e2;
+            e2.prepare (48000.0, 256);
+            auto* t2 = addTrack (e2, makeBuffer (2, 48000, [] (int, int i) { return i == 24000 ? 0.5f : 0.0f; }), "ipc export");
+            e2.setRemoteInsert (*t2, 0, ex, *descs[0]);
+            auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_ipc_export.wav");
+            std::atomic<float> progress { 0 }; std::atomic<bool> cancel { false };
+            juce::String err; bool clipped = false;
+            const bool ok = e2.exportMix (file, 32, 0.0, progress, cancel, err, clipped);
+            check (ok, "ipc export: exportacao com insert isolado " + err);
+            juce::AudioFormatManager fm; registerAudioFormats (fm);
+            auto loaded = loadAudioFile (fm, file);
+            if (loaded.ok())
+            {
+                check (loaded.original->getNumSamples() == 48000, "ipc export: tamanho certo (PDC descontado)");
+                check (peakIndex (*loaded.original, 0) == 24000
+                       && near (loaded.original->getSample (0, 24000), 0.5f * wetGain, 1.0e-3f),
+                       "ipc export: impulso processado pelo worker (-6 dB), alinhado, sem trecho seco");
+            }
+            else check (false, "ipc export: WAV legivel");
+            check (! ex->isFaulted() && ! ex->isOffline(), "ipc export: worker saudavel e modo tempo real restaurado");
+
+            // worker morto: exportacao recusada com mensagem, em vez de gravar mix seca
+            ex->simulateWorkerCrashForTests();
+            err.clear();
+            check (! e2.exportMix (file, 32, 0.0, progress, cancel, err, clipped) && err.isNotEmpty(),
+                   "ipc export: insert em falha bloqueia a exportacao com aviso");
+            file.deleteFile();
+        }
+    }
 }
 #endif
 
@@ -374,6 +453,43 @@ static void testLatencyCompensation()
         check (peakIndex (*loaded.original, 0) == 1000 && near (loaded.original->getSample (0, 1000), 2.0f),
                "exportacao sem deslocamento de latencia");
     check (clipped, "aviso de clipping na exportacao (pico 2.0)");
+
+    // exportacao de um trecho (regiao do loop): impulso em 1000 -> trecho 900..1500 = 600 amostras, impulso em 100
+    progress = 0; err.clear(); clipped = false;
+    check (e.exportMix (file, 32, 0.0, progress, cancel, err, clipped, 900, 1500), "exportar trecho " + err);
+    loaded = loadAudioFile (fm, file);
+    check (loaded.ok() && loaded.original->getNumSamples() == 600, "trecho exportado com o tamanho certo");
+    if (loaded.ok())
+        check (peakIndex (*loaded.original, 0) == 100 && near (loaded.original->getSample (0, 100), 2.0f),
+               "trecho exportado alinhado (PDC descontado)");
+    check (! e.exportMix (file, 32, 0.0, progress, cancel, err, clipped, 500, 500), "trecho vazio e recusado");
+    file.deleteFile();
+}
+
+static void testExportDither()
+{
+    // 16 bits: silencio vira ruido de dither de no maximo 2 LSB; sinal fica preservado
+    Engine e; e.prepare (48000, 256);
+    addTrack (e, makeBuffer (1, 4800, [] (int, int i) { return i < 2400 ? 0.0f : 0.25f; }), "half");
+    e.tracks[0]->pan = -1.0f; // mono -> so esquerda (potencia constante: L = 1)
+    auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_export_dither.wav");
+    std::atomic<float> progress { 0 }; std::atomic<bool> cancel { false };
+    juce::String err; bool clipped = false;
+    check (e.exportMix (file, 16, 0.0, progress, cancel, err, clipped), "exportar WAV 16 bits " + err);
+    juce::AudioFormatManager fm; registerAudioFormats (fm);
+    auto loaded = loadAudioFile (fm, file);
+    check (loaded.ok() && loaded.original->getNumSamples() == 4800, "WAV 16 bits com o tamanho certo");
+    if (loaded.ok())
+    {
+        const float lsb = 1.0f / 32768.0f;
+        const float silence = loaded.original->getMagnitude (0, 0, 2400);
+        const float noiseR = loaded.original->getMagnitude (1, 0, 4800);
+        float maxErr = 0.0f;
+        for (int i = 2400; i < 4800; ++i) maxErr = juce::jmax (maxErr, std::abs (loaded.original->getSample (0, i) - 0.25f));
+        check (silence > 0.0f && silence <= 2.5f * lsb && noiseR <= 2.5f * lsb, "dither TPDF de no maximo 2 LSB");
+        check (maxErr <= 2.5f * lsb, "sinal preservado com dither");
+    }
+    check (! clipped, "sem aviso de clipping");
     file.deleteFile();
 }
 
@@ -1049,6 +1165,7 @@ int main (int argc, char** argv)
     testStereoBalanceMuteSolo();
     testBusesAndSends();
     testLatencyCompensation();
+    testExportDither();
     testLoop();
     testAutomationRead();
     testAutomationRecord();

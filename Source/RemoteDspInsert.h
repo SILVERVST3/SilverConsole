@@ -46,12 +46,22 @@ public:
     // Usado somente em testes de regressao fora do audio callback.
     void simulateWorkerCrashForTests() noexcept;
 
+    /** Exportacao offline (thread de trabalho, com Engine::lock e sem callback de audio):
+        process() passa a ESPERAR o worker (com prazo) em vez de cair no sinal seco,
+        porque o bounce roda mais rapido que o tempo real. Ao entrar e ao sair,
+        descarta respostas e audio seco antigos para nao misturar playback e bounce. */
+    void setOffline (bool shouldBeOffline) noexcept;
+    bool isOffline() const noexcept { return offline; }
+
 private:
     RemoteDspInsert() = default;
     bool initialise (const juce::PluginDescription&, const juce::MemoryBlock&,
                      const juce::File&, double, int, juce::String&);
     void delayedDry (float*, float*, int) noexcept;
     void switchFade (float*, float*, int, bool wet) noexcept;
+    void resetStream() noexcept;
+    bool waitOffline (ipc::Frame&, std::int32_t wanted, std::int32_t forSequence) noexcept;
+    bool workerAlive() const noexcept;
 
     struct HostResources;
     std::unique_ptr<HostResources> resources;
@@ -65,6 +75,9 @@ private:
     int previousL = 0; // reservado para diagnostico
     float lastOutL = 0.0f, lastOutR = 0.0f;
     bool lastWet = false, hasOutput = false;
+    void* wakeEvent = nullptr;     // HANDLE de evento Win32: acorda o worker sem polling
+    bool offline = false;          // exportacao: espera o worker em vez de usar seco
+    uint64_t discardThrough = 0;   // respostas com sequencia <= isto sao de antes do reset
     std::atomic<bool> failed { false };
     std::atomic<uint64_t> missed { 0 };
     std::atomic<bool> workerFinished { false };

@@ -40,25 +40,43 @@ int main (int argc, char** argv)
     juce::ignoreUnused (argc, argv);
     return 2;
 #else
-    if (argc != 3) return 2;
+    // argv: mapeamento, config XML e (opcional) PID do host
+    if (argc != 3 && argc != 4) return 2;
     juce::ScopedJuceInitialiser_GUI init;
     const auto name = juce::String::fromUTF8 (argv[1]);
     const juce::File config (juce::String::fromUTF8 (argv[2]));
 
+    // Se o host morrer sem avisar (crash/kill), este processo encerra sozinho.
+    HANDLE parent = nullptr;
+    if (argc == 4)
+    {
+        const auto pid = (DWORD) juce::String::fromUTF8 (argv[3]).getLargeIntValue();
+        if (pid != 0) parent = ::OpenProcess (SYNCHRONIZE, FALSE, pid);
+    }
+    // Evento "bloco pronto" criado pelo host; sem ele, volta ao polling.
+    HANDLE wake = ::OpenEventW (SYNCHRONIZE, FALSE, (name + "_wake").toWideCharPointer());
+    const auto closeHandles = [&]
+    {
+        if (wake != nullptr) { ::CloseHandle (wake); wake = nullptr; }
+        if (parent != nullptr) { ::CloseHandle (parent); parent = nullptr; }
+    };
+
     HANDLE mapping = ::OpenFileMappingW (FILE_MAP_ALL_ACCESS, FALSE,
                                          name.toWideCharPointer());
-    if (mapping == nullptr) return 3;
+    if (mapping == nullptr) { closeHandles(); return 3; }
     auto* shared = static_cast<sc::ipc::Shared*> (
         ::MapViewOfFile (mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof (sc::ipc::Shared)));
     if (shared == nullptr)
     {
         ::CloseHandle (mapping);
+        closeHandles();
         return 4;
     }
     const auto release = [&] (int status)
     {
         ::UnmapViewOfFile (shared);
         ::CloseHandle (mapping);
+        closeHandles();
         return status;
     };
 
@@ -130,12 +148,21 @@ int main (int argc, char** argv)
     }
 
     store (shared->pluginLatency, juce::jmax (0, plugin->getLatencySamples()));
+    const bool monoOut = plugin->getTotalNumOutputChannels() == 1;
+    // O DSP precisa responder dentro de um buffer: prioridade de tempo real
+    // para esta thread (unica thread de processamento do worker).
+    ::SetThreadPriority (::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     store (shared->ready, 1);
 
     juce::AudioBuffer<float> audio (sc::ipc::channels, sc::ipc::maxFrames);
     juce::MidiBuffer midi;
+    int idleRounds = 0;
     while (load (shared->stop) == 0)
     {
+        if (parent != nullptr && (idleRounds & 63) == 0
+            && ::WaitForSingleObject (parent, 0) == WAIT_OBJECT_0)
+            break; // host encerrou: nao deixar processo orfao
+
         bool processed = false;
         for (auto& slot : shared->frames)
         {
@@ -166,6 +193,8 @@ int main (int argc, char** argv)
                 store (slot.state, sc::ipc::free);
                 return release (11);
             }
+            if (monoOut) // plugin de saida mono: o canal direito recebe o mesmo sinal
+                audio.copyFrom (1, 0, audio, 0, 0, count);
             bool finite = true;
             for (int channel = 0; channel < 2; ++channel)
             {
@@ -185,8 +214,15 @@ int main (int argc, char** argv)
             store (slot.state, sc::ipc::readyForHost);
         }
 
-        if (! processed)
-            juce::Thread::sleep (1); // somente no processo auxiliar
+        if (processed) idleRounds = 0;
+        else
+        {
+            ++idleRounds;
+            // Acorda assim que o host sinaliza um bloco; o prazo curto mantem
+            // a checagem de stop/host vivo mesmo sem audio.
+            if (wake != nullptr) ::WaitForSingleObject (wake, 2);
+            else juce::Thread::sleep (1); // fallback: polling
+        }
         ::InterlockedIncrement (reinterpret_cast<volatile LONG*> (&shared->heartbeat));
     }
     plugin->releaseResources();

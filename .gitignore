@@ -5,3 +5,4 @@ out/
 *.user
 Demo/
 __pycache__/
+dist/

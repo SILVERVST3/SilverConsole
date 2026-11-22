@@ -35,6 +35,7 @@ struct RemoteDspInsert::HostResources
 {
 #if JUCE_WINDOWS
     HANDLE mapping = nullptr;
+    HANDLE wake = nullptr; // evento auto-reset: host sinaliza bloco novo
 #endif
     juce::ChildProcess process;
     juce::File config;
@@ -49,6 +50,7 @@ struct RemoteDspInsert::HostResources
         }
         if (config.existsAsFile()) config.deleteFile();
 #if JUCE_WINDOWS
+        if (wake != nullptr) ::CloseHandle (wake);
         if (mapping != nullptr) ::CloseHandle (mapping);
 #endif
     }
@@ -103,6 +105,14 @@ bool RemoteDspInsert::initialise (
     shared->blockFrames = frames;
     shared->sampleRate = juce::roundToInt (rate);
 
+    // Evento de "bloco pronto". Sem ele o worker dependeria de Sleep(1), cuja
+    // granularidade no Windows pode chegar a ~15,6 ms (maior que um buffer de
+    // 256 amostras a 48 kHz), e o watchdog travaria o bypass. SetEvent nao
+    // bloqueia e e o mecanismo usual de pontes de plugin em tempo real.
+    resources->wake = ::CreateEventW (nullptr, FALSE, FALSE,
+                                      (resources->mappingName + "_wake").toWideCharPointer());
+    wakeEvent = resources->wake; // se falhar, o worker cai no modo polling
+
     resources->config = juce::File::getSpecialLocation (juce::File::tempDirectory)
         .getChildFile ("silverconsole-dsp-" + guid + ".xml");
     juce::XmlElement root ("SILVERCONSOLE_DSP_CONFIG");
@@ -118,6 +128,9 @@ bool RemoteDspInsert::initialise (
     args.add (exe.getFullPathName());
     args.add (resources->mappingName);
     args.add (resources->config.getFullPathName());
+    // PID do host: o worker encerra sozinho se o SilverConsole fechar de forma
+    // anormal (sem isso ficaria um ScDspWorker.exe orfao consumindo CPU).
+    args.add (juce::String ((juce::int64) ::GetCurrentProcessId()));
     if (! resources->process.start (args, 0))
     {
         error = "Falha ao iniciar ScDspWorker.exe.";
@@ -218,6 +231,7 @@ void RemoteDspInsert::process (float* l, float* r, int n, bool userBypass) noexc
         if (sequence != 0)
         {
             auto& slot = shared->frames[(sequence - 1) % ipc::slots];
+            if (offline) waitOffline (slot, ipc::free, (std::int32_t) sequence);
             if (atomicRead (slot.state) == ipc::free)
             {
                 slot.sequence = (std::int32_t) sequence;
@@ -228,6 +242,7 @@ void RemoteDspInsert::process (float* l, float* r, int n, bool userBypass) noexc
                     slot.input[1][i] = r[i];
                 }
                 atomicWrite (slot.state, ipc::readyForWorker);
+                if (wakeEvent != nullptr) ::SetEvent (static_cast<HANDLE> (wakeEvent));
             }
             else missed.fetch_add (1, std::memory_order_relaxed);
         }
@@ -236,10 +251,17 @@ void RemoteDspInsert::process (float* l, float* r, int n, bool userBypass) noexc
     // Sempre avanca a linha de atraso do sinal seco mesmo com bypass/timeout.
     delayedDry (l, r, n);
 
-    if (sequence > 1)
+    if (sequence > 1 && sequence - 1 > discardThrough)
     {
         const auto target = sequence - 1;
         auto& previous = shared->frames[(target - 1) % ipc::slots];
+        // Offline: o bounce nao tem relogio de tempo real; espera a resposta
+        // (com prazo) em vez de gravar trechos secos na mix exportada.
+        if (offline && ! waitOffline (previous, ipc::readyForHost, (std::int32_t) target))
+        {
+            failed.store (true, std::memory_order_relaxed);
+            watchdog.fail();
+        }
         if (atomicRead (previous.state) == ipc::readyForHost &&
             previous.sequence == (std::int32_t) target &&
             previous.frames == n)
@@ -284,6 +306,63 @@ void RemoteDspInsert::process (float* l, float* r, int n, bool userBypass) noexc
     delayedDry (l, r, n);
 #endif
     switchFade (l, r, n, wet);
+}
+
+bool RemoteDspInsert::workerAlive() const noexcept
+{
+    return resources != nullptr && resources->process.isRunning();
+}
+
+bool RemoteDspInsert::waitOffline (ipc::Frame& frame, std::int32_t wanted, std::int32_t forSequence) noexcept
+{
+#if JUCE_WINDOWS
+    // Somente na thread de exportacao (nunca no callback de audio).
+    const auto began = juce::Time::getMillisecondCounter();
+    for (int spins = 0;; ++spins)
+    {
+        const auto s = atomicRead (frame.state);
+        if (s == wanted) return true;
+        // libera respostas antigas que ocupam o slot (ex.: blocos do playback)
+        if (wanted == ipc::free && s == ipc::readyForHost && frame.sequence < forSequence)
+        {
+            atomicWrite (frame.state, ipc::free);
+            continue;
+        }
+        if (failed.load (std::memory_order_relaxed) || atomicRead (shared->ready) == -1) return false;
+        if ((spins & 255) == 255)
+        {
+            if (! workerAlive()) return false;
+            if (juce::Time::getMillisecondCounter() - began > 5000) return false; // worker travado
+        }
+        if (spins < 2000) ::SwitchToThread(); else ::Sleep (1);
+    }
+#else
+    juce::ignoreUnused (frame, wanted, forSequence);
+    return false;
+#endif
+}
+
+void RemoteDspInsert::resetStream() noexcept
+{
+#if JUCE_WINDOWS
+    if (shared != nullptr)
+        for (auto& slot : shared->frames)
+            if (atomicRead (slot.state) == ipc::readyForHost)
+                atomicWrite (slot.state, ipc::free);
+#endif
+    discardThrough = watchdog.snapshot().submitted; // ainda pode chegar resposta antiga em processamento
+    std::fill (dryL.begin(), dryL.end(), 0.0f);
+    std::fill (dryR.begin(), dryR.end(), 0.0f);
+    dryCursor = 0;
+    hasOutput = false;
+    lastWet = false;
+}
+
+void RemoteDspInsert::setOffline (bool shouldBeOffline) noexcept
+{
+    if (offline == shouldBeOffline) return;
+    offline = shouldBeOffline;
+    resetStream();
 }
 
 void RemoteDspInsert::simulateWorkerCrashForTests() noexcept

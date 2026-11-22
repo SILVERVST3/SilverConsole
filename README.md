@@ -60,7 +60,9 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 **Transporte e projeto**
 - Tocar/pausar, parar, voltar ao início, régua clicável e **loop**: Shift+arrastar na régua define a região.
 - Projetos `.sconsole` em XML. O projeto guarda o caminho dos áudios, relativo à pasta do projeto, e não copia os arquivos.
-- **Exportar mix** para WAV de 16, 24 ou 32 bits float, renderizada offline (mais rápido que tempo real e sem falhas). Inclui 3 s de cauda e já descontada a latência dos plugins. Avisa se a mix passou de 0 dBFS.
+- **Exportar mix** para WAV de 16, 24 ou 32 bits float, renderizada offline (mais rápido que tempo real e sem falhas). Inclui 3 s de cauda e já descontada a latência dos plugins. Avisa se a mix passou de 0 dBFS. Em 16 bits aplica **dither TPDF**.
+- **Exportar só a região do loop**: com uma região definida na régua, o menu de exportação oferece "Só a região do loop".
+- **Projetos recentes**: o botão **Abrir** lista os últimos 10 projetos. O tamanho e a posição da janela também são lembrados.
 
 ## Escaneamento isolado de VST3 (Etapa 4 - experimental)
 

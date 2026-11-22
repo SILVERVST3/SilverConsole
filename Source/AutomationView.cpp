@@ -664,7 +664,7 @@ const std::vector<float>& AutomationView::peaksFor (const Track& t)
     const auto* buf = t.playback.get();
     if (buf == nullptr) return none;
     auto it = peakCache.find (buf);
-    if (it != peakCache.end()) return it->second;
+    if (it != peakCache.end() && it->second.source.lock() == t.playback) return it->second.peaks;
     constexpr int bins = 4096;
     std::vector<float> peaks ((size_t) bins, 0.0f);
     const int len = buf->getNumSamples();
@@ -679,7 +679,7 @@ const std::vector<float>& AutomationView::peaksFor (const Track& t)
         }
     }
     if (peakCache.size() > 256) peakCache.clear();
-    return peakCache.emplace (buf, std::move (peaks)).first->second;
+    return peakCache.insert_or_assign (buf, PeakEntry { t.playback, std::move (peaks) }).first->second.peaks;
 }
 
 juce::String AutomationView::signature() const

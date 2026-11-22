@@ -266,10 +266,13 @@ public:
     /** Renderiza n amostras estereo. Requer lock. Retorna a nova posicao. */
     juce::int64 render (float* outL, float* outR, int n, juce::int64 pos, bool play, bool allowLoop);
 
-    /** Bounce offline do inicio ao fim (+ cauda). Roda numa thread de trabalho. */
+    /** Bounce offline (+ cauda). Roda numa thread de trabalho.
+        rangeStart/rangeEnd em amostras; rangeEnd < 0 = ate o fim da musica.
+        Em 16 bits aplica dither TPDF. */
     bool exportMix (const juce::File&, int bitDepth, double tailSeconds,
                     std::atomic<float>& progress, std::atomic<bool>& cancel,
-                    juce::String& error, bool& clipped);
+                    juce::String& error, bool& clipped,
+                    juce::int64 rangeStart = 0, juce::int64 rangeEnd = -1);
     std::atomic<bool> rendering { false };
 
     // AudioIODeviceCallback

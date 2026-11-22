@@ -92,7 +92,8 @@ public:
     void filesDropped (const juce::StringArray&, int, int) override;
 
     void requestQuit();
-    void openFile (const juce::File&);
+    /** Abre projeto ou importa audio. discardConfirmed: o usuario ja aceitou descartar as alteracoes. */
+    void openFile (const juce::File&, bool discardConfirmed = false);
 
     // StripHost
     Engine& getEngine() override { return engine; }
@@ -114,6 +115,8 @@ private:
     // projeto
     void newProject();
     void openProjectDialog();
+    void openMenu();
+    void addRecentFile (const juce::File&);
     void save (std::function<void (bool)> after = {});
     void saveAs (std::function<void (bool)> after = {});
     bool writeTo (const juce::File&);
@@ -206,6 +209,8 @@ private:
     juce::int64 lastAutosaveMs = 0;
     juce::File openedRecoveryFile;
     juce::String unsavedRecoveryId;
+    bool quitAfterJob = false; // fechar a janela durante uma tarefa: cancela e fecha ao terminar
+    juce::RecentlyOpenedFilesList recentFiles;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };

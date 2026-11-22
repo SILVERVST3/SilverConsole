@@ -60,6 +60,9 @@ private:
     juce::Viewport viewport;
     juce::Component content;
     juce::OwnedArray<juce::Component> rows;
-    std::map<const juce::AudioBuffer<float>*, std::vector<float>> peakCache;
+    // chave = endereco do buffer; o weak_ptr confirma que ainda e o mesmo buffer
+    // (um buffer novo pode reaproveitar o endereco de um apagado).
+    struct PeakEntry { std::weak_ptr<const juce::AudioBuffer<float>> source; std::vector<float> peaks; };
+    std::map<const juce::AudioBuffer<float>*, PeakEntry> peakCache;
 };
 } // namespace sc

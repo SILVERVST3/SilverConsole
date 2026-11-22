@@ -24,6 +24,12 @@ public:
 
     void shutdown() override
     {
+        if (window != nullptr)
+            if (auto* s = properties.getUserSettings())
+            {
+                s->setValue ("windowState", window->getWindowStateAsString());
+                s->saveIfNeeded();
+            }
         window.reset();
         properties.closeFiles();
     }
@@ -58,7 +64,10 @@ private:
             setContentOwned (new sc::MainComponent (props), true);
             setResizable (true, false);
             setResizeLimits (960, 700, 10000, 10000);
-            centreWithSize (getWidth(), getHeight());
+            // volta ao tamanho/posicao da ultima sessao (se ainda couber numa tela)
+            const auto saved = props.getUserSettings()->getValue ("windowState");
+            if (saved.isEmpty() || ! restoreWindowStateFromString (saved))
+                centreWithSize (getWidth(), getHeight());
             setVisible (true);
             content()->grabKeyboardFocus();
         }

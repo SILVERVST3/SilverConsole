@@ -1063,7 +1063,8 @@ void Engine::audioDeviceStopped() {}
 //==============================================================================
 bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds,
                         std::atomic<float>& progress, std::atomic<bool>& cancel,
-                        juce::String& error, bool& clipped)
+                        juce::String& error, bool& clipped,
+                        juce::int64 rangeStart, juce::int64 rangeEnd)
 {
     const juce::ScopedLock sl (lock);
     rendering = true;
@@ -1077,12 +1078,42 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
         forEachChannel ([] (Channel& c)
         {
             for (auto& s : c.inserts)
+            {
                 if (auto* p = s.processor.get()) { p->setNonRealtime (false); p->reset(); }
+                if (s.remote != nullptr) s.remote->setOffline (false);
+            }
             c.pdc.clear();
         });
         directDelay.clear();
         lastRenderEnd = -1;
         rendering = false;
+    };
+
+    // Insert isolado (IPC) ja em falha tocaria so o sinal seco: a mix exportada
+    // ficaria diferente do que o usuario espera. Recusa em vez de exportar errado.
+    juce::String faultedRemote;
+    forEachChannel ([&faultedRemote] (Channel& c)
+    {
+        for (auto& s : c.inserts)
+            if (s.remote != nullptr && s.remote->isFaulted() && ! s.bypassed.load() && faultedRemote.isEmpty())
+                faultedRemote = c.name + " / " + s.getName();
+    });
+    if (faultedRemote.isNotEmpty())
+    {
+        error = "O insert isolado " + faultedRemote + " esta em falha (sinal seco). "
+                "Reinicie o processo do plugin ou coloque-o em bypass antes de exportar.";
+        rendering = false;
+        return false;
+    }
+    auto anyRemoteFailed = [this]
+    {
+        bool bad = false;
+        forEachChannelNoAlloc ([&bad] (Channel& c)
+        {
+            for (auto& s : c.inserts)
+                if (s.remote != nullptr && s.remote->isFaulted() && ! s.bypassed.load (std::memory_order_relaxed)) bad = true;
+        });
+        return bad;
     };
 
     juce::TemporaryFile temp (file);
@@ -1099,7 +1130,10 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
     forEachChannel ([] (Channel& c)
     {
         for (auto& s : c.inserts)
+        {
             if (auto* p = s.processor.get()) { p->setNonRealtime (true); p->reset(); }
+            if (s.remote != nullptr) s.remote->setOffline (true); // espera o worker no bounce
+        }
         c.pdc.clear();
         c.smoothL.setCurrentAndTargetValue (c.smoothL.getTargetValue());
         c.smoothR.setCurrentAndTargetValue (c.smoothR.getTargetValue());
@@ -1113,28 +1147,52 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
     if (workers > 0 && tracks.size() >= 4)
         offlineTrackPool = std::make_unique<OfflineTrackPool> (workers);
 
-    const juce::int64 length = lengthSamples.load();
+    const juce::int64 start = juce::jmax ((juce::int64) 0, rangeStart);
+    const juce::int64 end = rangeEnd < 0 ? lengthSamples.load() : rangeEnd;
+    const juce::int64 length = juce::jmax ((juce::int64) 0, end - start);
     const juce::int64 total = length + (juce::int64) (tailSeconds * sr);
     const int latency = totalLatency.load();
     const juce::int64 toProduce = total + latency;
+    if (total <= 0) { restore(); writer.reset(); error = "Nada para exportar (trecho vazio)."; return false; }
+
+    // Dither TPDF (+-1 LSB) so em 16 bits: evita distorcao de quantizacao nos finais e fades.
+    const bool dither = bitDepth == 16;
+    const float lsb = 1.0f / 32768.0f;
+    juce::Random rng (0x51c0);
 
     juce::AudioBuffer<float> buf (2, bs);
-    juce::int64 pos = 0, produced = 0;
+    juce::int64 pos = start, produced = 0;
     while (produced < toProduce)
     {
         if (cancel.load()) { restore(); writer.reset(); error = "Exportacao cancelada."; return false; }
+        // Sempre renderiza um bloco inteiro e grava so o necessario: inserts
+        // isolados (IPC) so processam blocos do tamanho configurado, e um bloco
+        // final menor sairia seco.
         const int m = (int) juce::jmin ((juce::int64) bs, toProduce - produced);
         // O bounce corre mais rapido que o playback. Prefetch sincrono fora da
         // thread realtime impede silencio por cache vazio em exports longos.
         for (auto& t : tracks)
             if (t->diskStream != nullptr && t->playbackRate == sr)
-                t->diskStream->prefetchBlocking (pos, m);
-        pos = render (buf.getWritePointer (0), buf.getWritePointer (1), m, pos, true, false);
+                t->diskStream->prefetchBlocking (pos, bs);
+        pos = render (buf.getWritePointer (0), buf.getWritePointer (1), bs, pos, true, false);
+        if (anyRemoteFailed())
+        {
+            restore(); writer.reset();
+            error = "Um insert isolado (processo DSP) falhou ou travou durante a exportacao. "
+                    "A exportacao foi interrompida para nao gravar trechos sem o plugin.";
+            return false;
+        }
         const int skip = produced < latency ? (int) juce::jmin ((juce::int64) m, (juce::int64) latency - produced) : 0;
         const int w = m - skip;
         if (w > 0)
         {
             if (buf.getMagnitude (skip, w) > 1.0f) clipped = true;
+            if (dither)
+                for (int c = 0; c < 2; ++c)
+                {
+                    auto* d = buf.getWritePointer (c, skip);
+                    for (int i = 0; i < w; ++i) d[i] += (rng.nextFloat() - rng.nextFloat()) * lsb;
+                }
             if (! writer->writeFromAudioSampleBuffer (buf, skip, w))
             {
                 restore(); writer.reset(); error = "Falha ao gravar o arquivo (disco cheio?)."; return false;

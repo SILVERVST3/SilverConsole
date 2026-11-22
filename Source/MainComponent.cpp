@@ -292,7 +292,10 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     exportButton.setColour (juce::TextButton::buttonColourId, colours::accent.darker (0.35f));
 
     newButton.onClick = [this] { newProject(); };
-    openButton.onClick = [this] { openProjectDialog(); };
+    openButton.onClick = [this] { openMenu(); };
+    openButton.setTooltip ("Abrir projeto .sconsole (Ctrl+O) ou um projeto recente");
+    recentFiles.setMaxNumberOfItems (10);
+    recentFiles.restoreFromString (props.getUserSettings()->getValue ("recentProjects"));
     saveButton.onClick = [this]
     {
         if (juce::ModifierKeys::currentModifiers.isShiftDown()) saveAs();
@@ -483,6 +486,7 @@ void MainComponent::timerCallback()
             if (done) done (*finished);
             finished.reset();
             grabKeyboardFocus();
+            if (quitAfterJob) { quitAfterJob = false; requestQuit(); }
         }
         return;
     }
@@ -1073,6 +1077,7 @@ void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::Stri
             }
         }
         engine.setMissingInsert (c, in.slot, in.desc, in.state);
+        if (in.bypass) engine.setBypass (c, in.slot, true); // preserva o bypass ao salvar de novo
         problems.add (c.name + ": plugin " + in.desc.name + (err.isNotEmpty() ? " (" + err + ")" : juce::String()));
     }
 }
@@ -1444,17 +1449,31 @@ void MainComponent::exportDialog()
     juce::PopupMenu m;
     m.addSectionHeader ("Exportar mix (" + juce::String (engine.getSampleRate() / 1000.0, 1) + " kHz, estereo)");
     m.addItem (24, "WAV 24 bits");
-    m.addItem (16, "WAV 16 bits");
+    m.addItem (16, "WAV 16 bits (com dither)");
     m.addItem (32, "WAV 32 bits float");
-    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&exportButton), [this] (int bits)
+    const auto ls = engine.loopStart.load(), le = engine.loopEnd.load();
+    if (le > ls)
     {
-        if (bits == 0) return;
+        juce::PopupMenu loopMenu;
+        loopMenu.addItem (124, "WAV 24 bits");
+        loopMenu.addItem (116, "WAV 16 bits (com dither)");
+        loopMenu.addItem (132, "WAV 32 bits float");
+        const double sr = engine.getSampleRate();
+        m.addSeparator();
+        m.addSubMenu (juce::String::fromUTF8 ("S\xc3\xb3 a regi\xc3\xa3o do loop (") + timeText (ls, sr) + " - " + timeText (le, sr) + ")", loopMenu);
+    }
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&exportButton), [this, ls, le] (int choice)
+    {
+        if (choice == 0) return;
+        const bool loopOnly = choice > 100;
+        const int bits = choice % 100;
+        const juce::int64 rangeStart = loopOnly ? ls : 0, rangeEnd = loopOnly ? le : -1;
         auto start = currentFile != juce::File() ? currentFile.withFileExtension (".wav")
                                                  : juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("Mix.wav");
         chooser = std::make_unique<juce::FileChooser> ("Exportar mix", start, "*.wav");
         chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
                                   | juce::FileBrowserComponent::warnAboutOverwriting,
-                              [this, bits] (const juce::FileChooser& fc)
+                              [this, bits, rangeStart, rangeEnd] (const juce::FileChooser& fc)
         {
             auto file = fc.getResult();
             if (file == juce::File()) return;
@@ -1463,7 +1482,8 @@ void MainComponent::exportDialog()
             auto res = std::make_shared<Result>();
             closeAllEditors(); // evita repintar editores durante o render offline
             runJob ("Exportando " + file.getFileName() + "...", true,
-                    [this, res, file, bits] (Job& j) { res->ok = engine.exportMix (file, bits, 3.0, j.progress, j.cancel, res->error, res->clipped); },
+                    [this, res, file, bits, rangeStart, rangeEnd] (Job& j)
+                    { res->ok = engine.exportMix (file, bits, 3.0, j.progress, j.cancel, res->error, res->clipped, rangeStart, rangeEnd); },
                     [this, res, file] (Job&)
             {
                 refreshStrips();
@@ -1536,12 +1556,53 @@ void MainComponent::openProjectDialog()
     {
         chooser = std::make_unique<juce::FileChooser> ("Abrir projeto", currentFile.getParentDirectory(),
                                                        juce::String ("*") + kProjectExtension);
+        // Nao zera "dirty" aqui: se a abertura falhar ou for cancelada, o projeto atual continua
+        // marcado como alterado e o aviso ao sair nao se perde.
         chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles,
-                              [this] (const juce::FileChooser& fc) { if (fc.getResult() != juce::File()) { dirty = false; openFile (fc.getResult()); } });
+                              [this] (const juce::FileChooser& fc) { if (fc.getResult() != juce::File()) openFile (fc.getResult(), true); });
     });
 }
 
-void MainComponent::openFile (const juce::File& file)
+void MainComponent::openMenu()
+{
+    if (job != nullptr) return;
+    // remove da lista os projetos que nao existem mais
+    recentFiles.removeNonExistentFiles();
+    if (recentFiles.getNumFiles() == 0) { openProjectDialog(); return; }
+
+    juce::PopupMenu m;
+    m.addItem (1, "Abrir projeto... (Ctrl+O)");
+    m.addSeparator();
+    m.addSectionHeader ("Recentes");
+    recentFiles.createPopupMenuItems (m, 100, false, true);
+    m.addSeparator();
+    m.addItem (2, "Limpar lista de recentes");
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&openButton), [this] (int r)
+    {
+        if (r == 1) openProjectDialog();
+        else if (r == 2)
+        {
+            recentFiles.clear();
+            props.getUserSettings()->setValue ("recentProjects", recentFiles.toString());
+            props.getUserSettings()->saveIfNeeded();
+        }
+        else if (r >= 100)
+        {
+            const auto f = recentFiles.getFile (r - 100);
+            if (f.existsAsFile()) openFile (f);
+            else alert ("Abrir", juce::String::fromUTF8 ("O arquivo n\xc3\xa3o existe mais:\n") + f.getFullPathName());
+        }
+    });
+}
+
+void MainComponent::addRecentFile (const juce::File& f)
+{
+    recentFiles.addFile (f);
+    props.getUserSettings()->setValue ("recentProjects", recentFiles.toString());
+    props.getUserSettings()->saveIfNeeded();
+}
+
+void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
 {
     if (job != nullptr) return;
     if (! file.hasFileExtension (kProjectExtension))
@@ -1549,7 +1610,7 @@ void MainComponent::openFile (const juce::File& file)
         if (isAudioFile (file)) importFiles ({ file });
         return;
     }
-    if (dirty) { confirmDiscard ([this, file] { dirty = false; openFile (file); }); return; }
+    if (dirty && ! discardConfirmed) { confirmDiscard ([this, file] { openFile (file, true); }); return; }
 
     auto data = std::make_shared<ProjectData>();
     juce::String err;
@@ -1623,6 +1684,7 @@ void MainComponent::openFile (const juce::File& file)
             openedRecoveryFile = juce::File();
             currentFile = file;
             dirty = false;
+            addRecentFile (file);
         }
         rebuildStrips();
         updateTitle();
@@ -1647,6 +1709,7 @@ bool MainComponent::writeTo (const juce::File& f)
     currentFile = f;
     dirty = false;
     lastAutosaveMs = juce::Time::currentTimeMillis();
+    addRecentFile (f);
     updateTitle();
     return true;
 }
@@ -1676,7 +1739,13 @@ void MainComponent::saveAs (std::function<void (bool)> after)
 
 void MainComponent::requestQuit()
 {
-    if (job != nullptr) { job->cancel = true; return; }
+    if (job != nullptr)
+    {
+        // cancela a tarefa (se der) e fecha quando ela terminar
+        job->cancel = true;
+        quitAfterJob = true;
+        return;
+    }
     confirmDiscard ([] { juce::JUCEApplication::getInstance()->quit(); });
 }
 

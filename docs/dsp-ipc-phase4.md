@@ -16,3 +16,14 @@ O worker não suporta editor remoto nem automacao de parametros do plugin nesta 
 - O novo scanner isolado e a interface GUI de plugins do modo padrao continuam os mesmos.
 
 O caminho DSP em processo ainda nao e adequado para plugins que dependem de mais de dois canais, instrumentos MIDI ou GUIs de edicao. Não faça merge na main até Windows CI + testes de áudio reais validarem a opção.
+
+## Revisao de 22/11/2026 (branch `claude/phase4-review`)
+
+Correcoes feitas apos auditoria do caminho IPC:
+
+- **Prazo por buffer em tempo real.** O worker esperava novos blocos com `Sleep(1)`. No Windows essa espera pode durar ate ~15,6 ms (resolucao padrao do timer), mais que um buffer de 256 amostras a 48 kHz (5,3 ms): o watchdog via 3 respostas atrasadas seguidas e travava o bypass seco. Agora o host cria um evento Win32 auto-reset (`<mapeamento>_wake`) e chama `SetEvent` (nao bloqueante) a cada bloco publicado; o worker espera nesse evento (`WaitForSingleObject`, prazo de 2 ms) e roda com `THREAD_PRIORITY_TIME_CRITICAL`. Sem o evento, volta ao polling antigo. O teste antigo nao pegava o problema porque dormia 12 ms entre blocos; o novo teste chama o insert no ritmo real (um bloco a cada 5,33 ms, 400 blocos) e exige >= 90% dos blocos processados.
+- **Exportacao offline com insert isolado.** O bounce roda mais rapido que o tempo real e o insert remoto nao esperava o worker: a mix exportada saia com trechos secos (sem o plugin) e podia travar o bypass. Agora o `Engine::exportMix` coloca cada insert remoto em modo offline (`RemoteDspInsert::setOffline`): o bloco espera o worker (prazo de 5 s, fora do callback), respostas e audio seco antigos sao descartados ao entrar e sair do modo, e o bloco final e sempre renderizado no tamanho completo (blocos menores iam pelo caminho seco). Se um insert remoto ja estiver em falha, a exportacao e recusada com aviso; se falhar durante o bounce, a exportacao e interrompida em vez de gravar uma mix errada. Teste: impulso com o plugin de teste em -6 dB sai processado e alinhado no WAV; worker morto bloqueia a exportacao.
+- **Worker orfao.** O host passa o proprio PID; o worker encerra se o SilverConsole fechar de forma anormal (antes ficava um `ScDspWorker.exe` rodando).
+- **Plugin de saida mono no worker.** O canal direito recebe o mesmo sinal (antes repetia a entrada).
+
+Continua pendente: reinicio automatico do worker, parametros/automacao e estado atualizado pelo IPC, editor remoto, mais de 2 canais/MIDI, reset do estado interno do plugin remoto antes do bounce (caudas de reverb do playback podem entrar no inicio da exportacao), testes longos com plugins comerciais e interfaces reais.
