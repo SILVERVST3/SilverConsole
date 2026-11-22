@@ -347,6 +347,7 @@ std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, s
         retiredRemote = std::move (s.remote);
         s.processor = std::move (p);
         s.hasDescription = desc != nullptr;
+        s.preferRemote = false;
         if (desc != nullptr) s.description = *desc;
         s.missingState.reset();
         s.bypassed = false;
@@ -380,6 +381,7 @@ std::unique_ptr<juce::AudioProcessor> Engine::setRemoteInsert (
         entry.remote = std::move (ipcInsert);
         entry.description = desc;
         entry.hasDescription = true;
+        entry.preferRemote = true;
         entry.missingState = entry.remote->getInitialState();
         entry.bypassed.store (false, std::memory_order_relaxed);
         entry.faulted.store (false, std::memory_order_relaxed);
@@ -400,10 +402,12 @@ std::unique_ptr<juce::AudioProcessor> Engine::clearInsert (Channel& c, int slot)
     return old;
 }
 
-void Engine::setMissingInsert (Channel& c, int slot, const juce::PluginDescription& d, const juce::MemoryBlock& state)
+void Engine::setMissingInsert (Channel& c, int slot, const juce::PluginDescription& d,
+                               const juce::MemoryBlock& state, bool preferRemote)
 {
     auto old = setInsert (c, slot, nullptr, &d);
     c.inserts[(size_t) slot].missingState = state;
+    c.inserts[(size_t) slot].preferRemote = preferRemote;
     jassert (old == nullptr);
 }
 
@@ -423,6 +427,7 @@ void Engine::swapInserts (Channel& c, int a, int b)
     std::swap (x.remote, y.remote);
     std::swap (x.description, y.description);
     std::swap (x.hasDescription, y.hasDescription);
+    std::swap (x.preferRemote, y.preferRemote);
     std::swap (x.missingState, y.missingState);
     std::swap (x.bufferChannels, y.bufferChannels);
     std::swap (x.mainOutChannels, y.mainOutChannels);
@@ -493,6 +498,7 @@ void Engine::clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& t
             if (s.processor != nullptr) toDelete.push_back (std::move (s.processor));
             if (s.remote != nullptr) retiredRemote.push_back (std::move (s.remote));
             s.hasDescription = false;
+            s.preferRemote = false;
             s.missingState.reset();
             s.bypassed = false;
         }
