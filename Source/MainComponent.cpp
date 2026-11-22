@@ -1043,6 +1043,23 @@ void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::Stri
     for (auto& in : data.inserts)
     {
         juce::String err;
+        if (in.isolated)
+        {
+            const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                                 .getSiblingFile ("ScDspWorker.exe");
+            auto worker = RemoteDspInsert::start (in.desc, in.state, exe,
+                                                 engine.getSampleRate(), engine.getBlockSize(), err);
+            if (worker != nullptr)
+            {
+                engine.setRemoteInsert (c, in.slot, std::move (worker), in.desc);
+                if (in.bypass) engine.setBypass (c, in.slot, true);
+                continue;
+            }
+            engine.setMissingInsert (c, in.slot, in.desc, in.state, true);
+            problems.add (c.name + ": DSP isolado indisponivel - " + in.desc.name
+                          + (err.isNotEmpty() ? " (" + err + ")" : juce::String()));
+            continue;
+        }
         auto inst = pluginHost.create (in.desc, engine.getSampleRate(), engine.getBlockSize(), err);
         if (inst != nullptr)
         {
