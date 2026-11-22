@@ -187,6 +187,14 @@ juce::String Engine::prepareProcessor (juce::AudioProcessor& p)
 
 void Engine::prepareSlot (InsertSlot& s)
 {
+    if (s.remote != nullptr &&
+        ! s.remote->matchesConfiguration (sampleRate.load (std::memory_order_relaxed), blockSize))
+    {
+        // Novas taxas/buffers exigem outro handshake. Nunca reiniciar o
+        // processo no callback da interface de audio.
+        s.remote->invalidateForReconfigure();
+        s.faulted.store (true, std::memory_order_relaxed);
+    }
     if (auto* p = s.processor.get())
     {
         p->releaseResources();
