@@ -213,7 +213,9 @@ static void testRemoteDspWorker (const juce::File& worker, const juce::File& plu
 
     Engine e;
     e.prepare (48000.0, 256);
-    auto impulse = makeBuffer (2, 3072, [] (int, int i) { return i == 0 ? 0.5f : 0.0f; });
+    // O impulse ocorre DEPOIS da rampa de 20ms do fader/master; no
+    // primeiro sample o mixer intencionalmente faz fade-in e atenua o teste.
+    auto impulse = makeBuffer (2, 3072, [] (int, int i) { return i == 1024 ? 0.5f : 0.0f; });
     auto* track = addTrack (e, impulse, "ipc test");
     auto old = e.setRemoteInsert (*track, 0, remote, *descs[0]);
     check (old == nullptr && track->inserts[0].processor == nullptr
@@ -235,8 +237,8 @@ static void testRemoteDspWorker (const juce::File& worker, const juce::File& plu
     }
     check (remote->snapshot().completed > 0 && ! remote->isFaulted(),
            "ipc worker: worker devolveu blocos sem travar callback");
-    check (output.getSample (0, 320) > 0.3f &&
-           output.getSample (1, 320) > 0.3f,
+    check (output.getSample (0, 1344) > 0.3f &&
+           output.getSample (1, 1344) > 0.3f,
            "ipc worker: impulso reproduzido com atraso de 1 buffer + PDC do plugin");
 
     const auto latencyBefore = e.getTotalLatency();
