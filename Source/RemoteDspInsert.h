@@ -34,6 +34,17 @@ public:
     // Chamadas somente no controle: verifica o fim do child, e pode forcar
     // bypass em caso de falha; nunca mata um processo no audio callback.
     void pollWorker() noexcept;
+    bool matchesConfiguration (double sampleRate, int frames) const noexcept
+    {
+        return juce::roundToInt (sampleRate) == configuredRate && frames == transportFrames;
+    }
+    void invalidateForReconfigure() noexcept
+    {
+        failed.store (true, std::memory_order_relaxed);
+        watchdog.fail(); // dry permanece alinhado; reiniciar na thread de controle
+    }
+    // Usado somente em testes de regressao fora do audio callback.
+    void simulateWorkerCrashForTests() noexcept;
 
 private:
     RemoteDspInsert() = default;
@@ -48,7 +59,7 @@ private:
     juce::MemoryBlock savedState;
     DspIpcWatchdog watchdog { 3 };
     std::array<float, ipc::maxFrames + 16384> dryL {}, dryR {};
-    int transportFrames = 0, pluginLatency = 0;
+    int transportFrames = 0, pluginLatency = 0, configuredRate = 0;
     int dryLength = 1, dryCursor = 0;
     int nextSequence = 0, lastFrameCount = 0;
     int previousL = 0; // reservado para diagnostico
