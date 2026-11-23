@@ -322,7 +322,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
             else if (choice == 4) self->scanPluginsIsolated (false, true);
         });
     };
-    audioButton.onClick = [this] { showAudioSettings(); };
+    audioButton.onClick = [this] { audioMenu(); };
 
     mixerViewport.setViewedComponent (&mixerContent, false);
     mixerViewport.setScrollBarsShown (true, true);
@@ -343,6 +343,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     auto saved = props.getUserSettings()->getXmlValue ("audioDevice");
     const auto err = deviceManager.initialise (0, 2, saved.get(), true);
     if (err.isNotEmpty()) statusText = "Audio: " + err;
+    engine.setMultiCore (props.getUserSettings()->getBoolValue ("multiCore", true));
     deviceManager.addAudioCallback (&engine);
     deviceManager.addChangeListener (this);
 
@@ -402,7 +403,7 @@ void MainComponent::paint (juce::Graphics& g)
     // status
     g.setColour (colours::textDim);
     g.setFont (uiFont (11.5f));
-    g.drawText (statusText, getWidth() - 470, kTopBarH + 4, 458, kToolbarH - 8, juce::Justification::centredRight);
+    g.drawFittedText (statusText, statusArea(), juce::Justification::centredRight, 1, 0.75f);
 
     if (engine.tracks.empty())
     {
@@ -456,7 +457,17 @@ void MainComponent::resized()
     r.removeFromRight (10);
     mixerViewport.setBounds (r);
 
-    const int h = juce::jmax (660, mixerViewport.getHeight() - 12);
+    // Todos os canais alinhados: as linhas de insert/envio seguem o canal que tem mais.
+    int insertRows = engine.master.inserts.size(), sendRows = kDefaultSends;
+    for (auto& t : engine.tracks)
+    {
+        insertRows = juce::jmax (insertRows, t->inserts.size());
+        sendRows = juce::jmax (sendRows, t->sends.size());
+    }
+    for (auto& b : engine.buses) insertRows = juce::jmax (insertRows, b->inserts.size());
+    ChannelStrip::setLayoutRows (insertRows, sendRows);
+    const int minH = ChannelStrip::minimumHeight();
+    const int h = juce::jmax (minH, mixerViewport.getHeight() - 12);
     int x = 0;
     for (auto* s : strips)
     {
@@ -467,7 +478,9 @@ void MainComponent::resized()
         x += ChannelStrip::width + 3;
     }
     mixerContent.setSize (juce::jmax (x, 10), h);
-    if (masterStrip->getHeight() < 660) masterStrip->setSize (masterStrip->getWidth(), 660);
+    if (masterStrip->getHeight() < minH) masterStrip->setSize (masterStrip->getWidth(), minH);
+    for (auto* s : strips) s->syncSlots();
+    masterStrip->syncSlots();
     overlay.setBounds (getLocalBounds());
 }
 
@@ -550,16 +563,21 @@ void MainComponent::timerCallback()
             const double sr = d->getCurrentSampleRate();
             const int bs = d->getCurrentBufferSizeSamples();
             s << d->getTypeName() << ": " << d->getName() << "  |  " << juce::String (sr / 1000.0, 1) << " kHz  |  "
-              << bs << " amostras (" << juce::String (bs * 1000.0 / sr, 1) << " ms)  |  CPU "
-              << juce::roundToInt (deviceManager.getCpuUsage() * 100.0) << "%  |  PDC "
-              << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
+              << bs << " (" << juce::String (bs * 1000.0 / sr, 1) << " ms)  |  CPU "
+              << juce::roundToInt (deviceManager.getCpuUsage() * 100.0) << "%";
+            const int workers = engine.isMultiCore() ? engine.getRealtimeWorkerCount() : 0;
+            s << " (" << juce::String (workers + 1) << juce::String::fromUTF8 (workers > 0 ? " n\xc3\xba" "cleos" : " n\xc3\xba" "cleo") << ")";
+            s << "  |  PDC " << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
+            // Diagnostico de estalos: XRUN = callback passou do prazo (CPU);
+            // DISCO = audio do disco nao chegou a tempo; LOCK = edicao concorrente.
             const auto rt = engine.getRealtimeStats();
             s << "  |  XRUN " << juce::String (rt.callbackOverruns)
-              << "  |  LOCK " << juce::String (rt.lockContentions)
-              << "  |  PLUG ERR " << juce::String (rt.pluginExceptions);
+              << "  |  DISCO " << juce::String (engine.getDiskMissingSamples() > 0 ? (int) juce::jmin<juce::uint64> (999999, engine.getDiskMissingSamples() / (juce::uint64) juce::jmax (1, bs)) : 0)
+              << "  |  LOCK " << juce::String (rt.lockContentions);
+            if (rt.pluginExceptions > 0) s << "  |  PLUG ERR " << juce::String (rt.pluginExceptions);
         }
         else s = "Sem dispositivo de audio - clique em Audio";
-        if (s != statusText) { statusText = s; repaint (getWidth() - 470, kTopBarH, 470, kToolbarH); }
+        if (s != statusText) { statusText = s; repaint (statusArea()); }
     }
 }
 
@@ -790,6 +808,38 @@ bool MainComponent::channelExists (const Channel* c) const
     return false;
 }
 
+void MainComponent::setInsertSlots (Channel& c, int count)
+{
+    if (! channelExists (&c)) return;
+    if (count > kMaxInsertsPerChannel)
+    {
+        alert ("Inserts", "Limite de " + juce::String (kMaxInsertsPerChannel) + " inserts por canal.");
+        return;
+    }
+    if (engine.setInsertCount (c, count))
+    {
+        resized(); // realinha todos os canais e cria/remove os slots na tela
+        if (auto* s = stripFor (&c)) s->refresh();
+        markDirty();
+    }
+}
+
+void MainComponent::setSendSlots (Track& t, int count)
+{
+    if (! channelExists (&t)) return;
+    if (count > kMaxSendsPerTrack)
+    {
+        alert ("Envios", "Limite de " + juce::String (kMaxSendsPerTrack) + " envios por faixa.");
+        return;
+    }
+    if (engine.setSendCount (t, count))
+    {
+        resized();
+        if (auto* s = stripFor (&t)) s->refresh();
+        markDirty();
+    }
+}
+
 Bus* MainComponent::createBus()
 {
     auto* b = engine.addBus();
@@ -867,12 +917,23 @@ void MainComponent::sendMenu (Track& t, int send, juce::Component& source)
     m.addItem (2, "+ Criar novo bus", (int) engine.buses.size() < kMaxBuses);
     m.addSeparator();
     m.addItem (3, "Pre-fader (independe do volume da faixa)", s.bus.load() >= 0, s.preFader.load());
+    if (send == t.sends.size() - 1 && t.sends.size() > 1)
+    {
+        m.addSeparator();
+        m.addItem (4, "Remover este envio");
+    }
 
     auto* tp = &t;
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&source), [this, tp, send] (int r)
     {
-        if (r == 0 || ! channelExists (tp)) return;
+        if (r == 0 || ! channelExists (tp) || send >= tp->sends.size()) return;
         auto& snd = tp->sends[(size_t) send];
+        if (r == 4)
+        {
+            snd.bus = -1;
+            setSendSlots (*tp, tp->sends.size() - 1);
+            return;
+        }
         if (r == 1) snd.bus = -1;
         else if (r == 2) { if (auto* b = createBus()) snd.bus = engine.indexOfBus (b); }
         else if (r == 3) snd.preFader = ! snd.preFader.load();
@@ -906,8 +967,30 @@ void MainComponent::outputMenu (Track& t, juce::Component& source)
 // Plugins
 void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& source, const juce::MouseEvent& e)
 {
+    if (! c.hasInsert (slot)) return;
     auto& s = c.inserts[(size_t) slot];
-    if (s.isEmpty()) { showPluginMenu (c, slot, source, false); return; }
+    if (s.isEmpty())
+    {
+        // botao direito no ultimo slot vazio: opcao de remove-lo
+        if (e.mods.isPopupMenu() && slot == c.inserts.size() - 1 && c.inserts.size() > 1)
+        {
+            juce::PopupMenu m;
+            m.addSectionHeader ("Insert " + juce::String (slot + 1) + " - " + c.name);
+            m.addItem (1, "Inserir plugin...");
+            m.addItem (2, "Remover este slot vazio");
+            auto* cp = &c;
+            juce::Component::SafePointer<juce::Component> src (&source);
+            m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&source), [this, cp, slot, src] (int r)
+            {
+                if (r == 0 || ! channelExists (cp)) return;
+                if (r == 1 && src != nullptr) showPluginMenu (*cp, slot, *src, false);
+                if (r == 2) setInsertSlots (*cp, cp->inserts.size() - 1);
+            });
+            return;
+        }
+        showPluginMenu (c, slot, source, false);
+        return;
+    }
     if (e.mods.isShiftDown() && ! e.mods.isPopupMenu())
     {
         engine.setBypass (c, slot, ! s.bypassed.load());
@@ -923,10 +1006,13 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
     m.addItem (2, "Bypass", s.processor != nullptr || s.remote != nullptr, s.bypassed.load());
     if (s.remote != nullptr)
         m.addItem (6, "Reiniciar DSP isolado (recuperar falha)");
+    if (s.processor != nullptr && s.hasDescription)
+        m.addItem (7, juce::String::fromUTF8 ("Janela em modo compat\xc3\xadvel de escala (plugin gigante/min\xc3\xbasculo)"),
+                   true, usesCompatScaling (s.description));
     m.addSeparator();
     m.addItem (3, "Substituir...");
     m.addItem (4, "Mover para cima", slot > 0);
-    m.addItem (5, "Mover para baixo", slot < kNumInserts - 1);
+    m.addItem (5, "Mover para baixo", slot < c.inserts.size() - 1);
     m.addSeparator();
     m.addItem (9, "Remover");
     auto* cp = &c;
@@ -942,6 +1028,15 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
         {
             // Reiniciar e feito aqui, na thread de mensagens, nao no callback.
             loadPluginIntoRemote (*cp, slot, sl.description, sl.missingState);
+        }
+        else if (r == 7)
+        {
+            // salvo por plugin (vale para todas as instancias); reabre a janela no novo modo
+            setCompatScaling (sl.description, ! usesCompatScaling (sl.description));
+            const bool wasOpen = isEditorOpen (*cp, slot);
+            closeEditor (*cp, slot);
+            if (wasOpen || sl.processor != nullptr) openEditor (*cp, slot);
+            return;
         }
         else if (r == 4 || r == 5) { engine.swapInserts (*cp, slot, slot + (r == 4 ? -1 : 1)); lanesChanged(); }
         else if (r == 9)
@@ -1082,13 +1177,32 @@ void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::Stri
     }
 }
 
+bool MainComponent::usesCompatScaling (const juce::PluginDescription& d) const
+{
+    return juce::StringArray::fromLines (props.getUserSettings()->getValue ("pluginCompatScaling"))
+               .contains (d.createIdentifierString());
+}
+
+void MainComponent::setCompatScaling (const juce::PluginDescription& d, bool on)
+{
+    auto list = juce::StringArray::fromLines (props.getUserSettings()->getValue ("pluginCompatScaling"));
+    list.removeEmptyStrings();
+    list.removeString (d.createIdentifierString());
+    if (on) list.add (d.createIdentifierString());
+    props.getUserSettings()->setValue ("pluginCompatScaling", list.joinIntoString ("\n"));
+    props.getUserSettings()->saveIfNeeded();
+}
+
 void MainComponent::openEditor (Channel& c, int slot)
 {
-    auto* p = c.inserts[(size_t) slot].processor.get();
+    if (! c.hasInsert (slot)) return;
+    auto& insert = c.inserts[(size_t) slot];
+    auto* p = insert.processor.get();
     if (p == nullptr) return;
     for (auto& w : pluginWindows)
         if (&w->processor == p) { w->setVisible (true); w->toFront (true); return; }
 
+    const bool compat = insert.hasDescription && usesCompatScaling (insert.description);
     auto* cp = &c;
     juce::Component::SafePointer<MainComponent> self (this);
     pluginWindows.push_back (std::make_unique<PluginWindow> (*p, c.name + " - " + p->getName(), [self, cp] (PluginWindow* w)
@@ -1102,12 +1216,13 @@ void MainComponent::openEditor (Channel& c, int slot)
                 if (it->get() == w) { v.erase (it); break; }
             if (auto* s = sp->stripFor (cp)) s->refresh();
         });
-    }));
+    }, compat));
     if (auto* s = stripFor (&c)) s->refresh();
 }
 
 void MainComponent::closeEditor (Channel& c, int slot)
 {
+    if (! c.hasInsert (slot)) return;
     auto* p = c.inserts[(size_t) slot].processor.get();
     if (p == nullptr) return;
     for (auto it = pluginWindows.begin(); it != pluginWindows.end(); ++it)
@@ -1116,13 +1231,14 @@ void MainComponent::closeEditor (Channel& c, int slot)
 
 void MainComponent::closeEditorsFor (Channel& c)
 {
-    for (int i = 0; i < kNumInserts; ++i) closeEditor (c, i);
+    for (int i = 0; i < c.inserts.size(); ++i) closeEditor (c, i);
 }
 
 void MainComponent::closeAllEditors() { pluginWindows.clear(); }
 
 bool MainComponent::isEditorOpen (const Channel& c, int slot) const
 {
+    if (! c.hasInsert (slot)) return false;
     auto* p = c.inserts[(size_t) slot].processor.get();
     if (p == nullptr) return false;
     for (auto& w : pluginWindows)
@@ -1311,6 +1427,35 @@ void MainComponent::scanPluginsIsolated (bool retryFailed, bool probeDsp)
     });
 }
 
+juce::Rectangle<int> MainComponent::statusArea() const
+{
+    const int left = automationButton.getRight() + 16;
+    return { left, kTopBarH + 4, juce::jmax (100, getWidth() - left - 12), kToolbarH - 8 };
+}
+
+void MainComponent::audioMenu()
+{
+    const int workers = engine.getRealtimeWorkerCount();
+    juce::PopupMenu m;
+    m.addItem (1, juce::String::fromUTF8 ("Placa de som (dispositivo, buffer)..."));
+    m.addSeparator();
+    m.addItem (2, juce::String::fromUTF8 ("Processar faixas em v\xc3\xa1rios n\xc3\xba" "cleos (")
+                      + juce::String (workers + 1) + juce::String::fromUTF8 (" n\xc3\xba" "cleos)"),
+               workers > 0, engine.isMultiCore() && workers > 0);
+    m.addItem (3, juce::String::fromUTF8 ("Zerar contadores (XRUN / DISCO / LOCK)"));
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&audioButton), [this] (int r)
+    {
+        if (r == 1) showAudioSettings();
+        else if (r == 2)
+        {
+            engine.setMultiCore (! engine.isMultiCore());
+            props.getUserSettings()->setValue ("multiCore", engine.isMultiCore());
+            props.getUserSettings()->saveIfNeeded();
+        }
+        else if (r == 3) engine.resetRealtimeStats();
+    });
+}
+
 void MainComponent::showAudioSettings()
 {
     auto* selector = new juce::AudioDeviceSelectorComponent (deviceManager, 0, 0, 2, 2, false, false, true, false);
@@ -1406,11 +1551,13 @@ void MainComponent::startResampleIfNeeded()
         std::shared_ptr<const juce::AudioBuffer<float>> original, result;
         double rate;
         juce::File file;
+        bool wasStream = false;
+        std::shared_ptr<StreamingAudio> stream;
     };
     auto items = std::make_shared<std::vector<Item>>();
     for (auto& t : engine.tracks)
         if ((t->original != nullptr || t->diskStream != nullptr) && t->playbackRate != sr)
-            items->push_back ({ t.get(), t->original, nullptr, t->originalRate, t->sourceFile });
+            items->push_back ({ t.get(), t->original, nullptr, t->originalRate, t->sourceFile, t->diskStream != nullptr, nullptr });
     if (items->empty()) return;
 
     runJob ("Ajustando a taxa de amostragem (" + juce::String (sr / 1000.0, 1) + " kHz)...", false,
@@ -1419,8 +1566,14 @@ void MainComponent::startResampleIfNeeded()
                 parallelFor ((int) items->size(), j, [&] (int i)
                 {
                     auto& it = (*items)[(size_t) i];
-                    // Streaming nao faz reamostragem: se o dispositivo mudou de taxa,
-                    // usa temporariamente o caminho original de decodificacao + sinc.
+                    // Faixa em streaming: so reabre o arquivo na nova taxa (a conversao
+                    // e feita trecho a trecho pelo disco); nada vai inteiro para a RAM.
+                    if (it.wasStream && it.file.existsAsFile())
+                    {
+                        juce::String reason;
+                        it.stream = StreamingAudio::open (it.file, sr, reason);
+                        if (it.stream != nullptr) return;
+                    }
                     if (it.original == nullptr && it.file.existsAsFile())
                     {
                         juce::AudioFormatManager fm;
@@ -1437,8 +1590,11 @@ void MainComponent::startResampleIfNeeded()
     {
         if (sr != engine.getSampleRate()) return;
         for (auto& it : *items)
-            if (channelExists (it.track) && it.result != nullptr)
-                engine.setTrackAudio (*it.track, it.original, it.rate, it.result, sr);
+        {
+            if (! channelExists (it.track)) continue;
+            if (it.stream != nullptr) engine.setTrackStream (*it.track, it.stream);
+            else if (it.result != nullptr) engine.setTrackAudio (*it.track, it.original, it.rate, it.result, sr);
+        }
         refreshStrips();
     });
 }
@@ -1650,7 +1806,8 @@ void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
             applyChannelBasics (engine, *t, td.ch);
             t->sourceFile = td.file;
             t->outputBus = td.output;
-            for (int s = 0; s < kNumSends; ++s)
+            engine.setSendCount (*t, (int) td.sends.size());
+            for (int s = 0; s < (int) td.sends.size() && s < t->sends.size(); ++s)
             {
                 t->sends[(size_t) s].bus = td.sends[(size_t) s].bus;
                 t->sends[(size_t) s].levelDb = td.sends[(size_t) s].levelDb;

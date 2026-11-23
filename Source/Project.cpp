@@ -15,7 +15,8 @@ namespace
         d.mute = c.mute.load();
         d.solo = c.solo.load();
         d.phase = c.phase.load();
-        for (int i = 0; i < kNumInserts; ++i)
+        d.numInserts = c.inserts.size();
+        for (int i = 0; i < c.inserts.size(); ++i)
         {
             auto& s = c.inserts[(size_t) i];
             if (s.isEmpty()) continue;
@@ -47,6 +48,7 @@ namespace
         e.setAttribute ("mute", d.mute);
         e.setAttribute ("solo", d.solo);
         e.setAttribute ("phase", d.phase);
+        e.setAttribute ("inserts", d.numInserts);
         for (auto& in : d.inserts)
         {
             auto* x = e.createNewChildElement ("INSERT");
@@ -87,7 +89,7 @@ namespace
             in.slot = x->getIntAttribute ("slot", -1);
             in.bypass = x->getBoolAttribute ("bypass");
             in.isolated = x->getBoolAttribute ("isolated", false);
-            if (! juce::isPositiveAndBelow (in.slot, kNumInserts)) continue;
+            if (! juce::isPositiveAndBelow (in.slot, kMaxInsertsPerChannel)) continue;
             if (auto* p = x->getChildByName ("PLUGIN")) in.hasDesc = in.desc.loadFromXml (*p);
             if (auto* s = x->getChildByName ("STATE")) in.state.fromBase64Encoding (s->getAllSubText().trim());
             if (in.hasDesc) d.inserts.push_back (std::move (in));
@@ -102,7 +104,7 @@ namespace
                 l.slot = x->getIntAttribute ("slot", -1);
                 l.param = x->getIntAttribute ("param", -1);
                 l.step = x->getBoolAttribute ("step");
-                if (l.target == AutoTarget::plugin && (! juce::isPositiveAndBelow (l.slot, kNumInserts) || l.param < 0)) continue;
+                if (l.target == AutoTarget::plugin && (! juce::isPositiveAndBelow (l.slot, kMaxInsertsPerChannel) || l.param < 0)) continue;
                 auto tokens = juce::StringArray::fromTokens (x->getAllSubText(), " \n\r\t", "");
                 for (auto& tok : tokens)
                 {
@@ -115,6 +117,11 @@ namespace
                 if (! l.points.empty()) d.lanes.push_back (std::move (l));
             }
         }
+        // Numero de slots: o salvo (projetos antigos: padrao), sempre cobrindo
+        // os slots com plugin ou com linha de automacao.
+        d.numInserts = juce::jlimit (1, kMaxInsertsPerChannel, e.getIntAttribute ("inserts", kDefaultInserts));
+        for (auto& in : d.inserts) d.numInserts = juce::jmax (d.numInserts, in.slot + 1);
+        for (auto& l : d.lanes) if (l.target == AutoTarget::plugin) d.numInserts = juce::jmax (d.numInserts, l.slot + 1);
     }
 }
 
@@ -127,11 +134,9 @@ ProjectData captureProject (Engine& engine)
         td.ch = captureChannel (*t);
         td.file = t->sourceFile;
         td.output = t->outputBus.load();
-        for (int i = 0; i < kNumSends; ++i)
-        {
-            auto& s = t->sends[(size_t) i];
-            td.sends[(size_t) i] = { s.bus.load(), s.levelDb.load(), s.preFader.load() };
-        }
+        td.sends.clear();
+        for (auto& s : t->sends)
+            td.sends.push_back ({ s.bus.load(), s.levelDb.load(), s.preFader.load() });
         p.tracks.push_back (std::move (td));
     }
     for (auto& b : engine.buses) p.buses.push_back (captureChannel (*b));
@@ -154,6 +159,7 @@ void applyChannelBasics (Engine& engine, Channel& c, const ChannelData& d)
         lanes.push_back (std::move (l));
     }
     engine.editAutomation ([&] { c.lanes = std::move (lanes); });
+    engine.setInsertCount (c, d.numInserts);
     c.autoMode = (int) d.autoMode;
     c.name = d.name;
     c.colour = d.colour;
@@ -181,7 +187,8 @@ bool writeProject (const ProjectData& p, const juce::File& file, juce::String& e
         if (t.file != juce::File())
             e->setAttribute ("relFile", t.file.getRelativePathFrom (dir).replaceCharacter ('\\', '/'));
         e->setAttribute ("output", t.output);
-        for (int i = 0; i < kNumSends; ++i)
+        e->setAttribute ("sends", (int) t.sends.size());
+        for (int i = 0; i < (int) t.sends.size(); ++i)
         {
             const auto& s = t.sends[(size_t) i];
             if (s.bus < 0) continue;
@@ -240,10 +247,12 @@ bool readProject (const juce::File& file, ProjectData& p, juce::String& error)
         if (rel.isNotEmpty() && dir.getChildFile (rel).existsAsFile()) t.file = dir.getChildFile (rel);
         else if (juce::File::isAbsolutePath (abs)) t.file = juce::File (abs);
         t.output = validBus (e->getIntAttribute ("output", -1));
+        t.sends.assign ((size_t) juce::jlimit (1, kMaxSendsPerTrack, e->getIntAttribute ("sends", kDefaultSends)), SendData {});
         for (auto* x : e->getChildWithTagNameIterator ("SEND"))
         {
             const int i = x->getIntAttribute ("index", -1);
-            if (! juce::isPositiveAndBelow (i, kNumSends)) continue;
+            if (! juce::isPositiveAndBelow (i, kMaxSendsPerTrack)) continue;
+            if (i >= (int) t.sends.size()) t.sends.resize ((size_t) i + 1);
             t.sends[(size_t) i] = { validBus (x->getIntAttribute ("bus", -1)),
                                     juce::jlimit (kMinDb, 12.0f, (float) x->getDoubleAttribute ("levelDb", 0.0)),
                                     x->getBoolAttribute ("pre") };

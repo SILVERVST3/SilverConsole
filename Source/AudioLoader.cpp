@@ -103,39 +103,56 @@ std::shared_ptr<const juce::AudioBuffer<float>> resampleBuffer (std::shared_ptr<
     if (src == nullptr || fromRate <= 0 || toRate <= 0) return src;
     if (std::abs (fromRate - toRate) < 1.0e-6) return src;
 
+    const int inLen = src->getNumSamples();
+    const int outLen = (int) resampledLength (inLen, fromRate, toRate);
+    auto dst = std::make_shared<juce::AudioBuffer<float>> (src->getNumChannels(), juce::jmax (1, outLen));
+    for (int c = 0; c < src->getNumChannels(); ++c)
+        resampleRange (src->getReadPointer (c), 0, inLen, inLen, fromRate, toRate, 0, outLen, dst->getWritePointer (c));
+    return dst;
+}
+
+juce::int64 resampledLength (juce::int64 srcLength, double fromRate, double toRate)
+{
+    if (fromRate <= 0 || toRate <= 0) return srcLength;
+    return (juce::int64) std::ceil ((double) srcLength / (fromRate / toRate));
+}
+
+void resampleInputRange (juce::int64 srcLength, double fromRate, double toRate,
+                         juce::int64 outStart, int outCount, juce::int64& first, juce::int64& last)
+{
+    const double ratio = fromRate / toRate;
+    const double halfWidth = kZeroCrossings / juce::jmin (1.0, 1.0 / ratio);
+    first = juce::jmax ((juce::int64) 0, (juce::int64) std::ceil ((double) outStart * ratio - halfWidth));
+    last  = juce::jmin (srcLength - 1, (juce::int64) std::floor ((double) (outStart + juce::jmax (0, outCount - 1)) * ratio + halfWidth));
+}
+
+void resampleRange (const float* in, juce::int64 inStart, int inCount, juce::int64 srcLength,
+                    double fromRate, double toRate, juce::int64 outStart, int outCount, float* out)
+{
     const auto& table = kernelTable();
     const double ratio = fromRate / toRate;              // amostras de entrada por saida
     const double fc = juce::jmin (1.0, 1.0 / ratio);     // corte relativo a Nyquist da entrada
     const double halfWidth = kZeroCrossings / fc;        // em amostras de entrada
     const double gain = kCutoff * fc;
     const double tableScale = (double) (kTableSize - 1) / halfWidth;
+    const juce::int64 inEnd = inStart + inCount; // exclusivo
 
-    const int inLen = src->getNumSamples();
-    const int outLen = (int) std::ceil ((double) inLen / ratio);
-    auto dst = std::make_shared<juce::AudioBuffer<float>> (src->getNumChannels(), juce::jmax (1, outLen));
-
-    for (int c = 0; c < src->getNumChannels(); ++c)
+    for (int j = 0; j < outCount; ++j)
     {
-        const float* in = src->getReadPointer (c);
-        float* out = dst->getWritePointer (c);
-        for (int j = 0; j < outLen; ++j)
+        const double t = (double) (outStart + j) * ratio;
+        const juce::int64 k0 = juce::jmax ((juce::int64) 0, (juce::int64) std::ceil (t - halfWidth));
+        const juce::int64 k1 = juce::jmin (srcLength - 1, (juce::int64) std::floor (t + halfWidth));
+        double acc = 0.0;
+        for (juce::int64 k = juce::jmax (k0, inStart); k <= k1 && k < inEnd; ++k)
         {
-            const double t = j * ratio;
-            const int k0 = juce::jmax (0, (int) std::ceil (t - halfWidth));
-            const int k1 = juce::jmin (inLen - 1, (int) std::floor (t + halfWidth));
-            double acc = 0.0;
-            for (int k = k0; k <= k1; ++k)
-            {
-                const double pos = std::abs (t - k) * tableScale;
-                const int idx = (int) pos;
-                if (idx >= kTableSize - 1) continue;
-                const float frac = (float) (pos - idx);
-                const float kv = table[(size_t) idx] + frac * (table[(size_t) idx + 1] - table[(size_t) idx]);
-                acc += (double) in[k] * kv;
-            }
-            out[j] = (float) (acc * gain);
+            const double pos = std::abs (t - (double) k) * tableScale;
+            const int idx = (int) pos;
+            if (idx >= kTableSize - 1) continue;
+            const float frac = (float) (pos - idx);
+            const float kv = table[(size_t) idx] + frac * (table[(size_t) idx + 1] - table[(size_t) idx]);
+            acc += (double) in[k - inStart] * kv;
         }
+        out[j] = (float) (acc * gain);
     }
-    return dst;
 }
 } // namespace sc

@@ -107,6 +107,8 @@ public:
     void muteToggled (Channel&) override;
     void autoModeMenu (Channel&, juce::Component&) override;
     void lanesChanged() override;
+    void addInsertSlot (Channel& c) override { setInsertSlots (c, c.inserts.size() + 1); }
+    void addSendSlot (Track& t) override { setSendSlots (t, t.sends.size() + 1); }
 
 private:
     void timerCallback() override;
@@ -144,12 +146,16 @@ private:
                                const juce::MemoryBlock& state = {});
     void loadInserts (Channel&, const ChannelData&, juce::StringArray& problems);
     void openEditor (Channel&, int slot);
+    bool usesCompatScaling (const juce::PluginDescription&) const;
+    void setCompatScaling (const juce::PluginDescription&, bool);
     void closeEditor (Channel&, int slot);
     void closeEditorsFor (Channel&);
     void closeAllEditors();
     void showPluginManager (bool startScan);
     void scanPluginsIsolated (bool retryFailed = false, bool probeDsp = false);
     void showAudioSettings();
+    void audioMenu();
+    juce::Rectangle<int> statusArea() const;
 
     // estrutura
     void rebuildStrips();
@@ -158,6 +164,8 @@ private:
     bool channelExists (const Channel*) const;
     void removeChannel (Channel&);
     Bus* createBus();
+    void setInsertSlots (Channel&, int count);
+    void setSendSlots (Track&, int count);
 
     void runJob (const juce::String& title, bool cancellable, std::function<void (Job&)> work, std::function<void (Job&)> done);
     void togglePlay();

@@ -14,9 +14,13 @@
 
 namespace sc
 {
-constexpr int kNumInserts = 8;
-constexpr int kNumSends = 4;
-constexpr int kMaxBuses = 8;
+// Inserts e envios por canal sao dinamicos (botao "+" na faixa). Os limites
+// abaixo so protegem contra arquivos de projeto corrompidos.
+constexpr int kDefaultInserts = 4;
+constexpr int kDefaultSends = 4;
+constexpr int kMaxInsertsPerChannel = 64;
+constexpr int kMaxSendsPerTrack = 64;
+constexpr int kMaxBuses = 16;
 constexpr int kMaxTracks = 128;
 constexpr int kMaxPluginChannels = 31; // AudioBuffer de referencia sem alocacao
 constexpr float kMinDb = -60.0f;       // fader no fim = -inf
@@ -64,6 +68,44 @@ private:
 };
 
 //==============================================================================
+/** Lista de tamanho variavel com enderecos estaveis (os itens tem atomics e nao
+    podem ser movidos). Mudar o tamanho so na thread de mensagens com Engine::lock;
+    o audio itera sob o mesmo lock. */
+template <typename T>
+class SlotList
+{
+public:
+    explicit SlotList (int initial) { resize (initial); }
+
+    T& operator[] (size_t i) noexcept             { return *items[i]; }
+    const T& operator[] (size_t i) const noexcept { return *items[i]; }
+    int size() const noexcept                     { return (int) items.size(); }
+    void resize (int n)
+    {
+        while ((int) items.size() < n) items.push_back (std::make_unique<T>());
+        while ((int) items.size() > n) items.pop_back();
+    }
+
+    template <typename It, typename V>
+    struct Iter
+    {
+        It it;
+        V& operator*() const noexcept { return **it; }
+        Iter& operator++() noexcept   { ++it; return *this; }
+        bool operator!= (const Iter& o) const noexcept { return it != o.it; }
+    };
+    using iterator = Iter<typename std::vector<std::unique_ptr<T>>::iterator, T>;
+    using const_iterator = Iter<typename std::vector<std::unique_ptr<T>>::const_iterator, const T>;
+    iterator begin() noexcept             { return { items.begin() }; }
+    iterator end() noexcept               { return { items.end() }; }
+    const_iterator begin() const noexcept { return { items.cbegin() }; }
+    const_iterator end() const noexcept   { return { items.cend() }; }
+
+private:
+    std::vector<std::unique_ptr<T>> items;
+};
+
+//==============================================================================
 struct InsertSlot
 {
     std::unique_ptr<juce::AudioProcessor> processor;
@@ -100,7 +142,8 @@ struct Channel
     std::atomic<float> gainDb { 0.0f }, pan { 0.0f };
     std::atomic<bool> mute { false }, solo { false }, phase { false };
 
-    std::array<InsertSlot, kNumInserts> inserts;
+    SlotList<InsertSlot> inserts { kDefaultInserts };
+    bool hasInsert (int slot) const noexcept { return juce::isPositiveAndBelow (slot, inserts.size()); }
 
     // medidores (audio escreve, interface le e zera)
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
@@ -141,7 +184,7 @@ struct Track : Channel
     double playbackRate = 0.0;
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
-    std::array<Send, kNumSends> sends;
+    SlotList<Send> sends { kDefaultSends };
 };
 
 struct Bus : Channel { Bus() : Channel (ChannelKind::bus) {} };
@@ -158,6 +201,7 @@ struct Master : Channel
 
 //==============================================================================
 class OfflineTrackPool; // pool somente para bounce, nunca usado pelo callback realtime
+class RealtimeTrackPool; // pool persistente para o callback da placa (sem alocacao nem mutex)
 
 class Engine : public juce::AudioIODeviceCallback,
                private juce::AudioProcessorListener
@@ -193,6 +237,10 @@ public:
                            const juce::MemoryBlock& state, bool preferRemote = false);
     void swapInserts (Channel&, int a, int b);
     void setBypass (Channel&, int slot, bool);
+    /** Numero de slots de insert/envio. Diminuir so remove slots vazios do fim.
+        Retorna false se nada mudou. */
+    bool setInsertCount (Channel&, int count);
+    bool setSendCount (Track&, int count);
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
                         std::shared_ptr<const juce::AudioBuffer<float>> playback, double playbackRate);
     void setTrackStream (Track&, std::shared_ptr<StreamingAudio>);
@@ -252,8 +300,23 @@ public:
                  callbackOverruns.load (std::memory_order_relaxed),
                  pluginExceptions.load (std::memory_order_relaxed) };
     }
+    /** Amostras que o streaming de disco nao entregou a tempo (soma das faixas). */
+    juce::uint64 getDiskMissingSamples() const noexcept
+    {
+        juce::uint64 sum = 0;
+        for (auto& t : tracks)
+            if (t->diskStream != nullptr) sum += t->diskStream->getMissingSamples();
+        return sum;
+    }
+
+    /** Processamento das faixas em varios nucleos no callback da placa. */
+    void setMultiCore (bool shouldUse) noexcept { multiCore.store (shouldUse, std::memory_order_relaxed); }
+    bool isMultiCore() const noexcept { return multiCore.load (std::memory_order_relaxed); }
+    int getRealtimeWorkerCount() const noexcept;
+
     void resetRealtimeStats() noexcept
     {
+        for (auto& t : tracks) if (t->diskStream != nullptr) t->diskStream->resetMissingSamples();
         lockContentions.store (0, std::memory_order_relaxed);
         renderSuspensions.store (0, std::memory_order_relaxed);
         processedCallbacks.store (0, std::memory_order_relaxed);
@@ -305,6 +368,8 @@ private:
 
     std::unique_ptr<StreamWorker> streamingWorker;
     std::unique_ptr<OfflineTrackPool> offlineTrackPool;
+    std::unique_ptr<RealtimeTrackPool> realtimePool;
+    std::atomic<bool> multiCore { true };
     TruePeak4x truePeakMeter;
     MomentaryLoudness momentaryLoudness; // estado exclusivo do motor sob engine.lock
     std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 }, pluginExceptions { 0 };

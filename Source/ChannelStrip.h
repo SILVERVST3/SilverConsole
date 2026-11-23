@@ -21,6 +21,9 @@ public:
     virtual void muteToggled (Channel&) = 0;
     virtual void autoModeMenu (Channel&, juce::Component& source) = 0;
     virtual void lanesChanged() = 0;
+    // botao "+": mais um slot de insert (qualquer canal) ou de envio (faixa)
+    virtual void addInsertSlot (Channel&) = 0;
+    virtual void addSendSlot (Track&) = 0;
 };
 
 juce::Colour autoModeColour (AutoMode);
@@ -85,6 +88,12 @@ public:
     void tick();
     /** Sincroniza controles com o estado do motor. */
     void refresh();
+    /** Cria/remove slots de insert e envio na tela conforme o motor. */
+    void syncSlots();
+
+    /** Linhas de insert/envio de TODOS os canais (alinhados pelo que tem mais). */
+    static void setLayoutRows (int insertRows, int sendRows) noexcept { layoutInsertRows = insertRows; layoutSendRows = sendRows; }
+    static int minimumHeight() noexcept;
 
     Channel& channel;
     static constexpr int width = 104;
@@ -93,12 +102,16 @@ public:
 private:
     void updateGainLabel();
     juce::String panText() const;
+    juce::Rectangle<int> sendBlock() const; // area de envios (ou loudness/MASTER)
+
+    static inline int layoutInsertRows = kDefaultInserts, layoutSendRows = kDefaultSends;
 
     StripHost& host;
     juce::Label nameLabel, infoLabel, gainLabel, panLabel;
     juce::OwnedArray<InsertSlotComponent> slots;
-    std::array<int, kNumInserts> lastInsertVisualState {}; // evita 30x repaints/s por faixa sem mudancas
+    std::vector<int> lastInsertVisualState; // evita 30x repaints/s por faixa sem mudancas
     juce::OwnedArray<SendRow> sends;
+    juce::TextButton addInsertButton { "+" }, addSendButton { "+" };
     void refreshAutoButton();
     juce::TextButton autoButton;
     AutoMode shownMode = AutoMode::off;

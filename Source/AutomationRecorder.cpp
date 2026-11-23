@@ -57,7 +57,7 @@ void AutomationRecorder::handleParamEvents (double nowMs)
         int slot = -1;
         forEachChannel (engine, [&] (Channel& c)
         {
-            for (int i = 0; i < kNumInserts; ++i)
+            for (int i = 0; i < c.inserts.size(); ++i)
                 if (c.inserts[(size_t) i].processor.get() == e.proc) { owner = &c; slot = i; }
         });
         if (owner == nullptr) continue;

@@ -20,22 +20,24 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Até 128 faixas de áudio mono ou estéreo: WAV, AIFF, FLAC, OGG e MP3.
 - Importação múltipla, ou arraste os arquivos para a janela.
 - Arquivos em outra taxa de amostragem são convertidos automaticamente, com sinc janelado de alta qualidade e sem deslocar o tempo.
+- Arquivos grandes (32 MB ou mais) tocam **direto do disco** (streaming), inclusive em outra taxa de amostragem: a conversão é feita trecho a trecho e o arquivo não vai inteiro para a RAM.
 
 **Canais (estilo console)**
-- 8 slots de insert VST3 por canal, inclusive buses e master.
+- Inserts VST3 em todos os canais (faixas, buses e master): 4 por padrão; o botão **+** ao lado de INSERTS adiciona mais (até 64). Botão direito no último slot vazio: remover.
 - Fader de -∞ a +12 dB e pan (potência constante em faixas mono, balance em estéreo).
 - Mute, solo, inversão de polaridade (Ø) e medidor de pico L/R com indicador de clip.
 - Nome editável (duplo clique) e cor da faixa.
-- **4 envios por faixa**, pré ou pós-fader, para buses auxiliares (reverb, delay, paralelo).
+- **Envios por faixa** (4 por padrão, botão **+** ao lado de ENVIOS para mais; o menu do último envio remove), pré ou pós-fader, para buses auxiliares (reverb, delay, paralelo).
 - **Saída da faixa** para o Master ou para um bus (grupo, por exemplo um bus de bateria).
-- Até 8 buses auxiliares, cada um com 8 inserts, fader, pan e mute.
-- **Master** com 8 inserts, fader, botão **MONO** para conferir a mix e indicador de clip.
+- Até 16 buses auxiliares, cada um com inserts, fader, pan e mute.
+- **Master** com inserts, fader, botão **MONO** para conferir a mix e indicador de clip.
 
 **Plugins VST3**
 - Escaneamento da pasta padrão `C:\Program Files\Common Files\VST3` (ou de outras pastas). A lista fica salva; use **Plugins → Opções / Escanear...** para procurar plugins novos.
 - Se um plugin travar durante o escaneamento, ele é pulado na próxima vez.
 - Clique num slot vazio para escolher um plugin no menu, agrupado por fabricante.
 - Clique num slot ocupado para abrir o editor do plugin. **Shift+clique** liga o bypass. O botão direito abre o menu: bypass, substituir, mover para cima/baixo e remover.
+- **Janela do plugin**: se o editor for maior que a tela, ele aparece com barras de rolagem e a janela cabe no monitor (com bordas para redimensionar). Se um plugin abrir gigante ou minúsculo (escala do Windows em 125%/150%/200%), use no menu do insert **Janela em modo compatível de escala**: o Windows passa a ajustar a janela daquele plugin (a opção fica salva por plugin).
 - **Compensação automática de latência (PDC)** em faixas, buses e master: plugins com lookahead (limitadores, EQs de fase linear) não desalinham a mix.
 - O estado de todos os plugins é salvo no projeto. Se um plugin não estiver instalado ao abrir, o slot fica **vermelho** e o estado é preservado; ao salvar, nada se perde.
 
@@ -124,7 +126,15 @@ O diretório informado deve conter `common/iasiodrv.h` e `host/asiodrivers.h`. E
 
 ## Placa de som
 
-Em **Áudio**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Windows Audio (Exclusive Mode)** para ter latência baixa com a sua interface. O modo compartilhado também funciona.
+Em **Áudio → Placa de som**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Windows Audio (Exclusive Mode)** para ter latência baixa com a sua interface. O modo compartilhado também funciona.
+
+**Desempenho em sessões grandes**
+- As faixas (leitura, inserts e compensação de latência) são processadas em **vários núcleos** ao mesmo tempo. Dá para desligar em **Áudio → Processar faixas em vários núcleos**. Buses e master continuam em sequência, depois das faixas.
+- A barra de status mostra os contadores que explicam estalos:
+  - **XRUN**: o processamento passou do tempo do buffer (CPU). Aumente o buffer ou alivie os plugins.
+  - **DISCO**: o áudio do disco não chegou a tempo (disco lento ou muitas faixas grandes).
+  - **LOCK**: o áudio pulou um bloco porque a interface estava editando algo no mesmo instante.
+  - **Áudio → Zerar contadores** zera os três para um novo teste.
 
 ## Limites desta versão
 

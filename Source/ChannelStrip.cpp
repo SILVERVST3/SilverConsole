@@ -225,12 +225,21 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     setupSmallLabel (infoLabel, 10.0f, colours::inkSoft);
     addAndMakeVisible (infoLabel);
 
-    for (int i = 0; i < kNumInserts; ++i) addAndMakeVisible (slots.add (new InsertSlotComponent (c, i, h)));
+    auto setupPlus = [this] (juce::TextButton& b, const juce::String& tip)
+    {
+        b.setWantsKeyboardFocus (false);
+        b.setTooltip (tip);
+        b.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a4148));
+        b.setConnectedEdges (0);
+        addAndMakeVisible (b);
+    };
+    setupPlus (addInsertButton, "Adicionar mais um slot de insert (botao direito no ultimo slot vazio: remover)");
+    addInsertButton.onClick = [this] { host.addInsertSlot (channel); };
 
     if (isTrack)
     {
-        auto& t = static_cast<Track&> (c);
-        for (int i = 0; i < kNumSends; ++i) addAndMakeVisible (sends.add (new SendRow (t, i, h)));
+        setupPlus (addSendButton, "Adicionar mais um envio (menu do ultimo envio: remover)");
+        addSendButton.onClick = [this] { host.addSendSlot (static_cast<Track&> (channel)); };
         outputButton.onClick = [this] { host.outputMenu (static_cast<Track&> (channel), outputButton); };
         outputButton.setTooltip ("Saida da faixa: Master ou um bus");
         addAndMakeVisible (outputButton);
@@ -319,7 +328,48 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     };
     addAndMakeVisible (gainLabel);
 
+    syncSlots();
     refresh();
+}
+
+void ChannelStrip::syncSlots()
+{
+    bool changed = false;
+    while (slots.size() > channel.inserts.size()) { slots.removeLast(); changed = true; }
+    while (slots.size() < channel.inserts.size())
+    {
+        addAndMakeVisible (slots.add (new InsertSlotComponent (channel, slots.size(), host)));
+        changed = true;
+    }
+    lastInsertVisualState.resize ((size_t) slots.size(), 0);
+    if (channel.kind == ChannelKind::track)
+    {
+        auto& t = static_cast<Track&> (channel);
+        while (sends.size() > t.sends.size()) { sends.removeLast(); changed = true; }
+        while (sends.size() < t.sends.size())
+        {
+            addAndMakeVisible (sends.add (new SendRow (t, sends.size(), host)));
+            changed = true;
+        }
+    }
+    if (changed && ! getBounds().isEmpty()) resized();
+}
+
+namespace
+{
+    constexpr int kSlotH = 17, kSendH = 20, kInsertsTop = 54, kMinFaderH = 200;
+}
+
+int ChannelStrip::minimumHeight() noexcept
+{
+    const int sendsHeaderY = kInsertsTop + layoutInsertRows * kSlotH + 3;
+    const int y0 = sendsHeaderY + 37 + layoutSendRows * kSendH + 4;
+    return y0 + 112 + kMinFaderH + 28;
+}
+
+juce::Rectangle<int> ChannelStrip::sendBlock() const
+{
+    return sendsHeader.withHeight (37 + layoutSendRows * kSendH);
 }
 
 juce::String ChannelStrip::panText() const
@@ -398,7 +448,7 @@ void ChannelStrip::tick()
         const auto label = "TP " + db + " dBTP";
         if (infoLabel.getText() != label)
             infoLabel.setText (label, juce::dontSendNotification);
-        repaint (sendsHeader.withHeight (117));
+        repaint (sendBlock());
     }
 
 
@@ -439,18 +489,25 @@ void ChannelStrip::resized()
     const int w = getWidth();
     nameLabel.setBounds (4, 6, w - 8, 20);
     infoLabel.setBounds (4, 26, w - 8, 13);
+    // Layout vertical calculado: as linhas seguem o canal com mais inserts/envios,
+    // para que todos os canais fiquem alinhados.
     insertsHeader = { 6, 41, w - 12, 12 };
-    for (int i = 0; i < slots.size(); ++i) slots[i]->setBounds (6, 54 + i * 17, w - 12, 16);
-    sendsHeader = { 6, 193, w - 12, 12 };
-    for (int i = 0; i < sends.size(); ++i) sends[i]->setBounds (6, 206 + i * 20, w - 12, 19);
-    outputButton.setBounds (6, 290, w - 12, 20);
+    for (int i = 0; i < slots.size(); ++i) slots[i]->setBounds (6, kInsertsTop + i * kSlotH, w - 12, kSlotH - 1);
+    addInsertButton.setBounds (w - 6 - 18, 40, 18, 13);
 
-    panKnob.setBounds (w / 2 - 21, 314, 42, 42);
-    panLabel.setBounds (4, 355, w - 8, 13);
+    const int sendsY = kInsertsTop + layoutInsertRows * kSlotH + 3;
+    sendsHeader = { 6, sendsY, w - 12, 12 };
+    for (int i = 0; i < sends.size(); ++i) sends[i]->setBounds (6, sendsY + 13 + i * kSendH, w - 12, kSendH - 1);
+    addSendButton.setBounds (w - 6 - 18, sendsY - 1, 18, 13);
+    outputButton.setBounds (6, sendsY + 13 + layoutSendRows * kSendH + 4, w - 12, 20);
 
-    autoButton.setBounds (6, 372, w - 12, 20);
+    const int y0 = sendsY + 37 + layoutSendRows * kSendH + 4;
+    panKnob.setBounds (w / 2 - 21, y0, 42, 42);
+    panLabel.setBounds (4, y0 + 41, w - 8, 13);
+
+    autoButton.setBounds (6, y0 + 58, w - 12, 20);
     const int bw = (w - 16) / 3;
-    const int rowY = 396;
+    const int rowY = y0 + 82;
     if (channel.kind == ChannelKind::master)
     {
         muteButton.setBounds (6, rowY, 30, 20);
@@ -464,7 +521,8 @@ void ChannelStrip::resized()
     }
 
     const int bottom = getHeight() - 28;
-    faderArea = { 0, 426, w, juce::jmax (80, bottom - 426) };
+    const int faderTop = y0 + 112;
+    faderArea = { 0, faderTop, w, juce::jmax (80, bottom - faderTop) };
     const int meterW = channel.kind == ChannelKind::master ? 22 : 16;
     meter.setBounds (w - meterW - 6, faderArea.getY(), meterW, faderArea.getHeight());
     fader.setBounds (24, faderArea.getY() - 10, w - meterW - 34, faderArea.getHeight() + 20);
@@ -510,7 +568,7 @@ void ChannelStrip::paint (juce::Graphics& g)
     else
     {
         g.setColour (juce::Colours::black.withAlpha (0.08f));
-        g.fillRoundedRectangle (sendsHeader.withHeight (117).toFloat(), 3.0f);
+        g.fillRoundedRectangle (sendBlock().toFloat(), 3.0f);
         g.setColour (colours::inkSoft.withAlpha (0.7f));
         g.setFont (uiFont (10.0f, true));
         if (isMaster)
@@ -531,7 +589,7 @@ void ChannelStrip::paint (juce::Graphics& g)
         }
         else
             g.drawText (juce::String ("MASTER"),
-                        sendsHeader.withHeight (117), juce::Justification::centred);
+                        sendBlock(), juce::Justification::centred);
     }
 
     // escala do fader

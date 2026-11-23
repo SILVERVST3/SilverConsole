@@ -16,7 +16,7 @@ namespace
 
     juce::AudioProcessorParameter* pluginParam (Channel& c, int slot, int param)
     {
-        if (! juce::isPositiveAndBelow (slot, kNumInserts)) return nullptr;
+        if (! c.hasInsert (slot)) return nullptr;
         auto* p = c.inserts[(size_t) slot].processor.get();
         if (p == nullptr) return nullptr;
         auto& params = p->getParameters();
@@ -781,7 +781,7 @@ void AutomationView::showAddLaneMenu (Channel& c, juce::Component& source)
     m.addItem (2, c.kind == ChannelKind::track ? "Pan" : "Balance", true, engine.findLane (c, AutoTarget::pan) != nullptr);
     m.addItem (3, "Mute", true, engine.findLane (c, AutoTarget::mute) != nullptr);
     bool anyPlugin = false;
-    for (int s = 0; s < kNumInserts; ++s)
+    for (int s = 0; s < c.inserts.size(); ++s)
     {
         auto* p = c.inserts[(size_t) s].processor.get();
         if (p == nullptr) continue;

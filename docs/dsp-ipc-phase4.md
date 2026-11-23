@@ -27,3 +27,10 @@ Correcoes feitas apos auditoria do caminho IPC:
 - **Plugin de saida mono no worker.** O canal direito recebe o mesmo sinal (antes repetia a entrada).
 
 Continua pendente: reinicio automatico do worker, parametros/automacao e estado atualizado pelo IPC, editor remoto, mais de 2 canais/MIDI, reset do estado interno do plugin remoto antes do bounce (caudas de reverb do playback podem entrar no inicio da exportacao), testes longos com plugins comerciais e interfaces reais.
+
+## Desempenho e mixer (23/11/2026, mesma branch)
+
+- **Multicore em tempo real:** `RealtimeTrackPool` processa as faixas (leitura, inserts, PDC) em ate 8 threads persistentes. Sem alocacao nem mutex no callback: o trabalho e publicado num contador atomico (geracao + indice), os workers acordam por semaforo Win32 e rodam com MMCSS "Pro Audio". A soma, os envios, os buses e o master continuam sequenciais e na mesma ordem: o resultado e identico ao de um nucleo (teste compara amostra por amostra). Medicao: 24 faixas pesadas a 512 amostras, 8,1 ms/bloco em um nucleo contra 1,3 ms/bloco em multicore (6x). `ScopedNoDenormals` no callback e nos workers.
+- **Streaming com conversao de taxa:** arquivos de 32 MB ou mais tocam do disco tambem quando a taxa e diferente da placa. A conversao usa o mesmo sinc do reamostrador offline, por trechos (`resampleRange`), com resultado identico (erro 0 no teste). Antes, cada arquivo em outra taxa ia inteiro para a RAM duas vezes (original + convertido), cerca de 2,2 GB por faixa de 50 min. Janelas de cerca de 5,5 s, renovadas na metade; janela curta apos salto do cursor; 2 threads de I/O que atendem primeiro a faixa com menos audio a frente.
+- **Contadores na barra de status:** XRUN (CPU), DISCO (streaming atrasado), LOCK (edicao concorrente), com opcao de zerar.
+- **Mixer:** 16 buses; inserts e envios dinamicos (4 por padrao, botao "+", limite de seguranca 64), salvos no projeto (`inserts=`/`sends=`); janela de plugin com escala do host desligada (`getDesktopScaleFactor = 1`), limites de tamanho do proprio editor, rolagem quando maior que a tela e modo de compatibilidade de DPI por plugin.

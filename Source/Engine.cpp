@@ -1,5 +1,11 @@
 // SilverConsole - motor de mixagem. Codigo original (MIT).
 #include "Engine.h"
+#if JUCE_WINDOWS
+ #ifndef NOMINMAX
+  #define NOMINMAX
+ #endif
+ #include <windows.h>
+#endif
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -93,6 +99,126 @@ private:
     int jobCount = 0;
     const std::function<void(int)>* job = nullptr;
 };
+
+//==============================================================================
+// Pool PERSISTENTE para o callback da placa: as faixas (leitura, inserts, PDC)
+// sao processadas em varios nucleos. Sem alocacao, mutex ou espera bloqueante na
+// thread de audio: o trabalho e publicado num contador atomico (geracao + indice),
+// os workers sao acordados por semaforo (ReleaseSemaphore nao bloqueia) e a
+// thread de audio tambem processa faixas. Ela so espera faixas ja em andamento.
+class RealtimeTrackPool
+{
+public:
+    using Fn = void (*) (void* context, int index);
+
+    explicit RealtimeTrackPool (int workers)
+    {
+       #if JUCE_WINDOWS
+        semaphore = ::CreateSemaphoreW (nullptr, 0, 0x7fffffff, nullptr);
+        if (semaphore != nullptr)
+            for (int i = 0; i < workers; ++i)
+                threads.emplace_back ([this] { workerLoop(); });
+       #else
+        juce::ignoreUnused (workers);
+       #endif
+    }
+
+    ~RealtimeTrackPool()
+    {
+       #if JUCE_WINDOWS
+        stopping.store (true);
+        if (semaphore != nullptr) ::ReleaseSemaphore (semaphore, (LONG) threads.size() + 1, nullptr);
+        for (auto& t : threads) if (t.joinable()) t.join();
+        if (semaphore != nullptr) ::CloseHandle (semaphore);
+       #endif
+    }
+
+    int size() const noexcept { return (int) threads.size(); }
+
+    /** Thread de audio (ou de exportacao): executa fn(context, 0..count-1). */
+    void run (int count, Fn fn, void* context) noexcept
+    {
+        if (count <= 0) return;
+        if (threads.empty() || count == 1)
+        {
+            for (int i = 0; i < count; ++i) fn (context, i);
+            return;
+        }
+       #if JUCE_WINDOWS
+        const auto gen = ++generation; // so este produtor escreve
+        auto& slot = jobs[gen & 1];
+        slot.fn.store (fn, std::memory_order_relaxed);
+        slot.context.store (context, std::memory_order_relaxed);
+        slot.count.store (count, std::memory_order_relaxed);
+        completed.store (0, std::memory_order_relaxed);
+        work.store (gen << 32, std::memory_order_release);
+        ::ReleaseSemaphore (semaphore, (LONG) juce::jmin (size(), count - 1), nullptr);
+
+        claimAndRun();
+        for (int spins = 0; completed.load (std::memory_order_acquire) < count;)
+        {
+            ::YieldProcessor();
+            if (++spins == 2000) { spins = 0; ::SwitchToThread(); }
+        }
+       #endif
+    }
+
+private:
+    struct Job
+    {
+        std::atomic<Fn> fn { nullptr };
+        std::atomic<void*> context { nullptr };
+        std::atomic<int> count { 0 };
+    };
+
+    void claimAndRun() noexcept
+    {
+        for (;;)
+        {
+            auto w = work.load (std::memory_order_acquire);
+            const auto& job = jobs[(w >> 32) & 1];
+            const auto index = (int) (w & 0xffffffffu);
+            const auto fn = job.fn.load (std::memory_order_relaxed);
+            auto* context = job.context.load (std::memory_order_relaxed);
+            if (index >= job.count.load (std::memory_order_relaxed) || fn == nullptr) return;
+            // A geracao no mesmo contador garante que o indice pertence ao job lido.
+            if (! work.compare_exchange_weak (w, w + 1, std::memory_order_acq_rel)) continue;
+            fn (context, index);
+            completed.fetch_add (1, std::memory_order_release);
+        }
+    }
+
+   #if JUCE_WINDOWS
+    void workerLoop()
+    {
+        // Prioridade de audio: MMCSS "Pro Audio" (se disponivel) + tempo critico.
+        using AvSet = HANDLE (WINAPI*) (LPCWSTR, LPDWORD);
+        if (auto* avrt = ::LoadLibraryW (L"avrt.dll"))
+            if (auto set = reinterpret_cast<AvSet> (::GetProcAddress (avrt, "AvSetMmThreadCharacteristicsW")))
+            {
+                DWORD taskIndex = 0;
+                set (L"Pro Audio", &taskIndex);
+            }
+        ::SetThreadPriority (::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        while (! stopping.load (std::memory_order_relaxed))
+        {
+            ::WaitForSingleObject (semaphore, INFINITE);
+            if (stopping.load (std::memory_order_relaxed)) break;
+            juce::ScopedNoDenormals noDenormals;
+            claimAndRun();
+        }
+    }
+    HANDLE semaphore = nullptr;
+   #endif
+
+    std::vector<std::thread> threads;
+    std::atomic<bool> stopping { false };
+    std::atomic<std::uint64_t> work { 0 };
+    std::atomic<int> completed { 0 };
+    std::uint64_t generation = 0;
+    Job jobs[2];
+};
+
 namespace
 {
     void panGains (float pan, bool monoSource, float& l, float& r) noexcept
@@ -129,11 +255,20 @@ Engine::Engine()
 {
     master.colour = juce::Colour (0xffe8edf2);
     streamingWorker = std::make_unique<StreamWorker>();
+    // um nucleo fica para a thread de audio, outro para interface/disco
+    const int cores = (int) std::thread::hardware_concurrency();
+    realtimePool = std::make_unique<RealtimeTrackPool> (juce::jlimit (0, 8, cores - 2));
     prepare (48000.0, 512);
+}
+
+int Engine::getRealtimeWorkerCount() const noexcept
+{
+    return realtimePool != nullptr ? realtimePool->size() : 0;
 }
 
 Engine::~Engine()
 {
+    realtimePool.reset();
     offlineTrackPool.reset();
     streamingWorker.reset(); // termina I/O antes dos objetos Track
     forEachChannel ([this] (Channel& c)
@@ -345,7 +480,8 @@ std::unique_ptr<Bus> Engine::removeBus (Bus* b)
 std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, std::unique_ptr<juce::AudioProcessor> p,
                                                          const juce::PluginDescription* desc)
 {
-    jassert (juce::isPositiveAndBelow (slot, kNumInserts));
+    jassert (juce::isPositiveAndBelow (slot, kMaxInsertsPerChannel));
+    if (slot >= c.inserts.size()) setInsertCount (c, slot + 1); // projeto com slot alem dos visiveis
     auto& s = c.inserts[(size_t) slot];
     std::unique_ptr<juce::AudioProcessor> old;
     std::shared_ptr<RemoteDspInsert> retiredRemote;
@@ -377,8 +513,9 @@ std::unique_ptr<juce::AudioProcessor> Engine::setRemoteInsert (
     Channel& c, int slot, std::shared_ptr<RemoteDspInsert> ipcInsert,
     const juce::PluginDescription& desc)
 {
-    if (! juce::isPositiveAndBelow (slot, kNumInserts) || ipcInsert == nullptr)
+    if (! juce::isPositiveAndBelow (slot, kMaxInsertsPerChannel) || ipcInsert == nullptr)
         return {};
+    if (slot >= c.inserts.size()) setInsertCount (c, slot + 1);
     auto& entry = c.inserts[(size_t) slot];
     std::unique_ptr<juce::AudioProcessor> old;
     std::shared_ptr<RemoteDspInsert> oldRemote;
@@ -421,7 +558,7 @@ void Engine::setMissingInsert (Channel& c, int slot, const juce::PluginDescripti
 
 void Engine::swapInserts (Channel& c, int a, int b)
 {
-    if (! juce::isPositiveAndBelow (a, kNumInserts) || ! juce::isPositiveAndBelow (b, kNumInserts)) return;
+    if (! c.hasInsert (a) || ! c.hasInsert (b)) return;
     const juce::ScopedLock sl (lock);
     for (auto& l : c.lanes) // a automacao acompanha o plugin
         if (l->target == AutoTarget::plugin)
@@ -449,11 +586,49 @@ void Engine::swapInserts (Channel& c, int a, int b)
 
 void Engine::setBypass (Channel& c, int slot, bool b)
 {
+    if (! c.hasInsert (slot)) return;
     const juce::ScopedLock sl (lock);
     auto& insert = c.inserts[(size_t) slot];
     insert.bypassed = b;
     if (! b) insert.faulted.store (false, std::memory_order_relaxed); // retry explicito
     updateLatency();
+}
+
+bool Engine::setInsertCount (Channel& c, int count)
+{
+    count = juce::jlimit (1, kMaxInsertsPerChannel, count);
+    const juce::ScopedLock sl (lock); // o audio itera os inserts sob este lock
+    // so remove slots vazios do fim (plugins e automacao ficam intactos)
+    const int before = c.inserts.size();
+    while (c.inserts.size() > count && c.inserts[(size_t) c.inserts.size() - 1].isEmpty())
+        c.inserts.resize (c.inserts.size() - 1);
+    if (c.inserts.size() < count) c.inserts.resize (count);
+    return c.inserts.size() != before;
+}
+
+bool Engine::setSendCount (Track& t, int count)
+{
+    count = juce::jlimit (1, kMaxSendsPerTrack, count);
+    const juce::ScopedLock sl (lock);
+    bool changed = false;
+    while (t.sends.size() > count && t.sends[(size_t) t.sends.size() - 1].bus.load() < 0)
+    {
+        t.sends.resize (t.sends.size() - 1);
+        changed = true;
+    }
+    if (t.sends.size() < count)
+    {
+        const int first = t.sends.size();
+        t.sends.resize (count);
+        for (int i = first; i < count; ++i)
+        {
+            auto& s = t.sends[(size_t) i];
+            s.smooth.reset (sampleRate.load(), 0.02);
+            s.smooth.setCurrentAndTargetValue (0.0f);
+        }
+        changed = true;
+    }
+    return changed;
 }
 
 void Engine::setTrackAudio (Track& t, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
@@ -478,7 +653,7 @@ void Engine::setTrackStream (Track& t, std::shared_ptr<StreamingAudio> stream)
         const juce::ScopedLock sl (lock);
         t.original.reset();
         t.playback.reset();
-        t.originalRate = stream->getRate();
+        t.originalRate = stream->getSourceRate(); // taxa do arquivo (exibida na faixa)
         t.playbackRate = stream->getRate();
         t.sourceChannels = stream->getChannels();
         t.diskStream = stream;
@@ -572,7 +747,7 @@ bool Engine::currentValue (Channel& c, AutoTarget tg, int slot, int param, float
         case AutoTarget::pan:    value = c.pan.load(); return true;
         case AutoTarget::mute:   value = c.mute.load() ? 1.0f : 0.0f; return true;
         case AutoTarget::plugin:
-            if (juce::isPositiveAndBelow (slot, kNumInserts))
+            if (c.hasInsert (slot))
                 if (auto* p = c.inserts[(size_t) slot].processor.get())
                 {
                     auto& params = p->getParameters();
@@ -586,7 +761,7 @@ bool Engine::currentValue (Channel& c, AutoTarget tg, int slot, int param, float
 bool Engine::isStepTarget (Channel& c, AutoTarget tg, int slot, int param)
 {
     if (tg == AutoTarget::mute) return true;
-    if (tg != AutoTarget::plugin || ! juce::isPositiveAndBelow (slot, kNumInserts)) return false;
+    if (tg != AutoTarget::plugin || ! c.hasInsert (slot)) return false;
     if (auto* p = c.inserts[(size_t) slot].processor.get())
     {
         auto& params = p->getParameters();
@@ -610,7 +785,7 @@ void Engine::applyAutomation (Channel& c, double t)
             case AutoTarget::pan:    c.pan.store (juce::jlimit (-1.0f, 1.0f, v), std::memory_order_relaxed); break;
             case AutoTarget::mute:   c.mute.store (v >= 0.5f, std::memory_order_relaxed); break;
             case AutoTarget::plugin:
-                if (juce::isPositiveAndBelow (l.slot, kNumInserts))
+                if (c.hasInsert (l.slot))
                     if (auto* p = c.inserts[(size_t) l.slot].processor.get())
                     {
                         auto& params = p->getParameters();
@@ -860,6 +1035,14 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         const std::function<void(int)> job = processTrack;
         offlineTrackPool->run ((int) tracks.size(), job);
     }
+    else if (realtimePool != nullptr && realtimePool->size() > 0 && tracks.size() > 1
+             && multiCore.load (std::memory_order_relaxed))
+    {
+        // ponteiro de funcao + contexto: nada de std::function (alocacao) no callback
+        realtimePool->run ((int) tracks.size(),
+                           [] (void* ctx, int index) { (*static_cast<decltype (processTrack)*> (ctx)) (index); },
+                           const_cast<void*> (static_cast<const void*> (&processTrack)));
+    }
     else
         for (int index = 0; index < (int) tracks.size(); ++index)
             processTrack (index);
@@ -989,6 +1172,9 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
                                                const juce::AudioIODeviceCallbackContext&)
 {
     if (out == nullptr || n <= 0 || numOut <= 0) return;
+    // Denormais (caudas de reverb/filtros quase em silencio) podem multiplicar o
+    // custo de CPU de plugins que nao se protegem: FTZ/DAZ no callback inteiro.
+    juce::ScopedNoDenormals noDenormals;
     for (int c = 0; c < numOut; ++c)
         if (out[c] != nullptr) juce::FloatVectorOperations::clear (out[c], n);
 

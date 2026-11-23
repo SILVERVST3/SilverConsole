@@ -879,14 +879,147 @@ static void testDiskStreaming()
             }
             else check (false, "stream: reabrir para teste integrado");
         }
-        auto wrongRate = StreamingAudio::open (file, 44100.0, error);
-        check (wrongRate == nullptr, "stream: taxa diferente usa caminho de fallback");
+        // Taxa diferente: o streaming converte trecho a trecho na thread de disco
+        // (antes o arquivo inteiro ia para a RAM duas vezes). Deve ser identico
+        // ao reamostrador offline aplicado ao arquivo inteiro.
+        auto converted = StreamingAudio::open (file, 44100.0, error);
+        check (converted != nullptr && converted->getLength() == resampledLength (120000, 48000.0, 44100.0),
+               "stream: taxa diferente convertida no proprio streaming " + error);
+        if (converted != nullptr)
+        {
+            juce::AudioFormatManager fm;
+            registerAudioFormats (fm);
+            const auto full = loadAudioFile (fm, file);
+            const auto reference = full.ok() ? resampleBuffer (full.original, full.rate, 44100.0) : nullptr;
+            float maxErr = reference != nullptr ? 0.0f : 1.0f;
+            for (juce::int64 at : { (juce::int64) 0, (juce::int64) 5000, (juce::int64) 70000, converted->getLength() - 300 })
+            {
+                if (reference == nullptr) break;
+                converted->prefetchBlocking (at, 256);
+                float l[256] {}, r[256] {};
+                converted->copy (l, r, 0, at, 256);
+                const int cnt = (int) juce::jmin ((juce::int64) 256, converted->getLength() - at);
+                for (int i = 0; i < cnt; ++i)
+                    maxErr = juce::jmax (maxErr, std::abs (l[i] - reference->getSample (0, (int) at + i)),
+                                         std::abs (r[i] - reference->getSample (1, (int) at + i)));
+            }
+            check (maxErr < 1.0e-6f, "stream: conversao por trechos identica a offline (erro max "
+                                         + juce::String (maxErr, 9) + ")");
+        }
     }
     check (file.deleteFile(), "stream: limpeza do arquivo de teste");
 }
 
 // Garante que a soma do bounce com workers multicore seja igual ao render
 // sequencial (após acomodacao dos smoothing ramps).
+// Multicore no callback em tempo real: resultado identico ao de um nucleo.
+static void testRealtimeMulticore()
+{
+    auto build = [] (Engine& e)
+    {
+        e.prepare (48000.0, 256);
+        for (int i = 0; i < 12; ++i)
+        {
+            auto src = makeBuffer (2, 24000, [i] (int ch, int s)
+            { return 0.02f * std::sin ((float) s * (0.003f + 0.001f * (float) i) + (float) ch); });
+            auto* t = addTrack (e, src, "rt " + juce::String (i));
+            auto p = std::make_unique<InternalDelay> (10 + i * 7); // latencias diferentes: PDC + inserts
+            e.prepareProcessor (*p);
+            e.setInsert (*t, i % 4, std::move (p), nullptr);
+            t->pan = (float) (i % 5) * 0.4f - 0.8f;
+        }
+    };
+    Engine serial, parallel;
+    build (serial);
+    build (parallel);
+    serial.setMultiCore (false);
+    parallel.setMultiCore (true);
+    const auto a = run (serial, 20000);
+    const auto b = run (parallel, 20000);
+    float maxDiff = 0.0f;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int i = 0; i < 20000; ++i)
+            maxDiff = juce::jmax (maxDiff, std::abs (a.getSample (ch, i) - b.getSample (ch, i)));
+    std::printf ("       (workers de tempo real: %d)\n", parallel.getRealtimeWorkerCount());
+    check (maxDiff == 0.0f, "multicore tempo real: identico ao processamento em um nucleo");
+
+    // Medicao (informativa): 24 faixas com um "plugin" pesado de CPU, buffer 512.
+    struct Burn : InternalDelay
+    {
+        Burn() : InternalDelay (0) {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+        {
+            for (int c = 0; c < 2; ++c)
+            {
+                auto* d = b.getWritePointer (c);
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    float x = d[i];
+                    for (int k = 0; k < 40; ++k) x = 0.999f * std::sin (x + 0.001f * (float) k);
+                    d[i] = x;
+                }
+            }
+        }
+    };
+    auto timeIt = [] (bool multi)
+    {
+        Engine e;
+        e.prepare (48000.0, 512);
+        e.setMultiCore (multi);
+        for (int i = 0; i < 24; ++i)
+        {
+            auto* t = addTrack (e, makeBuffer (2, 48000, [] (int, int s) { return 0.1f * std::sin ((float) s * 0.01f); }), "burn");
+            auto p = std::make_unique<Burn>();
+            e.prepareProcessor (*p);
+            e.setInsert (*t, 0, std::move (p), nullptr);
+        }
+        run (e, 2048); // aquecimento
+        const auto t0 = juce::Time::getMillisecondCounterHiRes();
+        run (e, 512 * 40);
+        return (juce::Time::getMillisecondCounterHiRes() - t0) / 40.0; // ms por bloco de 512
+    };
+    const double one = timeIt (false), many = timeIt (true);
+    std::printf ("       (24 faixas pesadas, buffer 512 = %.1f ms: 1 nucleo %.2f ms/bloco, multicore %.2f ms/bloco, %.1fx)\n",
+                 512.0 * 1000.0 / 48000.0, one, many, one / juce::jmax (0.001, many));
+}
+
+// Inserts e envios dinamicos (botao "+"), 16 buses e persistencia no projeto.
+static void testDynamicSlots()
+{
+    Engine e;
+    e.prepare (48000.0, 256);
+    auto* t = addTrack (e, makeBuffer (2, 4800, [] (int, int) { return 0.1f; }), "slots");
+    check (t->inserts.size() == kDefaultInserts && t->sends.size() == kDefaultSends,
+           "slots: padrao de 4 inserts e 4 envios");
+    check (e.setInsertCount (*t, 10) && t->inserts.size() == 10, "slots: adicionar inserts alem de 8");
+    auto p = std::make_unique<InternalDelay> (5);
+    e.prepareProcessor (*p);
+    e.setInsert (*t, 8, std::move (p), nullptr);
+    check (e.getTotalLatency() == 5, "slots: plugin no insert 9 processa (latencia 5)");
+    e.setInsertCount (*t, 2);
+    check (t->inserts.size() == 9, "slots: reduzir so remove slots vazios do fim (plugin no 9 preservado)");
+    check (e.setSendCount (*t, 7) && t->sends.size() == 7, "slots: adicionar envios");
+    for (int i = 0; i < kMaxBuses; ++i) e.addBus();
+    check ((int) e.buses.size() == 16 && e.addBus() == nullptr, "slots: ate 16 buses");
+    t->sends[6].bus = 15;
+    t->sends[6].levelDb = -3.0f;
+    // insert alem do 9 vem do projeto mesmo sem plugin (slot vazio adicionado pelo usuario)
+    auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_slots.sconsole");
+    juce::String err;
+    check (writeProject (captureProject (e), file, err), "slots: salvar " + err);
+    ProjectData pd;
+    check (readProject (file, pd, err), "slots: abrir " + err);
+    check (pd.tracks.size() == 1 && pd.tracks[0].ch.numInserts == 9 && pd.tracks[0].sends.size() == 7
+           && pd.tracks[0].sends[6].bus == 15 && near (pd.tracks[0].sends[6].levelDb, -3.0f)
+           && pd.buses.size() == 16,
+           "slots: projeto guarda numero de inserts, envios e 16 buses");
+    Engine e2;
+    auto t2 = std::make_unique<Track>();
+    applyChannelBasics (e2, *t2, pd.tracks[0].ch);
+    check (t2->inserts.size() == 9, "slots: ao abrir, recria os slots");
+    file.deleteFile();
+}
+
 static void testMulticoreOfflineMix()
 {
     Engine e;
@@ -1161,6 +1294,8 @@ int main (int argc, char** argv)
     testMomentaryLoudness();
     test128TrackStress();
     testMulticoreOfflineMix();
+    testRealtimeMulticore();
+    testDynamicSlots();
     testDiskStreaming();
     testStereoBalanceMuteSolo();
     testBusesAndSends();

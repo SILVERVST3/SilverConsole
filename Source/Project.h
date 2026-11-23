@@ -32,6 +32,7 @@ struct ChannelData
     std::vector<InsertData> inserts;
     AutoMode autoMode = AutoMode::read;
     std::vector<LaneData> lanes;
+    int numInserts = kDefaultInserts; // slots visiveis (inclui vazios adicionados com "+")
 };
 
 struct SendData { int bus = -1; float levelDb = 0.0f; bool pre = false; };
@@ -41,7 +42,7 @@ struct TrackData
     ChannelData ch;
     juce::File file;
     int output = -1;
-    std::array<SendData, kNumSends> sends;
+    std::vector<SendData> sends = std::vector<SendData> ((size_t) kDefaultSends);
     LoadedAudio audio; // preenchido ao carregar
 };
 
