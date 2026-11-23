@@ -141,16 +141,24 @@ void Timeline::paint (juce::Graphics& g)
     g.setColour (colours::panelLine.withAlpha (0.8f));
     g.fillRect (juce::Rectangle<float>::leftTopRightBottom (sampleToX (0), r.getBottom() - 7.0f, sampleToX (len), r.getBottom() - 3.0f));
 
-    // loop
+    // selecao (= regiao do loop)
     const auto ls = engine.loopStart.load(), le = engine.loopEnd.load();
     if (le > ls)
     {
+        const bool looping = engine.loopOn.load();
         auto lr = juce::Rectangle<float>::leftTopRightBottom (sampleToX (ls), r.getY() + 2.0f, sampleToX (le), r.getBottom() - 2.0f);
-        g.setColour ((engine.loopOn.load() ? colours::accent : colours::textDim).withAlpha (0.22f));
+        const auto col = looping ? colours::accent : colours::silverTop;
+        g.setColour (col.withAlpha (looping ? 0.22f : 0.16f));
         g.fillRect (lr);
-        g.setColour (engine.loopOn.load() ? colours::accent : colours::textDim);
+        g.setColour (col);
         g.fillRect (lr.withWidth (2.0f));
         g.fillRect (lr.withLeft (lr.getRight() - 2.0f));
+        const juce::String label = timeText (ls, sr) + "  -  " + timeText (le, sr)
+                                   + "   (" + juce::String ((double) (le - ls) / sr, 1) + " s" + (looping ? ", loop)" : ")");
+        g.setFont (uiFont (10.0f, true));
+        if (lr.getWidth() > 190.0f)
+            g.drawText (label, lr.reduced (6.0f, 0.0f).withTop (r.getBottom() - 20.0f).withHeight (12.0f).toNearestInt(),
+                        juce::Justification::centred);
     }
 
     // regua
@@ -177,29 +185,79 @@ void Timeline::paint (juce::Graphics& g)
     g.fillPath (head);
 }
 
+Timeline::Drag Timeline::hitTestDrag (const juce::MouseEvent& e) const
+{
+    const float x = (float) e.x;
+    if (engine.hasSelection())
+    {
+        if (std::abs (x - sampleToX (engine.loopStart.load())) <= 5.0f) return Drag::startEdge;
+        if (std::abs (x - sampleToX (engine.loopEnd.load())) <= 5.0f) return Drag::endEdge;
+    }
+    if (e.y < 12 && std::abs (x - sampleToX (engine.position.load())) <= 7.0f) return Drag::scrub;
+    return Drag::click;
+}
+
+void Timeline::mouseMove (const juce::MouseEvent& e)
+{
+    const auto d = hitTestDrag (e);
+    setMouseCursor (d == Drag::startEdge || d == Drag::endEdge ? juce::MouseCursor::LeftRightResizeCursor
+                                                               : juce::MouseCursor::NormalCursor);
+}
+
 void Timeline::mouseDown (const juce::MouseEvent& e)
 {
-    loopDrag = e.mods.isShiftDown();
+    drag = Drag::none;
+    if (e.mods.isPopupMenu()) { if (onMenu) onMenu(); return; }
     dragAnchor = xToSample ((float) e.x);
-    if (! loopDrag)
-    {
-        engine.position = dragAnchor;
-        if (onEdited) onEdited();
-    }
+    drag = hitTestDrag (e);
+    loopWhileSelecting = e.mods.isShiftDown();
+    if (drag == Drag::click && loopWhileSelecting) drag = Drag::select;
     repaint();
 }
 
 void Timeline::mouseDrag (const juce::MouseEvent& e)
 {
     const auto s = xToSample ((float) e.x);
-    if (loopDrag)
+    if (drag == Drag::click && e.getDistanceFromDragStart() > 4) drag = Drag::select;
+    switch (drag)
     {
-        engine.setLoop (dragAnchor, s);
-        engine.loopOn = true;
+        case Drag::select:
+            engine.setLoop (dragAnchor, s);
+            if (loopWhileSelecting) engine.loopOn = true;
+            break;
+        case Drag::startEdge: engine.setLoop (s, engine.loopEnd.load()); break;
+        case Drag::endEdge:   engine.setLoop (engine.loopStart.load(), s); break;
+        case Drag::scrub:
+            engine.stopAt = -1;
+            engine.position = s;
+            if (onEdited) onEdited();
+            break;
+        case Drag::click: case Drag::none: break;
     }
-    else engine.position = s;
-    if (onEdited) onEdited();
     repaint();
+}
+
+void Timeline::mouseUp (const juce::MouseEvent&)
+{
+    if (drag == Drag::click)
+    {
+        engine.stopAt = -1;
+        engine.position = dragAnchor;
+        if (onEdited) onEdited();
+    }
+    else if (drag == Drag::select || drag == Drag::startEdge || drag == Drag::endEdge)
+    {
+        if (onSelectionChanged) onSelectionChanged();
+    }
+    drag = Drag::none;
+    repaint();
+}
+
+void Timeline::mouseDoubleClick (const juce::MouseEvent& e)
+{
+    const auto s = xToSample ((float) e.x);
+    if (engine.hasSelection() && s >= engine.loopStart.load() && s <= engine.loopEnd.load() && onPlaySelection)
+        onPlaySelection();
 }
 
 //==============================================================================
@@ -251,26 +309,27 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
 
     for (auto* b : { &toStartButton, &playButton, &stopButton, &loopButton })
         addAndMakeVisible (b);
-    toStartButton.onClick = [this] { engine.position = 0; playStart = 0; };
+    toStartButton.onClick = [this] { engine.stopAt = -1; engine.position = 0; playStart = 0; };
     playButton.onClick = [this] { togglePlay(); };
     stopButton.onClick = [this]
     {
+        engine.stopAt = -1;
         if (engine.playing.load()) { engine.playing = false; engine.position = playStart; }
         else { engine.position = 0; playStart = 0; }
     };
     loopButton.setClickingTogglesState (true);
     loopButton.onClick = [this]
     {
-        if (loopButton.getToggleState() && engine.loopEnd.load() <= engine.loopStart.load())
-        {
-            const auto len = juce::jmax (engine.getLengthSamples(), (juce::int64) (engine.getSampleRate() * 8));
-            engine.setLoop (0, len);
-        }
+        if (loopButton.getToggleState() && ! engine.hasSelection()) selectWholeSong();
         engine.loopOn = loopButton.getToggleState();
+        if (engine.loopOn.load()) engine.stopAt = -1;
         markDirty();
     };
     addAndMakeVisible (timeline);
     timeline.onEdited = [this] { if (! engine.playing.load()) playStart = engine.position.load(); };
+    timeline.onSelectionChanged = [this] { markDirty(); };
+    timeline.onPlaySelection = [this] { playSelection(); };
+    timeline.onMenu = [this] { timelineMenu (timeline); };
 
     auto setupTool = [this] (juce::TextButton& b, const juce::String& tip)
     {
@@ -595,7 +654,9 @@ bool MainComponent::keyPressed (const juce::KeyPress& k)
 {
     if (job != nullptr) return true;
     const auto cmd = juce::ModifierKeys::commandModifier;
+    if (k == juce::KeyPress (juce::KeyPress::spaceKey, juce::ModifierKeys::shiftModifier, 0)) { playSelection(); return true; }
     if (k == juce::KeyPress::spaceKey) { togglePlay(); return true; }
+    if (k == juce::KeyPress::escapeKey && engine.hasSelection()) { engine.clearSelection(); markDirty(); return true; }
     if (k == juce::KeyPress::homeKey) { engine.position = 0; playStart = 0; return true; }
     if (k == juce::KeyPress ('l')) { loopButton.triggerClick(); return true; }
     if (k == juce::KeyPress::tabKey) { automationButton.triggerClick(); return true; }
@@ -610,9 +671,10 @@ bool MainComponent::keyPressed (const juce::KeyPress& k)
 
 void MainComponent::togglePlay()
 {
-    if (engine.playing.load()) engine.playing = false;
+    if (engine.playing.load()) { engine.playing = false; engine.stopAt = -1; }
     else
     {
+        engine.stopAt = -1;
         playStart = engine.position.load();
         engine.playing = true;
     }
@@ -707,14 +769,20 @@ void MainComponent::writeRecoverySnapshot()
     }
     // Plugins sao capturados enquanto transporte esta parado; o lock evita
     // concorrencia com a engine. Escrita atomica via writeProject/TemporaryFile.
-    ProjectData snapshot;
+    auto snapshot = std::make_shared<ProjectData>();
     {
         const juce::ScopedLock guard (engine.lock);
-        snapshot = captureProject (engine);
+        *snapshot = captureProject (engine);
     }
-    juce::String error;
-    if (! writeProject (snapshot, recoveryFileFor (currentFile), error))
-        juce::Logger::writeToLog ("SilverConsole autosave: " + error);
+    // Gerar o XML (estados de plugins em base64) e gravar no disco fica numa
+    // thread separada: a interface nao trava em projetos grandes.
+    if (backgroundWrites.getNumJobs() > 0) return; // gravacao anterior ainda em andamento
+    backgroundWrites.addJob ([snapshot, file = recoveryFileFor (currentFile)]
+    {
+        juce::String error;
+        if (! writeProject (*snapshot, file, error))
+            juce::Logger::writeToLog ("SilverConsole autosave: " + error);
+    });
 }
 
 void MainComponent::offerRecoveryOnStartup()
@@ -1007,8 +1075,15 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
     if (s.remote != nullptr)
         m.addItem (6, "Reiniciar DSP isolado (recuperar falha)");
     if (s.processor != nullptr && s.hasDescription)
-        m.addItem (7, juce::String::fromUTF8 ("Janela em modo compat\xc3\xadvel de escala (plugin gigante/min\xc3\xbasculo)"),
-                   true, usesCompatScaling (s.description));
+    {
+        const auto cur = scaleModeFor (s.description);
+        juce::PopupMenu sm;
+        sm.addItem (70, juce::String::fromUTF8 ("Autom\xc3\xa1tica (corrige plugin gigante)"), true, cur == PluginScaleMode::automatic);
+        sm.addItem (72, "Sempre corrigir escala dupla", true, cur == PluginScaleMode::fixDouble);
+        sm.addItem (71, juce::String::fromUTF8 ("Escala do monitor, sem corre\xc3\xa7\xc3\xa3o"), true, cur == PluginScaleMode::native);
+        sm.addItem (73, juce::String::fromUTF8 ("Modo compat\xc3\xadvel do Windows (sem DPI)"), true, cur == PluginScaleMode::compatibility);
+        m.addSubMenu ("Escala da janela", sm);
+    }
     m.addSeparator();
     m.addItem (3, "Substituir...");
     m.addItem (4, "Mover para cima", slot > 0);
@@ -1029,10 +1104,10 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
             // Reiniciar e feito aqui, na thread de mensagens, nao no callback.
             loadPluginIntoRemote (*cp, slot, sl.description, sl.missingState);
         }
-        else if (r == 7)
+        else if (r >= 70 && r <= 73)
         {
             // salvo por plugin (vale para todas as instancias); reabre a janela no novo modo
-            setCompatScaling (sl.description, ! usesCompatScaling (sl.description));
+            setScaleMode (sl.description, (PluginScaleMode) (r - 70));
             const bool wasOpen = isEditorOpen (*cp, slot);
             closeEditor (*cp, slot);
             if (wasOpen || sl.processor != nullptr) openEditor (*cp, slot);
@@ -1177,20 +1252,34 @@ void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::Stri
     }
 }
 
-bool MainComponent::usesCompatScaling (const juce::PluginDescription& d) const
+// Modo de escala por plugin: linhas "modo|identificador" em pluginScaleModes.
+// A lista antiga pluginCompatScaling continua valendo como modo compativel.
+PluginScaleMode MainComponent::scaleModeFor (const juce::PluginDescription& d) const
 {
-    return juce::StringArray::fromLines (props.getUserSettings()->getValue ("pluginCompatScaling"))
-               .contains (d.createIdentifierString());
+    const auto id = d.createIdentifierString();
+    for (auto& line : juce::StringArray::fromLines (props.getUserSettings()->getValue ("pluginScaleModes")))
+        if (line.fromFirstOccurrenceOf ("|", false, false) == id)
+            return (PluginScaleMode) juce::jlimit (0, 3, line.upToFirstOccurrenceOf ("|", false, false).getIntValue());
+    if (juce::StringArray::fromLines (props.getUserSettings()->getValue ("pluginCompatScaling")).contains (id))
+        return PluginScaleMode::compatibility;
+    return PluginScaleMode::automatic;
 }
 
-void MainComponent::setCompatScaling (const juce::PluginDescription& d, bool on)
+void MainComponent::setScaleMode (const juce::PluginDescription& d, PluginScaleMode mode)
 {
-    auto list = juce::StringArray::fromLines (props.getUserSettings()->getValue ("pluginCompatScaling"));
-    list.removeEmptyStrings();
-    list.removeString (d.createIdentifierString());
-    if (on) list.add (d.createIdentifierString());
-    props.getUserSettings()->setValue ("pluginCompatScaling", list.joinIntoString ("\n"));
-    props.getUserSettings()->saveIfNeeded();
+    const auto id = d.createIdentifierString();
+    auto* settings = props.getUserSettings();
+    auto legacy = juce::StringArray::fromLines (settings->getValue ("pluginCompatScaling"));
+    legacy.removeString (id);
+    legacy.removeEmptyStrings();
+    settings->setValue ("pluginCompatScaling", legacy.joinIntoString ("\n"));
+
+    juce::StringArray lines;
+    for (auto& line : juce::StringArray::fromLines (settings->getValue ("pluginScaleModes")))
+        if (line.isNotEmpty() && line.fromFirstOccurrenceOf ("|", false, false) != id) lines.add (line);
+    if (mode != PluginScaleMode::automatic) lines.add (juce::String ((int) mode) + "|" + id);
+    settings->setValue ("pluginScaleModes", lines.joinIntoString ("\n"));
+    settings->saveIfNeeded();
 }
 
 void MainComponent::openEditor (Channel& c, int slot)
@@ -1202,7 +1291,7 @@ void MainComponent::openEditor (Channel& c, int slot)
     for (auto& w : pluginWindows)
         if (&w->processor == p) { w->setVisible (true); w->toFront (true); return; }
 
-    const bool compat = insert.hasDescription && usesCompatScaling (insert.description);
+    const auto scaleMode = insert.hasDescription ? scaleModeFor (insert.description) : PluginScaleMode::automatic;
     auto* cp = &c;
     juce::Component::SafePointer<MainComponent> self (this);
     pluginWindows.push_back (std::make_unique<PluginWindow> (*p, c.name + " - " + p->getName(), [self, cp] (PluginWindow* w)
@@ -1216,7 +1305,7 @@ void MainComponent::openEditor (Channel& c, int slot)
                 if (it->get() == w) { v.erase (it); break; }
             if (auto* s = sp->stripFor (cp)) s->refresh();
         });
-    }, compat));
+    }, scaleMode));
     if (auto* s = stripFor (&c)) s->refresh();
 }
 
@@ -1599,56 +1688,376 @@ void MainComponent::startResampleIfNeeded()
     });
 }
 
+namespace
+{
+//==============================================================================
+/** Dialogo de exportacao de faixas individuais (stems). */
+class StemExportPanel : public juce::Component
+{
+public:
+    std::function<void (Engine::StemExport)> onExport;
+
+    StemExportPanel (Engine& e, bool selectionOnly, const juce::String& prefixName)
+        : engine (e), prefix (prefixName)
+    {
+        title.setText ("Exportar faixas individuais", juce::dontSendNotification);
+        title.setFont (uiFont (17.0f, true));
+        addAndMakeVisible (title);
+
+        const double sr = engine.getSampleRate();
+        const bool hasSel = engine.hasSelection();
+        rangeBox.addItem (juce::String::fromUTF8 ("M\xc3\xbasica inteira"), 1);
+        rangeBox.addItem (juce::String::fromUTF8 ("S\xc3\xb3 a sele\xc3\xa7\xc3\xa3o (") + timeText (engine.loopStart.load(), sr)
+                              + " - " + timeText (engine.loopEnd.load(), sr) + ")", 2);
+        rangeBox.setItemEnabled (2, hasSel);
+        rangeBox.setSelectedId (selectionOnly && hasSel ? 2 : 1, juce::dontSendNotification);
+        rangeBox.onChange = [this] { tailToggle.setToggleState (rangeBox.getSelectedId() == 1, juce::dontSendNotification); };
+
+        modeBox.addItem (juce::String::fromUTF8 ("Com processamento (inserts, volume, pan, automa\xc3\xa7\xc3\xa3o)"), 1);
+        modeBox.addItem (juce::String::fromUTF8 ("\xc3\x81udio original da faixa (sem processamento)"), 2);
+        modeBox.setSelectedId (1, juce::dontSendNotification);
+        modeBox.onChange = [this] { updateEnablement(); };
+
+        formatBox.addItem ("WAV 24 bits", 24);
+        formatBox.addItem ("WAV 16 bits (com dither)", 16);
+        formatBox.addItem ("WAV 32 bits float", 32);
+        formatBox.setSelectedId (24, juce::dontSendNotification);
+
+        tailToggle.setButtonText ("Incluir 3 s de cauda no fim (reverb/delay)");
+        tailToggle.setToggleState (rangeBox.getSelectedId() == 1, juce::dontSendNotification);
+        busToggle.setButtonText ("Exportar os buses (cada bus com tudo que chega nele)");
+        info.setText (juce::String::fromUTF8 ("Com processamento: cada faixa sai como soa na mix, sem buses e sem o master. "
+                                              "Solo \xc3\xa9 ignorado; faixas em mute saem em sil\xc3\xaancio. "
+                                              "Todas as faixas come\xc3\xa7" "am no mesmo ponto (alinhadas)."),
+                      juce::dontSendNotification);
+        info.setFont (uiFont (12.0f));
+        info.setColour (juce::Label::textColourId, colours::textDim);
+        info.setJustificationType (juce::Justification::topLeft);
+
+        for (auto* c : std::initializer_list<juce::Component*> { &rangeBox, &modeBox, &formatBox, &tailToggle, &busToggle, &info,
+                                                                 &allButton, &noneButton, &exportButton, &cancelButton, &tracksView })
+            addAndMakeVisible (c);
+        for (auto* l : { &rangeLabel, &modeLabel, &formatLabel, &tracksLabel })
+        {
+            l->setFont (uiFont (13.0f, true));
+            addAndMakeVisible (l);
+        }
+
+        for (auto& t : engine.tracks)
+        {
+            auto* b = trackToggles.add (new juce::ToggleButton (t->name.isNotEmpty() ? t->name : juce::String ("Faixa")));
+            b->setToggleState (t->sourceChannels > 0 && ! t->mute.load(), juce::dontSendNotification);
+            b->setColour (juce::ToggleButton::tickColourId, t->colour);
+            trackPtrs.push_back (t.get());
+            tracksContent.addAndMakeVisible (b);
+        }
+        tracksView.setViewedComponent (&tracksContent, false);
+        tracksView.setScrollBarsShown (true, false);
+        allButton.onClick = [this] { for (auto* b : trackToggles) b->setToggleState (true, juce::dontSendNotification); };
+        noneButton.onClick = [this] { for (auto* b : trackToggles) b->setToggleState (false, juce::dontSendNotification); };
+        cancelButton.onClick = [this] { close(); };
+        exportButton.onClick = [this] { submit(); };
+        updateEnablement();
+        setSize (560, 600);
+    }
+
+    ~StemExportPanel() override { tracksView.setViewedComponent (nullptr, false); }
+
+    void paint (juce::Graphics& g) override { g.fillAll (colours::background); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (18);
+        title.setBounds (r.removeFromTop (28));
+        r.removeFromTop (8);
+        auto row = [&r] (juce::Label& l, juce::Component& c)
+        {
+            auto line = r.removeFromTop (28);
+            l.setBounds (line.removeFromLeft (90));
+            c.setBounds (line);
+            r.removeFromTop (6);
+        };
+        row (rangeLabel, rangeBox);
+        row (modeLabel, modeBox);
+        row (formatLabel, formatBox);
+        tailToggle.setBounds (r.removeFromTop (24).withTrimmedLeft (90));
+        busToggle.setBounds (r.removeFromTop (24).withTrimmedLeft (90));
+        r.removeFromTop (4);
+        info.setBounds (r.removeFromTop (48));
+        auto buttons = r.removeFromBottom (32);
+        cancelButton.setBounds (buttons.removeFromRight (110));
+        buttons.removeFromRight (8);
+        exportButton.setBounds (buttons.removeFromRight (150));
+        r.removeFromBottom (10);
+        auto head = r.removeFromTop (26);
+        tracksLabel.setBounds (head.removeFromLeft (120));
+        noneButton.setBounds (head.removeFromRight (80));
+        head.removeFromRight (6);
+        allButton.setBounds (head.removeFromRight (80));
+        r.removeFromTop (4);
+        tracksView.setBounds (r);
+        const int w = r.getWidth() - tracksView.getScrollBarThickness() - 4;
+        const int colW = w / 2;
+        for (int i = 0; i < trackToggles.size(); ++i)
+            trackToggles[i]->setBounds ((i % 2) * colW, (i / 2) * 24, colW - 6, 22);
+        tracksContent.setSize (w, ((trackToggles.size() + 1) / 2) * 24);
+    }
+
+private:
+    void updateEnablement()
+    {
+        const bool processed = modeBox.getSelectedId() == 1;
+        tailToggle.setEnabled (processed);
+        busToggle.setEnabled (processed && ! engine.buses.empty());
+    }
+
+    void close()
+    {
+        if (auto* dw = findParentComponentOfClass<juce::DialogWindow>()) dw->exitModalState (0);
+    }
+
+    void submit()
+    {
+        Engine::StemExport req;
+        req.prefix = prefix;
+        req.bitDepth = formatBox.getSelectedId();
+        req.processed = modeBox.getSelectedId() == 1;
+        req.tailSeconds = req.processed && tailToggle.getToggleState() ? 3.0 : 0.0;
+        if (rangeBox.getSelectedId() == 2 && engine.hasSelection())
+        {
+            req.rangeStart = engine.loopStart.load();
+            req.rangeEnd = engine.loopEnd.load();
+        }
+        for (size_t i = 0; i < trackPtrs.size(); ++i)
+        {
+            if (! trackToggles[(int) i]->getToggleState()) continue;
+            for (size_t ti = 0; ti < engine.tracks.size(); ++ti)
+                if (engine.tracks[ti].get() == trackPtrs[i]) req.tracks.push_back ((int) ti);
+        }
+        if (req.processed && busToggle.getToggleState())
+            for (int bi = 0; bi < (int) engine.buses.size(); ++bi) req.buses.push_back (bi);
+        if (req.tracks.empty() && req.buses.empty())
+        {
+            juce::AlertWindow::showAsync (juce::MessageBoxOptions().withIconType (juce::MessageBoxIconType::InfoIcon)
+                                              .withTitle ("Exportar faixas").withMessage ("Marque pelo menos uma faixa.").withButton ("OK"),
+                                          nullptr);
+            return;
+        }
+        auto cb = onExport;
+        close(); // o painel e destruido junto com o dialogo
+        if (cb) cb (std::move (req));
+    }
+
+    Engine& engine;
+    juce::String prefix;
+    juce::Label title, info;
+    juce::Label rangeLabel { {}, "Trecho" }, modeLabel { {}, juce::String::fromUTF8 ("Conte\xc3\xba" "do") },
+                formatLabel { {}, "Formato" }, tracksLabel { {}, "Faixas" };
+    juce::ComboBox rangeBox, modeBox, formatBox;
+    juce::ToggleButton tailToggle, busToggle;
+    juce::TextButton allButton { "Todas" }, noneButton { "Nenhuma" }, exportButton { "Escolher pasta..." }, cancelButton { "Cancelar" };
+    juce::Viewport tracksView;
+    juce::Component tracksContent;
+    juce::OwnedArray<juce::ToggleButton> trackToggles;
+    std::vector<const Track*> trackPtrs;
+};
+} // namespace
+
 void MainComponent::exportDialog()
 {
     if (engine.tracks.empty()) { alert ("Exportar", "Importe alguma faixa antes de exportar."); return; }
+    const double sr = engine.getSampleRate();
+    const bool hasSel = engine.hasSelection();
+    const auto ls = engine.loopStart.load(), le = engine.loopEnd.load();
     juce::PopupMenu m;
-    m.addSectionHeader ("Exportar mix (" + juce::String (engine.getSampleRate() / 1000.0, 1) + " kHz, estereo)");
+    m.addSectionHeader (juce::String::fromUTF8 ("Mix est\xc3\xa9reo - m\xc3\xbasica inteira (") + juce::String (sr / 1000.0, 1) + " kHz)");
     m.addItem (24, "WAV 24 bits");
     m.addItem (16, "WAV 16 bits (com dither)");
     m.addItem (32, "WAV 32 bits float");
-    const auto ls = engine.loopStart.load(), le = engine.loopEnd.load();
-    if (le > ls)
+    if (hasSel)
     {
-        juce::PopupMenu loopMenu;
-        loopMenu.addItem (124, "WAV 24 bits");
-        loopMenu.addItem (116, "WAV 16 bits (com dither)");
-        loopMenu.addItem (132, "WAV 32 bits float");
-        const double sr = engine.getSampleRate();
-        m.addSeparator();
-        m.addSubMenu (juce::String::fromUTF8 ("S\xc3\xb3 a regi\xc3\xa3o do loop (") + timeText (ls, sr) + " - " + timeText (le, sr) + ")", loopMenu);
+        m.addSectionHeader (juce::String::fromUTF8 ("Mix est\xc3\xa9reo - s\xc3\xb3 a sele\xc3\xa7\xc3\xa3o (") + timeText (ls, sr) + " - " + timeText (le, sr) + ")");
+        m.addItem (124, "WAV 24 bits");
+        m.addItem (116, "WAV 16 bits (com dither)");
+        m.addItem (132, "WAV 32 bits float");
     }
+    m.addSeparator();
+    m.addItem (200, "Faixas individuais (stems)...");
+    if (hasSel) m.addItem (201, juce::String::fromUTF8 ("Faixas individuais s\xc3\xb3 da sele\xc3\xa7\xc3\xa3o..."));
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&exportButton), [this, ls, le] (int choice)
     {
         if (choice == 0) return;
-        const bool loopOnly = choice > 100;
-        const int bits = choice % 100;
-        const juce::int64 rangeStart = loopOnly ? ls : 0, rangeEnd = loopOnly ? le : -1;
-        auto start = currentFile != juce::File() ? currentFile.withFileExtension (".wav")
-                                                 : juce::File::getSpecialLocation (juce::File::userMusicDirectory).getChildFile ("Mix.wav");
-        chooser = std::make_unique<juce::FileChooser> ("Exportar mix", start, "*.wav");
-        chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
-                                  | juce::FileBrowserComponent::warnAboutOverwriting,
-                              [this, bits, rangeStart, rangeEnd] (const juce::FileChooser& fc)
+        if (choice >= 200) { stemsDialog (choice == 201); return; }
+        const bool selectionOnly = choice > 100;
+        exportMixTo (choice % 100, selectionOnly ? ls : 0, selectionOnly ? le : -1);
+    });
+}
+
+void MainComponent::exportMixTo (int bits, juce::int64 rangeStart, juce::int64 rangeEnd)
+{
+    if (engine.tracks.empty()) { alert ("Exportar", "Importe alguma faixa antes de exportar."); return; }
+    auto base = currentFile != juce::File() ? currentFile.getFileNameWithoutExtension() : juce::String ("Mix");
+    if (rangeEnd >= 0) base << juce::String::fromUTF8 (" - trecho ") << timeText (rangeStart, engine.getSampleRate()).replaceCharacter (':', '.');
+    auto folder = currentFile != juce::File() ? currentFile.getParentDirectory()
+                                              : juce::File::getSpecialLocation (juce::File::userMusicDirectory);
+    auto start = folder.getChildFile (juce::File::createLegalFileName (base) + ".wav");
+    chooser = std::make_unique<juce::FileChooser> ("Exportar mix", start, "*.wav");
+    chooser->launchAsync (juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles
+                              | juce::FileBrowserComponent::warnAboutOverwriting,
+                          [this, bits, rangeStart, rangeEnd] (const juce::FileChooser& fc)
+    {
+        auto file = fc.getResult();
+        if (file == juce::File()) return;
+        file = file.withFileExtension (".wav");
+        struct Result { bool ok = false, clipped = false; juce::String error; };
+        auto res = std::make_shared<Result>();
+        closeAllEditors(); // evita repintar editores durante o render offline
+        runJob ("Exportando " + file.getFileName() + "...", true,
+                [this, res, file, bits, rangeStart, rangeEnd] (Job& j)
+                { res->ok = engine.exportMix (file, bits, 3.0, j.progress, j.cancel, res->error, res->clipped, rangeStart, rangeEnd); },
+                [this, res, file] (Job&)
         {
-            auto file = fc.getResult();
-            if (file == juce::File()) return;
-            file = file.withFileExtension (".wav");
-            struct Result { bool ok = false, clipped = false; juce::String error; };
-            auto res = std::make_shared<Result>();
-            closeAllEditors(); // evita repintar editores durante o render offline
-            runJob ("Exportando " + file.getFileName() + "...", true,
-                    [this, res, file, bits, rangeStart, rangeEnd] (Job& j)
-                    { res->ok = engine.exportMix (file, bits, 3.0, j.progress, j.cancel, res->error, res->clipped, rangeStart, rangeEnd); },
-                    [this, res, file] (Job&)
-            {
-                refreshStrips();
-                if (! res->ok) { alert ("Exportar", res->error); return; }
-                juce::String msg = "Mix exportada:\n" + file.getFullPathName();
-                if (res->clipped) msg << "\n\nAtencao: a mix passou de 0 dBFS (clipping). Abaixe o master ou use um limitador.";
-                alert ("Exportar", msg, res->clipped);
-            });
+            refreshStrips();
+            if (! res->ok) { alert ("Exportar", res->error); return; }
+            juce::String msg = "Mix exportada:\n" + file.getFullPathName();
+            if (res->clipped) msg << "\n\nAtencao: a mix passou de 0 dBFS (clipping). Abaixe o master ou use um limitador.";
+            alert ("Exportar", msg, res->clipped);
         });
+    });
+}
+
+void MainComponent::stemsDialog (bool selectionOnly)
+{
+    if (engine.tracks.empty()) { alert ("Exportar", "Importe alguma faixa antes de exportar."); return; }
+    auto* panel = new StemExportPanel (engine, selectionOnly,
+                                       currentFile != juce::File() ? currentFile.getFileNameWithoutExtension() : juce::String ("Stems"));
+    juce::Component::SafePointer<MainComponent> self (this);
+    panel->onExport = [self] (Engine::StemExport req)
+    {
+        // depois que o dialogo fechou
+        juce::MessageManager::callAsync ([self, req]
+        {
+            if (self != nullptr) self->runStemExport (req);
+        });
+    };
+    juce::DialogWindow::LaunchOptions o;
+    o.content.setOwned (panel);
+    o.dialogTitle = "Exportar faixas individuais";
+    o.dialogBackgroundColour = colours::background;
+    o.useNativeTitleBar = true;
+    o.resizable = false;
+    o.escapeKeyTriggersCloseButton = true;
+    o.componentToCentreAround = this;
+    o.launchAsync();
+}
+
+void MainComponent::runStemExport (Engine::StemExport request)
+{
+    auto start = currentFile != juce::File() ? currentFile.getParentDirectory()
+                                             : juce::File::getSpecialLocation (juce::File::userMusicDirectory);
+    chooser = std::make_unique<juce::FileChooser> (juce::String::fromUTF8 ("Pasta onde criar a pasta das faixas"), start);
+    chooser->launchAsync (juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectDirectories,
+                          [this, request] (const juce::FileChooser& fc) mutable
+    {
+        const auto parent = fc.getResult();
+        if (parent == juce::File()) return;
+        // Sempre numa pasta nova: nunca sobrescreve arquivos existentes.
+        juce::String folderName = request.prefix + " - faixas";
+        if (request.rangeEnd >= 0)
+            folderName << " " << timeText (request.rangeStart, engine.getSampleRate()).replaceCharacter (':', '.')
+                       << " a " << timeText (request.rangeEnd, engine.getSampleRate()).replaceCharacter (':', '.');
+        request.folder = parent.getNonexistentChildFile (juce::File::createLegalFileName (folderName), {}, true);
+
+        struct Result { bool ok = false; juce::String error; juce::StringArray written, clipped; };
+        auto res = std::make_shared<Result>();
+        closeAllEditors();
+        runJob ("Exportando " + juce::String ((int) (request.tracks.size() + request.buses.size())) + " faixas...", true,
+                [this, res, request] (Job& j)
+                { res->ok = engine.exportStems (request, j.progress, j.cancel, res->error, res->written, res->clipped); },
+                [this, res, folder = request.folder] (Job&)
+        {
+            refreshStrips();
+            if (! res->ok)
+            {
+                alert ("Exportar faixas", res->error);
+                // trabalho cancelado/falhou: nao deixa pasta vazia para tras
+                if (folder.isDirectory() && folder.getNumberOfChildFiles (juce::File::findFilesAndDirectories) == 0)
+                    folder.deleteFile();
+                return;
+            }
+            juce::String msg = juce::String (res->written.size()) + " arquivos exportados em:\n" + folder.getFullPathName();
+            if (! res->clipped.isEmpty())
+                msg << "\n\nPassaram de 0 dBFS (clipping): " << res->clipped.joinIntoString (", ")
+                    << "\nUse 32 bits float ou abaixe o volume dessas faixas.";
+            juce::AlertWindow::showAsync (juce::MessageBoxOptions()
+                                              .withIconType (res->clipped.isEmpty() ? juce::MessageBoxIconType::InfoIcon
+                                                                                     : juce::MessageBoxIconType::WarningIcon)
+                                              .withTitle ("Exportar faixas")
+                                              .withMessage (msg)
+                                              .withButton ("Abrir pasta")
+                                              .withButton ("OK"),
+                                          [folder] (int r) { if (r == 1) folder.startAsProcess(); });
+        });
+    });
+}
+
+void MainComponent::selectWholeSong()
+{
+    const auto len = juce::jmax (engine.getLengthSamples(), (juce::int64) (engine.getSampleRate() * 8));
+    engine.setLoop (0, len);
+}
+
+void MainComponent::playSelection()
+{
+    if (! engine.hasSelection())
+    {
+        alert (juce::String::fromUTF8 ("Tocar sele\xc3\xa7\xc3\xa3o"),
+               juce::String::fromUTF8 ("Arraste na r\xc3\xa9gua do tempo para selecionar um trecho."), false);
+        return;
+    }
+    const auto ls = engine.loopStart.load(), le = engine.loopEnd.load();
+    engine.playing = false;
+    playStart = ls;
+    engine.stopReturn = ls;
+    engine.stopAt = engine.loopOn.load() ? -1 : le; // com loop, repete; sem loop, para no fim
+    engine.position = ls;
+    engine.playing = true;
+}
+
+void MainComponent::timelineMenu (juce::Component&)
+{
+    const double sr = engine.getSampleRate();
+    const bool hasSel = engine.hasSelection();
+    const auto ls = engine.loopStart.load(), le = engine.loopEnd.load();
+    juce::PopupMenu m;
+    m.addSectionHeader (hasSel ? juce::String::fromUTF8 ("Sele\xc3\xa7\xc3\xa3o ") + timeText (ls, sr) + " - " + timeText (le, sr)
+                               : juce::String::fromUTF8 ("Nenhum trecho (arraste na r\xc3\xa9gua para selecionar)"));
+    m.addItem (1, juce::String::fromUTF8 ("Tocar sele\xc3\xa7\xc3\xa3o (Shift+Espa\xc3\xa7o, duplo clique)"), hasSel);
+    m.addItem (2, juce::String::fromUTF8 ("Repetir a sele\xc3\xa7\xc3\xa3o - loop (L)"), hasSel, engine.loopOn.load());
+    m.addSeparator();
+    juce::PopupMenu mix;
+    mix.addItem (124, "WAV 24 bits");
+    mix.addItem (116, "WAV 16 bits (com dither)");
+    mix.addItem (132, "WAV 32 bits float");
+    m.addSubMenu (juce::String::fromUTF8 ("Exportar mix da sele\xc3\xa7\xc3\xa3o"), mix, hasSel);
+    m.addItem (3, juce::String::fromUTF8 ("Exportar faixas individuais da sele\xc3\xa7\xc3\xa3o..."), hasSel);
+    m.addSeparator();
+    m.addItem (4, juce::String::fromUTF8 ("Selecionar a m\xc3\xbasica toda"));
+    m.addItem (5, juce::String::fromUTF8 ("Selecionar do in\xc3\xad" "cio at\xc3\xa9 o cursor"), engine.position.load() > 0);
+    m.addItem (6, juce::String::fromUTF8 ("Limpar sele\xc3\xa7\xc3\xa3o (Esc)"), hasSel);
+    m.showMenuAsync (juce::PopupMenu::Options().withMousePosition(), [this, ls, le] (int r)
+    {
+        switch (r)
+        {
+            case 1: playSelection(); break;
+            case 2: loopButton.triggerClick(); break;
+            case 3: stemsDialog (true); break;
+            case 4: selectWholeSong(); markDirty(); break;
+            case 5: engine.setLoop (0, engine.position.load()); markDirty(); break;
+            case 6: engine.clearSelection(); markDirty(); break;
+            case 124: case 116: case 132: exportMixTo (r % 100, ls, le); break;
+            default: break;
+        }
     });
 }
 

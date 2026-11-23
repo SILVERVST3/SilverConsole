@@ -983,6 +983,166 @@ static void testRealtimeMulticore()
                  512.0 * 1000.0 / 48000.0, one, many, one / juce::jmax (0.001, many));
 }
 
+// Buses com inserts processados em paralelo: identico ao processamento serial.
+static void testParallelBuses()
+{
+    auto build = [] (Engine& e)
+    {
+        e.prepare (48000.0, 256);
+        for (int b = 0; b < 6; ++b)
+        {
+            auto* bus = e.addBus ("B" + juce::String (b));
+            auto p = std::make_unique<InternalDelay> (5 + b * 9);
+            e.prepareProcessor (*p);
+            e.setInsert (*bus, 0, std::move (p), nullptr);
+            bus->gainDb = -1.0f * (float) b;
+            bus->pan = 0.2f * (float) b - 0.5f;
+        }
+        for (int i = 0; i < 10; ++i)
+        {
+            auto* t = addTrack (e, makeBuffer (2, 24000, [i] (int ch, int s)
+                                { return 0.03f * std::sin ((float) s * (0.002f + 0.0007f * (float) i) + (float) ch); }), "t" + juce::String (i));
+            t->outputBus = i % 7 - 1; // -1 = master
+            t->sends[0].bus = (i + 2) % 6;
+            t->sends[0].levelDb = -6.0f;
+            t->sends[1].bus = (i + 4) % 6;
+            t->sends[1].preFader = true;
+        }
+    };
+    Engine serial, parallel;
+    build (serial); build (parallel);
+    serial.setMultiCore (false);
+    parallel.setMultiCore (true);
+    const auto a = run (serial, 16000), b = run (parallel, 16000);
+    float maxDiff = 0.0f;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int i = 0; i < 16000; ++i) maxDiff = juce::jmax (maxDiff, std::abs (a.getSample (ch, i) - b.getSample (ch, i)));
+    check (maxDiff == 0.0f && a.getMagnitude (0, 16000) > 0.01f, "buses em paralelo: identico ao serial");
+}
+
+// "Tocar selecao" sem loop: para no fim do trecho (silencio depois) e volta ao inicio.
+static void testSelectionPlayback()
+{
+    Engine e; e.prepare (48000, 256);
+    addTrack (e, makeBuffer (1, 48000, [] (int, int) { return 0.5f; }), "dc");
+    e.setLoop (1000, 6500);
+    check (e.hasSelection(), "selecao definida");
+    e.loopOn = false;
+    e.stopReturn = 1000;
+    e.stopAt = 6500;
+    e.position = 1000;
+    e.playing = true;
+    juce::AudioBuffer<float> out (2, 1000);
+    juce::AudioIODeviceCallbackContext ctx;
+    for (int k = 0; k < 5; ++k) e.audioDeviceIOCallbackWithContext (nullptr, 0, out.getArrayOfWritePointers(), 2, 1000, ctx);
+    check (e.playing.load() && e.position.load() == 6000, "toca o trecho (" + juce::String (e.position.load()) + ")");
+    e.audioDeviceIOCallbackWithContext (nullptr, 0, out.getArrayOfWritePointers(), 2, 1000, ctx);
+    check (out.getSample (0, 499) > 0.1f && out.getSample (0, 500) == 0.0f && out.getSample (0, 999) == 0.0f,
+           "silencio exatamente apos o fim da selecao");
+    check (! e.playing.load() && e.position.load() == 1000 && e.stopAt.load() == -1, "para sozinho e volta ao inicio do trecho");
+
+    // com loop ligado, o fim nao para o transporte
+    e.loopOn = true; e.stopAt = 6500; e.position = 6000; e.playing = true;
+    e.audioDeviceIOCallbackWithContext (nullptr, 0, out.getArrayOfWritePointers(), 2, 1000, ctx);
+    check (e.playing.load() && e.position.load() == 1500, "com loop a selecao repete (" + juce::String (e.position.load()) + ")");
+    e.clearSelection();
+    check (! e.hasSelection() && ! e.loopOn.load(), "limpar selecao");
+}
+
+// Stems: uma passada, alinhados, solo ignorado, mute respeitado, buses opcionais.
+static void testStemExport()
+{
+    Engine e; e.prepare (48000, 256);
+    auto* a = addTrack (e, makeBuffer (2, 48000, [] (int ch, int i) { return 0.2f * std::sin ((float) i * 0.01f + (float) ch); }), "Bateria");
+    auto* b = addTrack (e, makeBuffer (1, 48000, [] (int, int i) { return 0.3f * std::sin ((float) i * 0.0037f); }), "Baixo");
+    auto* c = addTrack (e, makeBuffer (1, 48000, [] (int, int) { return 0.4f; }), "Mudo");
+    auto* bus = e.addBus ("Grupo");
+    {
+        auto p = std::make_unique<InternalDelay> (37); // latencia na faixa: PDC
+        e.prepareProcessor (*p);
+        e.setInsert (*a, 0, std::move (p), nullptr);
+        auto q = std::make_unique<InternalDelay> (11); // latencia no bus
+        e.prepareProcessor (*q);
+        e.setInsert (*bus, 0, std::move (q), nullptr);
+    }
+    a->gainDb = -3.0f; a->pan = -0.4f;
+    b->pan = 0.3f; b->outputBus = 0;
+    bus->gainDb = -2.0f;
+    c->mute = true;
+    a->solo = true; // solo nao pode silenciar os outros stems
+
+    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_stems_test");
+    dir.deleteRecursively();
+    std::atomic<float> progress { 0 }; std::atomic<bool> cancel { false };
+    juce::String err;
+    juce::StringArray written, clipped;
+    Engine::StemExport req;
+    req.folder = dir; req.prefix = "Teste"; req.bitDepth = 32;
+    req.rangeStart = 4800; req.rangeEnd = 4800 + 9600;
+    req.tracks = { 0, 1, 2 }; req.buses = { 0 };
+    check (e.exportStems (req, progress, cancel, err, written, clipped), "exportar stems processados " + err);
+    check (written.size() == 4 && dir.getChildFile ("Teste - 01 - Bateria.wav").existsAsFile()
+           && dir.getChildFile ("Teste - 04 - BUS Grupo.wav").existsAsFile(), "4 arquivos com nomes numerados");
+    check (a->solo.load() && ! e.rendering.load(), "estado do mixer preservado");
+
+    juce::AudioFormatManager fm; registerAudioFormats (fm);
+    auto load = [&fm] (const juce::File& f) { return loadAudioFile (fm, f); };
+    auto stemA = load (dir.getChildFile ("Teste - 01 - Bateria.wav"));
+    auto stemB = load (dir.getChildFile ("Teste - 02 - Baixo.wav"));
+    auto stemC = load (dir.getChildFile ("Teste - 03 - Mudo.wav"));
+    auto stemBus = load (dir.getChildFile ("Teste - 04 - BUS Grupo.wav"));
+    check (stemA.ok() && stemB.ok() && stemC.ok() && stemBus.ok() && stemA.original->getNumSamples() == 9600
+           && stemBus.original->getNumSamples() == 9600, "stems com o tamanho do trecho");
+
+    // referencia: a mix exportada com so a faixa em solo (master sem processamento)
+    auto mixOf = [&] (Track* solo, const juce::String& name)
+    {
+        for (auto& t : e.tracks) t->solo = t.get() == solo;
+        auto f = dir.getChildFile (name);
+        bool clip = false;
+        e.exportMix (f, 32, 0.0, progress, cancel, err, clip, req.rangeStart, req.rangeEnd);
+        return load (f);
+    };
+    auto mixA = mixOf (a, "mixA.wav");
+    auto mixB = mixOf (b, "mixB.wav");
+    float dA = 0.0f, dBus = 0.0f, dB = 0.0f;
+    const float busGain = juce::Decibels::decibelsToGain (-2.0f);
+    if (stemA.ok() && mixA.ok() && stemB.ok() && mixB.ok() && stemBus.ok())
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < 9600; ++i)
+            {
+                dA = juce::jmax (dA, std::abs (stemA.original->getSample (ch, i) - mixA.original->getSample (ch, i)));
+                dBus = juce::jmax (dBus, std::abs (stemBus.original->getSample (ch, i) - mixB.original->getSample (ch, i)));
+                dB = juce::jmax (dB, std::abs (stemB.original->getSample (ch, i) * busGain - mixB.original->getSample (ch, i)));
+            }
+    check (dA < 1.0e-6f && stemA.original->getMagnitude (0, 9600) > 0.05f, "stem da faixa = faixa na mix (PDC alinhado) dif " + juce::String (dA, 8) + " pico " + juce::String (stemA.ok() ? stemA.original->getMagnitude (0, 9600) : -1.0f) + " mix " + juce::String (mixA.ok() ? mixA.original->getMagnitude (0, 9600) : -1.0f));
+    check (dBus < 1.0e-6f, "stem do bus = bus na mix dif " + juce::String (dBus, 8));
+    check (dB < 1.0e-5f, "faixa roteada ao bus sai antes do bus (pos-fader)");
+    check (stemC.ok() && stemC.original->getMagnitude (0, 9600) == 0.0f, "faixa em mute sai em silencio");
+
+    // audio original: mono continua mono, identico ao arquivo no trecho
+    Engine::StemExport raw = req;
+    raw.processed = false; raw.prefix = "Orig"; raw.tracks = { 1 }; raw.buses.clear();
+    check (e.exportStems (raw, progress, cancel, err, written, clipped), "exportar audio original " + err);
+    auto rawB = load (dir.getChildFile ("Orig - 01 - Baixo.wav"));
+    float dRaw = 1.0f;
+    if (rawB.ok() && rawB.original->getNumChannels() == 1 && rawB.original->getNumSamples() == 9600)
+    {
+        dRaw = 0.0f;
+        for (int i = 0; i < 9600; ++i)
+            dRaw = juce::jmax (dRaw, std::abs (rawB.original->getSample (0, i) - b->playback->getSample (0, 4800 + i)));
+    }
+    check (dRaw == 0.0f, "audio original mono, identico ao trecho do arquivo");
+
+    // trecho vazio e cancelamento
+    Engine::StemExport empty = req; empty.rangeStart = 100; empty.rangeEnd = 100;
+    check (! e.exportStems (empty, progress, cancel, err, written, clipped), "trecho vazio recusado");
+    cancel = true;
+    Engine::StemExport cancelled = req; cancelled.folder = dir.getChildFile ("cancel");
+    check (! e.exportStems (cancelled, progress, cancel, err, written, clipped) && ! e.rendering.load(), "cancelar encerra o render");
+    dir.deleteRecursively();
+}
+
 // Inserts e envios dinamicos (botao "+"), 16 buses e persistencia no projeto.
 static void testDynamicSlots()
 {
@@ -1295,6 +1455,9 @@ int main (int argc, char** argv)
     test128TrackStress();
     testMulticoreOfflineMix();
     testRealtimeMulticore();
+    testParallelBuses();
+    testSelectionPlayback();
+    testStemExport();
     testDynamicSlots();
     testDiskStreaming();
     testStereoBalanceMuteSolo();

@@ -156,8 +156,37 @@ public:
         g.drawText ("TEMPO", 10, 0, headerW - 20, getHeight(), juce::Justification::centredLeft);
     }
 
-    void mouseDown (const juce::MouseEvent& e) override { seek (e); }
-    void mouseDrag (const juce::MouseEvent& e) override { seek (e); }
+    // clique posiciona; arrastar seleciona um trecho (Shift liga o loop);
+    // duplo clique toca a selecao; botao direito abre o menu do trecho.
+    void mouseDown (const juce::MouseEvent& e) override
+    {
+        selecting = false;
+        if (e.x < headerW) return;
+        if (e.mods.isPopupMenu()) { owner.host.timelineMenu (*this); return; }
+        anchor = sampleAt (e);
+        seek (e);
+    }
+    void mouseDrag (const juce::MouseEvent& e) override
+    {
+        if (e.x < headerW && ! selecting) return;
+        if (e.mods.isPopupMenu()) return;
+        if (! selecting && e.getDistanceFromDragStart() > 4) selecting = true;
+        if (! selecting) return;
+        owner.engine.setLoop (anchor, sampleAt (e));
+        if (e.mods.isShiftDown()) owner.engine.loopOn = true;
+        owner.repaint();
+    }
+    void mouseUp (const juce::MouseEvent&) override
+    {
+        if (selecting) owner.host.markDirty();
+        selecting = false;
+    }
+    void mouseDoubleClick (const juce::MouseEvent& e) override
+    {
+        const auto s = sampleAt (e);
+        if (owner.engine.hasSelection() && s >= owner.engine.loopStart.load() && s <= owner.engine.loopEnd.load())
+            owner.host.playSelection();
+    }
     void mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWheelDetails& w) override
     {
         const float ax = (float) headerW, aw = (float) getWidth() - ax;
@@ -166,8 +195,17 @@ public:
     }
 
 private:
+    juce::int64 sampleAt (const juce::MouseEvent& e) const
+    {
+        const float ax = (float) headerW, aw = (float) getWidth() - ax;
+        return (juce::int64) (juce::jmax (0.0, owner.xToTime ((float) e.x, ax, aw)) * owner.engine.getSampleRate());
+    }
+    juce::int64 anchor = 0;
+    bool selecting = false;
+
     void seek (const juce::MouseEvent& e)
     {
+        owner.engine.stopAt = -1;
         if (e.x < headerW) return;
         const float ax = (float) headerW, aw = (float) getWidth() - ax;
         const double t = juce::jmax (0.0, owner.xToTime ((float) e.x, ax, aw));

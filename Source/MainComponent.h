@@ -39,22 +39,31 @@ private:
 };
 
 //==============================================================================
+/** Regua do tempo: clique posiciona o cursor; arrastar seleciona um trecho
+    (Shift+arrastar tambem liga o loop); arrastar as bordas ajusta a selecao;
+    duplo clique na selecao toca o trecho; botao direito abre o menu do trecho. */
 class Timeline : public juce::Component
 {
 public:
     explicit Timeline (Engine& e) : engine (e) {}
     void paint (juce::Graphics&) override;
+    void mouseMove (const juce::MouseEvent&) override;
     void mouseDown (const juce::MouseEvent&) override;
     void mouseDrag (const juce::MouseEvent&) override;
-    std::function<void()> onEdited;
+    void mouseUp (const juce::MouseEvent&) override;
+    void mouseDoubleClick (const juce::MouseEvent&) override;
+    std::function<void()> onEdited, onSelectionChanged, onPlaySelection, onMenu;
 
 private:
+    enum class Drag { none, click, select, startEdge, endEdge, scrub };
+    Drag hitTestDrag (const juce::MouseEvent&) const;
     double visibleSeconds() const;
     juce::int64 xToSample (float x) const;
     float sampleToX (juce::int64 s) const;
     Engine& engine;
     juce::int64 dragAnchor = 0;
-    bool loopDrag = false;
+    Drag drag = Drag::none;
+    bool loopWhileSelecting = false;
 };
 
 //==============================================================================
@@ -138,6 +147,14 @@ private:
     void replaceAudio (Track&);
     void startResampleIfNeeded();
     void exportDialog();
+    /** Mix estereo: escolhe o arquivo e exporta (rangeEnd < 0 = musica inteira). */
+    void exportMixTo (int bits, juce::int64 rangeStart, juce::int64 rangeEnd);
+    /** Faixas individuais (stems): dialogo com faixas, trecho e formato. */
+    void stemsDialog (bool selectionOnly);
+    void runStemExport (Engine::StemExport request);
+    void timelineMenu (juce::Component&) override;
+    void playSelection() override;
+    void selectWholeSong();
 
     // plugins
     void showPluginMenu (Channel&, int slot, juce::Component&, bool replacing);
@@ -146,8 +163,8 @@ private:
                                const juce::MemoryBlock& state = {});
     void loadInserts (Channel&, const ChannelData&, juce::StringArray& problems);
     void openEditor (Channel&, int slot);
-    bool usesCompatScaling (const juce::PluginDescription&) const;
-    void setCompatScaling (const juce::PluginDescription&, bool);
+    PluginScaleMode scaleModeFor (const juce::PluginDescription&) const;
+    void setScaleMode (const juce::PluginDescription&, PluginScaleMode);
     void closeEditor (Channel&, int slot);
     void closeEditorsFor (Channel&);
     void closeAllEditors();
@@ -183,11 +200,11 @@ private:
     IconButton toStartButton { IconButton::Shape::toStart, "Voltar ao inicio (Home)" },
                playButton { IconButton::Shape::play, "Tocar / pausar (Espaco)" },
                stopButton { IconButton::Shape::stop, "Parar e voltar ao ponto de inicio" },
-               loopButton { IconButton::Shape::loop, "Loop (L). Shift+arrastar na regua define a regiao" };
+               loopButton { IconButton::Shape::loop, "Loop da selecao (L). Arraste na regua para selecionar um trecho" };
     Timeline timeline { engine };
     juce::TextButton newButton { "Novo" }, openButton { "Abrir" }, saveButton { "Salvar" },
                      importButton { juce::String::fromUTF8 ("Importar \xc3\xa1udio") }, addBusButton { "+ Bus" },
-                     exportButton { "Exportar mix" }, pluginsButton { "Plugins" }, audioButton { juce::String::fromUTF8 ("\xc3\x81udio") };
+                     exportButton { "Exportar" }, pluginsButton { "Plugins" }, audioButton { juce::String::fromUTF8 ("\xc3\x81udio") };
 
     juce::Viewport mixerViewport;
     juce::Component mixerContent;
@@ -219,6 +236,8 @@ private:
     juce::String unsavedRecoveryId;
     bool quitAfterJob = false; // fechar a janela durante uma tarefa: cancela e fecha ao terminar
     juce::RecentlyOpenedFilesList recentFiles;
+    // gravacao de recuperacao fora da thread da interface (destruida antes dos dados acima)
+    juce::ThreadPool backgroundWrites { juce::ThreadPoolOptions{}.withNumberOfThreads (1).withThreadName ("SilverConsole autosave") };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };

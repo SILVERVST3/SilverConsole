@@ -154,6 +154,10 @@ struct Channel
     AutoMode getAutoMode() const noexcept { return (AutoMode) autoMode.load(); }
 
     // estado de render
+    // Buffers exclusivos do canal (faixas e buses): inserts/PDC independentes,
+    // prealocados fora do callback para processamento paralelo.
+    juce::AudioBuffer<float> processingBuffer;
+    juce::MidiBuffer processingMidi;
     juce::LinearSmoothedValue<float> smoothL, smoothR;
     DelayLine pdc;
     int chainLatency = 0;
@@ -177,10 +181,6 @@ struct Track : Channel
     double originalRate = 0.0;
     std::shared_ptr<const juce::AudioBuffer<float>> playback; // na taxa do motor
     std::shared_ptr<StreamingAudio> diskStream; // prefetch em disco, alternativo ao playback RAM
-    // Buffers exclusivos da faixa: inserts/PDC independentes por canal.
-    // Prealocados fora do callback para viabilizar processamento paralelo.
-    juce::AudioBuffer<float> processingBuffer;
-    juce::MidiBuffer processingMidi;
     double playbackRate = 0.0;
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
@@ -275,6 +275,12 @@ public:
     std::atomic<bool> loopOn { false };
     std::atomic<juce::int64> loopStart { 0 }, loopEnd { 0 };
     void setLoop (juce::int64 start, juce::int64 end);
+    /** "Tocar selecao" sem loop: para sozinho em stopAt e volta para stopReturn.
+        -1 = desligado. A interface zera ao parar/mover o cursor. */
+    std::atomic<juce::int64> stopAt { -1 }, stopReturn { 0 };
+    // A selecao de trecho e a mesma regiao do loop (loopOn liga a repeticao).
+    bool hasSelection() const noexcept { return loopEnd.load() > loopStart.load(); }
+    void clearSelection() noexcept { loopOn = false; stopAt = -1; loopStart = 0; loopEnd = 0; }
 
     juce::int64 getLengthSamples() const noexcept { return lengthSamples.load(); }
     void updateLength();
@@ -338,6 +344,24 @@ public:
                     juce::int64 rangeStart = 0, juce::int64 rangeEnd = -1);
     std::atomic<bool> rendering { false };
 
+    /** Exportacao de faixas individuais (stems) de um trecho.
+        processed = true: cada faixa sai como entra na mix (inserts, volume, pan,
+        automacao, PDC), sem buses/master; solo e ignorado, mute e respeitado.
+        Buses pedidos saem com tudo o que chega neles. Uma unica passada de render.
+        processed = false: audio original da faixa no trecho (mono continua mono). */
+    struct StemExport
+    {
+        juce::File folder;
+        juce::String prefix;
+        int bitDepth = 24;
+        double tailSeconds = 0.0;
+        juce::int64 rangeStart = 0, rangeEnd = -1;
+        bool processed = true;
+        std::vector<int> tracks, buses; // indices
+    };
+    bool exportStems (const StemExport&, std::atomic<float>& progress, std::atomic<bool>& cancel,
+                      juce::String& error, juce::StringArray& written, juce::StringArray& clippedNames);
+
     // AudioIODeviceCallback
     void audioDeviceIOCallbackWithContext (const float* const*, int, float* const* out, int numOut, int n,
                                            const juce::AudioIODeviceCallbackContext&) override;
@@ -355,6 +379,12 @@ private:
     void applyAutomation (Channel&, double timeSec);
 
     void prepareChannel (Channel&);
+    juce::String beginOfflineRender(); // requer lock; erro ou vazio
+    void endOfflineRender();
+    bool remoteFailedDuringRender();
+    struct StemTaps { std::vector<juce::AudioBuffer<float>*> tracks, buses; };
+    StemTaps* stemTaps = nullptr; // so durante exportStems (sob lock)
+    bool snapGains = false;       // proximo render comeca sem rampa de ganho (sob lock)
     void prepareSlot (InsertSlot&);
     int chainLatencyOf (const Channel&) const;
     void runInserts (Channel&, int n, juce::AudioBuffer<float>&, juce::MidiBuffer&);

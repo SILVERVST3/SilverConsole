@@ -173,6 +173,21 @@ if(SILVERCONSOLE_TESTS)
     endif()
     add_dependencies(SilverConsoleTests SCTestPlugin_VST3 ScPluginScanWorker ScDspWorker)
 
+    # Diagnostico manual da janela de plugins (escala/DPI). Nao entra no pacote.
+    # Uso: ScPluginWindowProbe "<plugin.vst3>" log.txt [compat|native|fix] [janela.png]
+    if(WIN32)
+        juce_add_gui_app(ScPluginWindowProbe PRODUCT_NAME "ScPluginWindowProbe")
+        juce_generate_juce_header(ScPluginWindowProbe)
+        target_sources(ScPluginWindowProbe PRIVATE Tests/PluginWindowProbe.cpp)
+        target_include_directories(ScPluginWindowProbe PRIVATE Source)
+        target_compile_definitions(ScPluginWindowProbe PRIVATE ${SC_COMMON_DEFS})
+        target_link_libraries(ScPluginWindowProbe PRIVATE
+            juce::juce_audio_utils juce::juce_audio_processors juce::juce_recommended_config_flags)
+        if(MSVC)
+            target_compile_options(ScPluginWindowProbe PRIVATE /utf-8)
+        endif()
+    endif()
+
     add_test(NAME Engine
         COMMAND SilverConsoleTests
           "$<GENEX_EVAL:$<TARGET_PROPERTY:SCTestPlugin_VST3,JUCE_PLUGIN_ARTEFACT_FILE>>"

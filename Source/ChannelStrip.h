@@ -24,6 +24,9 @@ public:
     // botao "+": mais um slot de insert (qualquer canal) ou de envio (faixa)
     virtual void addInsertSlot (Channel&) = 0;
     virtual void addSendSlot (Track&) = 0;
+    // selecao de trecho (regua do tempo)
+    virtual void timelineMenu (juce::Component&) {}
+    virtual void playSelection() {}
 };
 
 juce::Colour autoModeColour (AutoMode);

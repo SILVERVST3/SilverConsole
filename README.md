@@ -37,7 +37,7 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Se um plugin travar durante o escaneamento, ele é pulado na próxima vez.
 - Clique num slot vazio para escolher um plugin no menu, agrupado por fabricante.
 - Clique num slot ocupado para abrir o editor do plugin. **Shift+clique** liga o bypass. O botão direito abre o menu: bypass, substituir, mover para cima/baixo e remover.
-- **Janela do plugin**: se o editor for maior que a tela, ele aparece com barras de rolagem e a janela cabe no monitor (com bordas para redimensionar). Se um plugin abrir gigante ou minúsculo (escala do Windows em 125%/150%/200%), use no menu do insert **Janela em modo compatível de escala**: o Windows passa a ajustar a janela daquele plugin (a opção fica salva por plugin).
+- **Janela do plugin**: alguns plugins aplicam a escala do Windows duas vezes e abriam gigantes (BSA Drum Bus num monitor 4K a 250% abria com 625%). A janela detecta isso e corrige sozinha; plugins redimensionáveis que ainda não cabem são reduzidos para caber no monitor (com bordas para redimensionar). Plugins não redimensionáveis maiores que a tela ficam com barras de rolagem. No menu do insert, **Escala da janela** permite escolher por plugin: *Automática* (padrão), *Sempre corrigir escala dupla*, *Escala do monitor, sem correção* ou *Modo compatível do Windows (sem DPI)*. A escolha fica salva por plugin.
 - **Compensação automática de latência (PDC)** em faixas, buses e master: plugins com lookahead (limitadores, EQs de fase linear) não desalinham a mix.
 - O estado de todos os plugins é salvo no projeto. Se um plugin não estiver instalado ao abrir, o slot fica **vermelho** e o estado é preservado; ao salvar, nada se perde.
 
@@ -60,10 +60,15 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - A automação fica salva no projeto e entra na exportação da mix. Ao mover um plugin de slot, a automação dele vai junto; ao remover ou trocar o plugin, as linhas dele são apagadas.
 
 **Transporte e projeto**
-- Tocar/pausar, parar, voltar ao início, régua clicável e **loop**: Shift+arrastar na régua define a região.
+- Tocar/pausar, parar, voltar ao início e régua clicável.
+- **Seleção de trecho**: arraste na régua do tempo (no topo ou na régua do editor de automação) para selecionar um trecho; arraste as bordas para ajustar. **Shift+Espaço** ou **duplo clique** na seleção toca só o trecho e para no fim (volta ao início do trecho). Com o **loop** (L) ligado, o trecho repete. **Esc** limpa a seleção. O botão direito na régua abre o menu do trecho: tocar, loop, exportar a mix do trecho, exportar as faixas do trecho, selecionar a música toda, selecionar do início até o cursor e limpar. A seleção fica salva no projeto.
 - Projetos `.sconsole` em XML. O projeto guarda o caminho dos áudios, relativo à pasta do projeto, e não copia os arquivos.
 - **Exportar mix** para WAV de 16, 24 ou 32 bits float, renderizada offline (mais rápido que tempo real e sem falhas). Inclui 3 s de cauda e já descontada a latência dos plugins. Avisa se a mix passou de 0 dBFS. Em 16 bits aplica **dither TPDF**.
-- **Exportar só a região do loop**: com uma região definida na régua, o menu de exportação oferece "Só a região do loop".
+- **Exportar a mix só do trecho selecionado**: com um trecho selecionado, o botão **Exportar** (e o menu da régua) oferece a mix só da seleção.
+- **Exportar faixas individuais (stems)**, da música inteira ou só da seleção. Escolha as faixas, o formato e o conteúdo:
+  - **Com processamento**: cada faixa sai como soa na mix (inserts, volume, pan, automação, compensação de latência), sem buses e sem master. Solo é ignorado; faixas em mute saem em silêncio. Opcional: 3 s de cauda e os **buses** (cada bus com tudo o que chega nele). É uma passada só de render, em vários núcleos.
+  - **Áudio original**: o trecho do arquivo de cada faixa, sem processamento (mono continua mono).
+  - Todos os arquivos começam no mesmo ponto (alinhados) e vão para uma **pasta nova** (nunca sobrescreve arquivos), com nomes numerados na ordem das faixas. Avisa quais faixas passaram de 0 dBFS.
 - **Projetos recentes**: o botão **Abrir** lista os últimos 10 projetos. O tamanho e a posição da janela também são lembrados.
 
 ## Escaneamento isolado de VST3 (Etapa 4 - experimental)
@@ -85,12 +90,14 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 | Tecla | Ação |
 |---|---|
 | Espaço | Tocar / pausar |
+| Shift+Espaço | Tocar só o trecho selecionado |
+| Esc | Limpar a seleção de trecho |
 | Home | Voltar ao início |
-| L | Liga/desliga o loop |
+| L | Liga/desliga o loop (repete a seleção) |
 | Ctrl+N / Ctrl+O / Ctrl+S | Novo / Abrir / Salvar |
 | Ctrl+Shift+S | Salvar como |
 | Ctrl+I | Importar áudio |
-| Ctrl+E | Exportar mix |
+| Ctrl+E | Exportar (mix, trecho ou faixas individuais) |
 | Tab | Alterna entre mixer e editor de automação |
 | Duplo clique no fader/pan | 0 dB / centro |
 | Ctrl+arrastar o fader | Ajuste fino |
@@ -129,7 +136,9 @@ O diretório informado deve conter `common/iasiodrv.h` e `host/asiodrivers.h`. E
 Em **Áudio → Placa de som**, escolha o dispositivo e o tamanho do buffer. No Windows, use **Windows Audio (Exclusive Mode)** para ter latência baixa com a sua interface. O modo compartilhado também funciona.
 
 **Desempenho em sessões grandes**
-- As faixas (leitura, inserts e compensação de latência) são processadas em **vários núcleos** ao mesmo tempo. Dá para desligar em **Áudio → Processar faixas em vários núcleos**. Buses e master continuam em sequência, depois das faixas.
+- As faixas (leitura, inserts e compensação de latência) e depois os **buses** (inserts de reverb/delay etc.) são processados em **vários núcleos** ao mesmo tempo. Dá para desligar em **Áudio → Processar faixas em vários núcleos**. A soma das faixas, a soma dos buses e o master continuam em sequência, na ordem original (resultado idêntico ao de um núcleo).
+- O que roda fora da thread de áudio: leitura do disco (2 threads de E/S), escaneamento de plugins (processo separado), plugins isolados (processo DSP separado, opcional por insert), importação/reamostragem e exportação (thread de trabalho) e a gravação da cópia de recuperação (thread separada, a interface não trava em projetos grandes).
+- A exportação usa os mesmos núcleos do playback (até 8 workers), já que o áudio fica suspenso durante o render.
 - A barra de status mostra os contadores que explicam estalos:
   - **XRUN**: o processamento passou do tempo do buffer (CPU). Aumente o buffer ou alivie os plugins.
   - **DISCO**: o áudio do disco não chegou a tempo (disco lento ou muitas faixas grandes).
@@ -142,9 +151,9 @@ Em **Áudio → Placa de som**, escolha o dispositivo e o tamanho do buffer. No 
 - **ASIO não está incluído.** Use WASAPI exclusivo. Dá para adicionar ASIO depois.
 - O programa só mixa: não grava áudio, não tem MIDI/instrumentos, edição de clipes nem undo (inclusive nas edições de automação).
 - A automação é aplicada a cada bloco de áudio (alguns milissegundos), com suavização no volume e no pan. Não tem precisão de amostra.
-- **Streaming em disco experimental (Etapa 2):** arquivos com 32 MiB ou mais, na mesma taxa do motor, usam cache limitado de 65.536 amostras por faixa e uma thread de pré-leitura compartilhada; a forma de onda usa um resumo compacto. Arquivos menores e/ou em outra taxa continuam na RAM com reamostragem sinc. Se a taxa do dispositivo mudar, o fallback atual pode carregar o arquivo completo na RAM. A exportação offline lê os blocos necessários antes de renderizar.
+- **Streaming em disco (experimental):** arquivos com 32 MiB ou mais tocam do disco com cache limitado por faixa e duas threads de pré-leitura; arquivos em outra taxa são convertidos por trechos (sinc, idêntico à conversão offline), sem carregar o arquivo inteiro na RAM. Arquivos menores ficam na RAM. A exportação offline lê os blocos necessários antes de renderizar.
 - Na reprodução em streaming, saltos bruscos de cursor e discos lentos podem produzir silêncios momentâneos se o cache não estiver pronto. O streaming ainda precisa de testes prolongados; não é considerado pronto para produção.
-- **Processamento multicore parcial (Etapa 2):** o bounce offline distribui leitura, inserts VST3 e PDC de faixas independentes por ate tres workers adicionais, com somatoria e buses na mesma ordem. A reproducao **em tempo real** ainda e sequencial ate concluir testes de prazo de buffer e seguranca. Sessões muito pesadas podem precisar de um buffer maior.
+- **Multicore:** faixas e buses usam vários núcleos no playback e na exportação. A cadeia de inserts de um mesmo canal continua em um núcleo (é sequencial por natureza): um canal com muitos plugins pesados ainda pode exigir buffer maior.
 - O escaneamento isolado e experimental e o scanner tradicional JUCE continua disponivel. Plugins em inserts continuam hospedados no processo principal, sem isolamento do DSP.
 
 ## Compilar no PC (opcional)
