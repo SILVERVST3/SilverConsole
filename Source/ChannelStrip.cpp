@@ -75,7 +75,7 @@ void LevelMeter::paint (juce::Graphics& g)
     for (int c = 0; c < 2; ++c)
     {
         auto col = juce::Rectangle<float> (bars.getX() + c * (bw + 2.0f), bars.getY(), bw, h);
-        g.setColour (juce::Colour (0xff101316));
+        g.setColour (colours::lcd);
         g.fillRect (col);
         const float db = juce::Decibels::gainToDecibels (vals[c], -100.0f);
         const float y = dbToY (db, h);
@@ -122,10 +122,22 @@ void InsertSlotComponent::paint (juce::Graphics& g)
         g.fillRect (r.getX() + 1.0f, r.getY() + 2.0f, 2.0f, r.getHeight() - 4.0f);
     }
     juce::Colour c = colours::lcdText;
-    if (s.isMissing() || s.faulted.load (std::memory_order_relaxed)) c = colours::danger;
+    if (s.isOffline()) c = colours::textDim.withAlpha (0.8f);
+    else if (s.isMissing() || s.faulted.load (std::memory_order_relaxed)) c = colours::danger;
     else if (s.bypassed.load()) c = colours::textDim;
+    if (channel.asleep.load (std::memory_order_relaxed)) c = c.withMultipliedAlpha (0.45f); // dormindo: sem CPU
     g.setColour (c);
     g.drawFittedText (s.getName(), text.toNearestInt(), juce::Justification::centredLeft, 1, 0.85f);
+    if (s.isOffline())
+    {
+        g.setColour (colours::silverBot);
+        g.setFont (uiFont (9.0f, true));
+        g.drawText ("OFF", r.withTrimmedRight (3.0f), juce::Justification::centredRight);
+        const bool frozen = channel.kind == ChannelKind::track && static_cast<const Track&> (channel).isFrozen();
+        setTooltip (frozen ? s.getName() + juce::String::fromUTF8 (" - gravado no Ã¡udio congelado. Clique: descongelar")
+                           : s.getName() + juce::String::fromUTF8 (" - offline (sem CPU/memÃ³ria, ajuste guardado). Clique: colocar online"));
+        return;
+    }
     if (s.bypassed.load() || s.faulted.load())
     {
         g.setColour (s.faulted.load() ? colours::danger : colours::mute);
@@ -209,7 +221,7 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     nameLabel.setText (c.name, juce::dontSendNotification);
     nameLabel.setFont (uiFont (13.0f, true));
     nameLabel.setJustificationType (juce::Justification::centred);
-    nameLabel.setColour (juce::Label::textColourId, colours::ink);
+    nameLabel.setColour (juce::Label::textColourId, colours::text);
     nameLabel.setEditable (false, ! isMaster, false);
     nameLabel.onTextChange = [this]
     {
@@ -222,14 +234,14 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     nameLabel.setTooltip ("Duplo clique: renomear | botao direito: opcoes");
     addAndMakeVisible (nameLabel);
 
-    setupSmallLabel (infoLabel, 10.0f, colours::inkSoft);
+    setupSmallLabel (infoLabel, 10.0f, colours::textDim);
     addAndMakeVisible (infoLabel);
 
     auto setupPlus = [this] (juce::TextButton& b, const juce::String& tip)
     {
         b.setWantsKeyboardFocus (false);
         b.setTooltip (tip);
-        b.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a4148));
+        b.setColour (juce::TextButton::buttonColourId, colours::gun);
         b.setConnectedEdges (0);
         addAndMakeVisible (b);
     };
@@ -259,14 +271,15 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     panKnob.onDragStart = [this] { host.automationTouch (channel, AutoTarget::pan, true); };
     panKnob.onDragEnd = [this] { host.automationTouch (channel, AutoTarget::pan, false); };
     addAndMakeVisible (panKnob);
-    setupSmallLabel (panLabel, 10.5f, colours::ink);
+    setupSmallLabel (panLabel, 10.5f, colours::lcdText);
     addAndMakeVisible (panLabel);
 
     auto setupToggle = [this] (juce::TextButton& b, juce::Colour on, const juce::String& tip)
     {
         b.setClickingTogglesState (true);
         b.setColour (juce::TextButton::buttonOnColourId, on);
-        b.setColour (juce::TextButton::buttonColourId, juce::Colour (0xff3a4148));
+        b.setColour (juce::TextButton::textColourOnId, on == colours::accentDeep ? juce::Colours::white : colours::ink);
+        b.setColour (juce::TextButton::buttonColourId, colours::gun);
         b.setWantsKeyboardFocus (false);
         b.setTooltip (tip);
         addAndMakeVisible (b);
@@ -285,12 +298,12 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     }
     if (! isMaster)
     {
-        setupToggle (phaseButton, colours::accent, "Inverter polaridade");
+        setupToggle (phaseButton, colours::accentDeep, "Inverter polaridade");
         phaseButton.onClick = [this] { channel.phase = phaseButton.getToggleState(); host.markDirty(); };
     }
     else
     {
-        setupToggle (monoButton, colours::accent, "Ouvir a mix em mono");
+        setupToggle (monoButton, colours::accentDeep, "Ouvir a mix em mono");
         monoButton.onClick = [this] { host.getEngine().master.mono = monoButton.getToggleState(); host.markDirty(); };
     }
     outputButton.setWantsKeyboardFocus (false);
@@ -400,7 +413,8 @@ void ChannelStrip::refresh()
     if (channel.kind == ChannelKind::track)
     {
         auto& t = static_cast<Track&> (channel);
-        if (t.sourceChannels == 0) info = "SEM AUDIO";
+        if (t.isFrozen()) info = "CONGELADA";
+        else if (t.sourceChannels == 0) info = "SEM AUDIO";
         else
         {
             info = t.sourceChannels == 1 ? "MONO" : "ESTEREO";
@@ -408,6 +422,10 @@ void ChannelStrip::refresh()
             if (t.originalRate > 0 && std::abs (t.originalRate - engine.getSampleRate()) > 0.5)
                 info << "  " << juce::String (t.originalRate / 1000.0, 1) << "k";
         }
+        infoLabel.setColour (juce::Label::textColourId, t.isFrozen() ? colours::accent : colours::textDim);
+        phaseButton.setEnabled (! t.isFrozen()); // a fase ja esta gravada no audio congelado
+        phaseButton.setTooltip (t.isFrozen() ? juce::String::fromUTF8 ("Faixa congelada: a fase estÃ¡ gravada no Ã¡udio")
+                                             : juce::String ("Inverter polaridade"));
         const int ob = t.outputBus.load();
         outputButton.setButtonText (juce::String::fromUTF8 ("\xe2\x86\x92 ")
                                     + (ob >= 0 && ob < (int) engine.buses.size() ? engine.buses[(size_t) ob]->name : juce::String ("MASTER")));
@@ -430,7 +448,7 @@ void ChannelStrip::refreshAutoButton()
     shownMode = channel.getAutoMode();
     autoButton.setButtonText (autoModeName (shownMode));
     const auto c = autoModeColour (shownMode);
-    autoButton.setColour (juce::TextButton::buttonColourId, shownMode == AutoMode::off ? juce::Colour (0xff3a4148) : c.darker (0.15f));
+    autoButton.setColour (juce::TextButton::buttonColourId, shownMode == AutoMode::off ? colours::gun : c.darker (0.15f));
     autoButton.setColour (juce::TextButton::textColourOffId, shownMode == AutoMode::off ? colours::textDim : colours::ink);
 }
 
@@ -474,14 +492,18 @@ void ChannelStrip::tick()
     for (int i = 0; i < slots.size(); ++i)
     {
         const auto& insert = channel.inserts[(size_t) i];
-        const int visual = insert.faulted.load (std::memory_order_relaxed) ? 2
-                         : insert.bypassed.load (std::memory_order_relaxed) ? 1 : 0;
+        const int visual = (insert.faulted.load (std::memory_order_relaxed) ? 2
+                          : insert.bypassed.load (std::memory_order_relaxed) ? 1
+                          : insert.isOffline() ? 3 : 0)
+                         + (channel.asleep.load (std::memory_order_relaxed) ? 8 : 0);
         if (lastInsertVisualState[(size_t) i] != visual)
         {
             lastInsertVisualState[(size_t) i] = visual;
             slots[i]->repaint();
         }
     }
+    const bool asleepNow = channel.asleep.load (std::memory_order_relaxed);
+    if (asleepNow != shownAsleep) { shownAsleep = asleepNow; repaint (insertsHeader); }
 }
 
 void ChannelStrip::resized()
@@ -534,49 +556,47 @@ void ChannelStrip::paint (juce::Graphics& g)
     auto r = getLocalBounds().toFloat().reduced (1.5f, 0.0f);
     const bool isBus = channel.kind == ChannelKind::bus;
     const bool isMaster = channel.kind == ChannelKind::master;
-    auto top = isBus ? colours::silverTop.interpolatedWith (colours::busTint, 0.12f) : colours::silverTop;
-    auto bot = isMaster ? colours::silverBot.darker (0.08f) : colours::silverBot;
-    g.setGradientFill ({ top, 0, 0, bot, 0, (float) getHeight(), false });
-    g.fillRoundedRectangle (r, 4.0f);
-    // textura escovada
-    juce::Random rnd (channel.name.hashCode());
-    for (int y = 2; y < getHeight(); y += 3)
-    {
-        g.setColour (juce::Colours::white.withAlpha (0.03f + rnd.nextFloat() * 0.04f));
-        g.drawHorizontalLine (y, r.getX() + 2, r.getRight() - 2);
-    }
-    g.setColour (juce::Colours::black.withAlpha (0.5f));
-    g.drawRoundedRectangle (r, 4.0f, 1.0f);
+    // faixas e master: placa azul-marinho; buses: placa chumbo (facil de achar em sessoes grandes)
+    if (isBus) SilverLookAndFeel::drawPlate (g, r, colours::gunHi.darker (0.25f), colours::gunLo.darker (0.3f), channel.name.hashCode());
+    else if (isMaster) SilverLookAndFeel::drawPlate (g, r, colours::navyHi.brighter (0.15f), colours::navyDeep, 7);
+    else SilverLookAndFeel::drawPlate (g, r, colours::navyHi, colours::navyLo, channel.name.hashCode());
 
     g.setColour (channel.colour);
     g.fillRoundedRectangle (r.getX() + 4, 2.0f, r.getWidth() - 8, 4.0f, 1.5f);
     // Distinct master/bus outline for quicker navigation in large sessions.
     if (isBus || isMaster)
     {
-        g.setColour ((isMaster ? colours::accent : colours::busTint).withAlpha (0.65f));
+        g.setColour (isMaster ? colours::accent.withAlpha (0.65f) : colours::busTint.withAlpha (0.38f));
         g.drawRoundedRectangle (r.reduced (1.0f), 4.0f, 1.5f);
     }
 
     auto header = [&g] (juce::Rectangle<int> a, const juce::String& t)
     {
-        g.setColour (colours::inkSoft);
+        g.setColour (colours::silverBot.withAlpha (0.8f));
         g.setFont (uiFont (9.5f, true));
         g.drawText (t, a, juce::Justification::centredLeft);
     };
     header (insertsHeader, "INSERTS");
+    if (channel.asleep.load (std::memory_order_relaxed))
+    {
+        // economia de CPU: plugins do canal parados enquanto ha silencio
+        g.setColour (colours::accent.withAlpha (0.9f));
+        g.setFont (uiFont (9.5f, true));
+        g.drawText ("zz", insertsHeader.withTrimmedLeft (46), juce::Justification::centredLeft);
+    }
     if (channel.kind == ChannelKind::track) header (sendsHeader, "ENVIOS");
     else
     {
-        g.setColour (juce::Colours::black.withAlpha (0.08f));
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
         g.fillRoundedRectangle (sendBlock().toFloat(), 3.0f);
-        g.setColour (colours::inkSoft.withAlpha (0.7f));
+        g.setColour (colours::textDim);
         g.setFont (uiFont (10.0f, true));
         if (isMaster)
         {
             const auto& m = static_cast<const Master&> (channel);
             g.drawText ("LOUDNESS (M)", sendsHeader.withHeight (32), juce::Justification::centred);
             g.setFont (uiFont (16.0f, true));
-            g.setColour (colours::ink);
+            g.setColour (colours::lcdText);
             const auto loudness = m.momentaryLufs.load (std::memory_order_relaxed);
             const auto value = loudness <= -110.0f
                                    ? juce::String ("-inf LUFS")
@@ -597,7 +617,7 @@ void ChannelStrip::paint (juce::Graphics& g)
     for (float db : { 12.0f, 6.0f, 0.0f, -6.0f, -12.0f, -24.0f, -40.0f, kMinDb })
     {
         const float y = (float) fader.getY() + (float) fader.getPositionOfValue (db);
-        g.setColour (db == 0.0f ? colours::ink : colours::inkSoft);
+        g.setColour (db == 0.0f ? colours::silverTop : colours::textDim);
         g.drawHorizontalLine ((int) y, 4.0f, 22.0f);
         g.drawText (db <= kMinDb ? juce::String::fromUTF8 ("\xe2\x88\x9e") : juce::String ((int) std::abs (db)),
                     2, (int) y - 9, 20, 8, juce::Justification::centredLeft);

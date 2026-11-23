@@ -3,6 +3,7 @@
 // Permanece em processo filho mesmo quando um plugin causa access violation.
 #include <JuceHeader.h>
 #include "DspIpcProtocol.h"
+#include "RealtimeThread.h"
 #include <cmath>
 #include <cstdint>
 
@@ -151,7 +152,8 @@ int main (int argc, char** argv)
     const bool monoOut = plugin->getTotalNumOutputChannels() == 1;
     // O DSP precisa responder dentro de um buffer: prioridade de tempo real
     // para esta thread (unica thread de processamento do worker).
-    ::SetThreadPriority (::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    sc::rt::configureProcessForAudio();
+    sc::rt::promoteAudioThread(); // MMCSS "Pro Audio" + sem economia de energia
     store (shared->ready, 1);
 
     juce::AudioBuffer<float> audio (sc::ipc::channels, sc::ipc::maxFrames);

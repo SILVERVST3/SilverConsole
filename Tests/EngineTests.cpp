@@ -1143,6 +1143,232 @@ static void testStemExport()
     dir.deleteRecursively();
 }
 
+// Plugin de teste: atraso + contador de chamadas + cauda/estado configuraveis.
+class CountingDelay : public InternalDelay
+{
+public:
+    explicit CountingDelay (int d, double tailSeconds = 0.0) : InternalDelay (d), tail (tailSeconds) {}
+    void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer& m) override { ++calls; InternalDelay::processBlock (b, m); }
+    double getTailLengthSeconds() const override { return tail; }
+    void getStateInformation (juce::MemoryBlock& d) override { d.replaceAll (stateText.toRawUTF8(), stateText.getNumBytesAsUTF8()); }
+    void setStateInformation (const void* d, int n) override { stateText = juce::String::fromUTF8 ((const char*) d, n); }
+    int calls = 0;
+    double tail;
+    juce::String stateText { "ajuste-original" };
+};
+
+// Economia de CPU: canal em silencio dorme (sem chamar plugins), acorda no
+// primeiro bloco com som e o resultado e identico ao processamento continuo.
+static void testCpuSaverSleep()
+{
+    const int sr = 48000, len = sr * 7;
+    auto signal = makeBuffer (2, len, [sr] (int ch, int i)
+    {
+        const bool on = i < 4800 || (i >= 6 * sr && i < 6 * sr + 4800);
+        return on ? 0.3f * std::sin ((float) i * 0.013f + (float) ch) : 0.0f;
+    });
+    CountingDelay* plugins[2] = {};
+    Engine engines[2];
+    Track* tracks[2] = {};
+    for (int k = 0; k < 2; ++k)
+    {
+        auto& e = engines[k];
+        e.prepare (sr, 256);
+        e.setCpuSaver (k == 0);
+        tracks[k] = addTrack (e, signal, "t");
+        auto p = std::make_unique<CountingDelay> (100);
+        plugins[k] = p.get();
+        e.prepareProcessor (*p);
+        e.setInsert (*tracks[k], 0, std::move (p), nullptr);
+    }
+    const auto a1 = run (engines[0], 5 * sr), b1 = run (engines[1], 5 * sr);
+    check (tracks[0]->asleep.load() && ! tracks[1]->asleep.load(), "canal em silencio dorme (so com a economia ligada)");
+    check (engines[0].getSleepingCount() == 1, "contagem de canais dormindo");
+    check (plugins[0]->calls < plugins[1]->calls * 2 / 3, "dormindo nao chama o plugin ("
+           + juce::String (plugins[0]->calls) + " x " + juce::String (plugins[1]->calls) + ")");
+    const auto a2 = run (engines[0], 2 * sr, 5 * sr), b2 = run (engines[1], 2 * sr, 5 * sr);
+    check (! tracks[0]->asleep.load(), "acorda quando o som volta");
+    float diff = 0.0f;
+    for (int ch = 0; ch < 2; ++ch)
+    {
+        for (int i = 0; i < 5 * sr; ++i) diff = juce::jmax (diff, std::abs (a1.getSample (ch, i) - b1.getSample (ch, i)));
+        for (int i = 0; i < 2 * sr; ++i) diff = juce::jmax (diff, std::abs (a2.getSample (ch, i) - b2.getSample (ch, i)));
+    }
+    check (diff == 0.0f && a2.getMagnitude (0, 0, 2 * sr) > 0.1f, "resultado identico ao processamento continuo");
+
+    // mudar o insert acorda o canal; transporte parado tambem dorme
+    run (engines[0], 4 * sr, 0, false);
+    check (tracks[0]->asleep.load(), "parado: plugins dormem");
+    engines[0].setBypass (*tracks[0], 0, true);
+    engines[0].setBypass (*tracks[0], 0, false);
+    check (! tracks[0]->asleep.load(), "mexer no insert acorda o canal");
+
+    // cauda longa declarada pelo plugin: espera a cauda; cauda infinita: nunca dorme
+    {
+        Engine e; e.prepare (sr, 256);
+        auto* t = addTrack (e, makeBuffer (2, 4800, [] (int, int i) { return i < 2400 ? 0.2f : 0.0f; }), "rev");
+        auto p = std::make_unique<CountingDelay> (0, 6.0);
+        e.prepareProcessor (*p);
+        e.setInsert (*t, 0, std::move (p), nullptr);
+        run (e, 5 * sr);
+        check (! t->asleep.load(), "respeita a cauda declarada (6 s)");
+        run (e, 3 * sr, 5 * sr);
+        check (t->asleep.load(), "dorme depois da cauda");
+        auto q = std::make_unique<CountingDelay> (0, std::numeric_limits<double>::infinity());
+        e.prepareProcessor (*q);
+        e.setInsert (*t, 0, std::move (q), nullptr);
+        run (e, 10 * sr, 0, false);
+        check (! t->asleep.load(), "cauda infinita: espera mais que 10 s de silencio");
+        run (e, 2 * sr, 0, false);
+        check (t->asleep.load(), "cauda infinita: dorme depois de 10 s de saida em silencio");
+    }
+
+    // a exportacao processa tudo (nunca dorme)
+    {
+        auto& e = engines[0];
+        const int before = plugins[0]->calls;
+        auto f = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_sleep_export.wav");
+        std::atomic<float> progress { 0 }; std::atomic<bool> cancel { false };
+        juce::String err; bool clip = false;
+        check (e.exportMix (f, 24, 0.0, progress, cancel, err, clip), "exportar com economia ligada " + err);
+        const int blocks = (len + 100 + 255) / 256;
+        check (plugins[0]->calls - before >= blocks, "exportacao chama o plugin em todos os blocos");
+        f.deleteFile();
+    }
+}
+
+// Plugin offline: estado guardado, latencia fora da PDC, volta online igual.
+static void testPluginOffline()
+{
+    Engine e; e.prepare (48000, 256);
+    auto* t = addTrack (e, makeBuffer (2, 4800, [] (int, int) { return 0.1f; }), "Voz");
+    auto p = std::make_unique<CountingDelay> (64);
+    p->stateText = "ajuste-do-usuario";
+    e.prepareProcessor (*p);
+    juce::PluginDescription desc; desc.name = "Plug"; desc.pluginFormatName = "VST3"; desc.fileOrIdentifier = "C:/p.vst3";
+    e.setInsert (*t, 1, std::move (p), &desc);
+    e.setBypass (*t, 1, true);
+    e.setBypass (*t, 1, false);
+    check (e.getTotalLatency() == 64, "latencia do plugin na PDC");
+    e.setBypass (*t, 1, true);
+    auto old = e.takeInsertOffline (*t, 1);
+    check (old != nullptr && t->inserts[1].isOffline() && ! t->inserts[1].isMissing() && t->inserts[1].processor == nullptr,
+           "plugin descarregado (offline, nao ausente)");
+    check (t->inserts[1].missingState.toString() == "ajuste-do-usuario", "estado guardado ao ficar offline");
+    check (e.getTotalLatency() == 0 && t->inserts[1].bypassed.load(), "latencia sai da PDC; bypass mantido");
+    old.reset();
+    run (e, 2048); // toca sem o plugin
+
+    auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_offline.sconsole");
+    juce::String err;
+    ProjectData pd;
+    check (writeProject (captureProject (e), file, err) && readProject (file, pd, err), "salvar/abrir com plugin offline " + err);
+    check (pd.tracks.size() == 1 && pd.tracks[0].ch.inserts.size() == 1 && pd.tracks[0].ch.inserts[0].offline
+           && pd.tracks[0].ch.inserts[0].state.toString() == "ajuste-do-usuario", "offline salvo no projeto com o estado");
+    file.deleteFile();
+
+    std::vector<Engine::RestoredInsert> back (1);
+    back[0].slot = 1;
+    auto np = std::make_unique<CountingDelay> (64);
+    np->setStateInformation (t->inserts[1].missingState.getData(), (int) t->inserts[1].missingState.getSize());
+    e.prepareProcessor (*np);
+    back[0].local = std::move (np);
+    e.restoreInserts (*t, back, false);
+    auto* restored = dynamic_cast<CountingDelay*> (t->inserts[1].processor.get());
+    check (restored != nullptr && restored->stateText == "ajuste-do-usuario" && ! t->inserts[1].isOffline(), "volta online com o ajuste");
+    check (t->inserts[1].bypassed.load() && t->inserts[1].description.name == "Plug", "bypass e descricao preservados");
+    e.setBypass (*t, 1, false);
+    check (e.getTotalLatency() == 64, "latencia volta para a PDC");
+}
+
+// Congelar: render da faixa (fase + inserts, sem latencia) toca no lugar do
+// audio com os plugins offline; a mix fica igual. Descongelar volta ao normal.
+static void testFreezeTrack()
+{
+    const int sr = 48000, len = sr;
+    Engine e; e.prepare (sr, 256);
+    auto* a = addTrack (e, makeBuffer (2, len, [] (int ch, int i) { return 0.25f * std::sin ((float) i * 0.02f + (float) ch); }), "Guitarra");
+    auto* b = addTrack (e, makeBuffer (1, len, [] (int, int i) { return 0.2f * std::sin ((float) i * 0.005f); }), "Baixo");
+    auto p = std::make_unique<CountingDelay> (37);
+    e.prepareProcessor (*p);
+    juce::PluginDescription desc; desc.name = "Delay37"; desc.pluginFormatName = "VST3"; desc.fileOrIdentifier = "C:/d.vst3";
+    e.setInsert (*a, 0, std::move (p), &desc);
+    a->phase = true; a->gainDb = -3.0f; a->pan = 0.3f;
+    b->pan = -0.2f;
+
+    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_freeze_test");
+    dir.deleteRecursively();
+    dir.createDirectory();
+    std::atomic<float> progress { 0 }; std::atomic<bool> cancel { false };
+    juce::String err; bool clip = false;
+    juce::AudioFormatManager fm; registerAudioFormats (fm);
+    auto mix = [&] (const juce::String& name)
+    {
+        auto f = dir.getChildFile (name);
+        e.exportMix (f, 32, 0.5, progress, cancel, err, clip);
+        return loadAudioFile (fm, f);
+    };
+    const auto ref = mix ("ref.wav");
+
+    const auto frozenFile = dir.getChildFile ("Guitarra.wav");
+    check (e.renderFreeze (*a, frozenFile, 1.0, progress, cancel, err), "congelar faixa " + err);
+    const auto frozen = loadAudioFile (fm, frozenFile);
+    float dFrozen = 1.0f;
+    if (frozen.ok() && frozen.original->getNumSamples() == len + sr && frozen.original->getNumChannels() == 2)
+    {
+        dFrozen = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < len; ++i)
+                dFrozen = juce::jmax (dFrozen, std::abs (frozen.original->getSample (ch, i) + a->playback->getSample (ch, i)));
+        dFrozen = juce::jmax (dFrozen, frozen.original->getMagnitude (len, sr));
+    }
+    check (dFrozen < 1.0e-7f, "render congelado = fase + plugin, sem latencia, com cauda");
+
+    auto stream = StreamingAudio::open (frozenFile, sr, err);
+    check (stream != nullptr, "abrir arquivo congelado " + err);
+    std::vector<std::unique_ptr<juce::AudioProcessor>> unloaded;
+    e.setFrozen (*a, frozenFile, stream, unloaded);
+    check (a->isFrozen() && unloaded.size() == 1 && a->inserts[0].isOffline() && e.getTotalLatency() == 0,
+           "congelada: plugin offline e sem latencia");
+    unloaded.clear();
+    const auto frozenMix = mix ("frozen.wav");
+    float d1 = 1.0f;
+    if (ref.ok() && frozenMix.ok() && frozenMix.original->getNumSamples() == ref.original->getNumSamples())
+    {
+        d1 = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < ref.original->getNumSamples(); ++i)
+                d1 = juce::jmax (d1, std::abs (ref.original->getSample (ch, i) - frozenMix.original->getSample (ch, i)));
+    }
+    check (d1 < 1.0e-6f, "mix com a faixa congelada = mix original (" + juce::String (d1) + ")");
+
+    ProjectData pd;
+    const auto proj = dir.getChildFile ("p.sconsole");
+    check (writeProject (captureProject (e), proj, err) && readProject (proj, pd, err), "salvar/abrir com faixa congelada " + err);
+    check (pd.tracks.size() == 2 && pd.tracks[0].frozenFile == frozenFile && pd.tracks[0].ch.inserts.size() == 1
+           && pd.tracks[0].ch.inserts[0].offline, "projeto guarda o arquivo congelado e o plugin offline");
+
+    std::vector<Engine::RestoredInsert> back (1);
+    back[0].slot = 0;
+    auto np = std::make_unique<CountingDelay> (37);
+    e.prepareProcessor (*np);
+    back[0].local = std::move (np);
+    e.restoreInserts (*a, back, true);
+    check (! a->isFrozen() && a->inserts[0].processor != nullptr && e.getTotalLatency() == 37, "descongelar: plugin de volta");
+    const auto backMix = mix ("back.wav");
+    float d2 = 1.0f;
+    if (ref.ok() && backMix.ok() && backMix.original->getNumSamples() == ref.original->getNumSamples())
+    {
+        d2 = 0.0f;
+        for (int ch = 0; ch < 2; ++ch)
+            for (int i = 0; i < ref.original->getNumSamples(); ++i)
+                d2 = juce::jmax (d2, std::abs (ref.original->getSample (ch, i) - backMix.original->getSample (ch, i)));
+    }
+    check (d2 == 0.0f, "descongelada: mix identica a original");
+    stream.reset();
+    dir.deleteRecursively();
+}
+
 // Inserts e envios dinamicos (botao "+"), 16 buses e persistencia no projeto.
 static void testDynamicSlots()
 {
@@ -1458,6 +1684,9 @@ int main (int argc, char** argv)
     testParallelBuses();
     testSelectionPlayback();
     testStemExport();
+    testCpuSaverSleep();
+    testPluginOffline();
+    testFreezeTrack();
     testDynamicSlots();
     testDiskStreaming();
     testStereoBalanceMuteSolo();

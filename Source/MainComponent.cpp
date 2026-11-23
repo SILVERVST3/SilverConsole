@@ -45,6 +45,8 @@ namespace
         LoadedAudio audio;
         std::shared_ptr<const juce::AudioBuffer<float>> playback;
         std::shared_ptr<StreamingAudio> stream;
+        juce::File frozenFile;                  // faixa congelada no projeto
+        std::shared_ptr<StreamingAudio> frozen; // aberto junto com o audio
     };
 
     void decodeInto (DecodedFile& d, double sr)
@@ -69,15 +71,19 @@ void IconButton::paintButton (juce::Graphics& g, bool over, bool down)
 {
     auto r = getLocalBounds().toFloat().reduced (1.0f);
     const bool on = getToggleState() || (shape == Shape::play && showPause);
-    auto base = on ? colours::accent : juce::Colour (0xff2a3036);
+    auto base = on ? colours::accentDeep : colours::gun;
     if (down) base = base.darker (0.2f); else if (over) base = base.brighter (0.1f);
-    g.setGradientFill ({ base.brighter (0.1f), 0, r.getY(), base.darker (0.15f), 0, r.getBottom(), false });
+    auto topC = base.brighter (0.28f), botC = base.darker (0.35f);
+    if (down) std::swap (topC, botC);
+    g.setGradientFill ({ topC, 0, r.getY(), botC, 0, r.getBottom(), false });
     g.fillRoundedRectangle (r, 4.0f);
-    g.setColour (juce::Colours::black.withAlpha (0.5f));
+    g.setColour (juce::Colours::white.withAlpha (down ? 0.04f : 0.16f));
+    g.drawHorizontalLine ((int) r.getY() + 1, r.getX() + 3.0f, r.getRight() - 3.0f);
+    g.setColour (juce::Colours::black);
     g.drawRoundedRectangle (r, 4.0f, 1.0f);
 
     auto icon = r.withSizeKeepingCentre (14.0f, 14.0f);
-    g.setColour (on ? colours::ink : colours::text);
+    g.setColour (on ? juce::Colours::white : colours::silverTop);
     juce::Path p;
     switch (shape)
     {
@@ -131,14 +137,16 @@ float Timeline::sampleToX (juce::int64 s) const
 void Timeline::paint (juce::Graphics& g)
 {
     auto r = getLocalBounds().toFloat();
-    g.setColour (colours::lcd);
+    g.setColour (juce::Colours::black);
     g.fillRoundedRectangle (r, 4.0f);
+    g.setGradientFill ({ juce::Colour (0xff0b1a36), 0, r.getY(), colours::lcd, 0, r.getBottom(), false });
+    g.fillRoundedRectangle (r.reduced (1.0f), 3.0f);
     const double sr = engine.getSampleRate();
     const double total = visibleSeconds();
     const auto len = engine.getLengthSamples();
 
     // regiao com audio
-    g.setColour (colours::panelLine.withAlpha (0.8f));
+    g.setColour (colours::accentDeep);
     g.fillRect (juce::Rectangle<float>::leftTopRightBottom (sampleToX (0), r.getBottom() - 7.0f, sampleToX (len), r.getBottom() - 3.0f));
 
     // selecao (= regiao do loop)
@@ -169,7 +177,7 @@ void Timeline::paint (juce::Graphics& g)
     for (double t = 0.0; t <= total; t += step)
     {
         const float x = sampleToX ((juce::int64) (t * sr));
-        g.setColour (colours::textDim.withAlpha (0.6f));
+        g.setColour (colours::grid.brighter (0.4f));
         g.drawVerticalLine ((int) x, r.getY() + 16.0f, r.getBottom() - 8.0f);
         const int m = (int) (t / 60.0);
         g.setColour (colours::textDim);
@@ -348,7 +356,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     setupTool (automationButton, juce::String::fromUTF8 ("Editor de automa\xc3\xa7\xc3\xa3o (Tab). Clique de novo para voltar ao mixer."));
     automationButton.setClickingTogglesState (true);
     automationButton.onClick = [this] { setAutomationVisible (automationButton.getToggleState()); };
-    exportButton.setColour (juce::TextButton::buttonColourId, colours::accent.darker (0.35f));
+    exportButton.setColour (juce::TextButton::buttonColourId, colours::accentDeep);
 
     newButton.onClick = [this] { newProject(); };
     openButton.onClick = [this] { openMenu(); };
@@ -403,6 +411,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     const auto err = deviceManager.initialise (0, 2, saved.get(), true);
     if (err.isNotEmpty()) statusText = "Audio: " + err;
     engine.setMultiCore (props.getUserSettings()->getBoolValue ("multiCore", true));
+    engine.setCpuSaver (props.getUserSettings()->getBoolValue ("cpuSaver", true));
     deviceManager.addAudioCallback (&engine);
     deviceManager.addChangeListener (this);
 
@@ -435,9 +444,14 @@ void MainComponent::paint (juce::Graphics& g)
 {
     g.fillAll (colours::background);
     auto top = getLocalBounds().removeFromTop (kTopBarH);
-    g.setGradientFill ({ colours::panel.brighter (0.05f), 0, 0, colours::panel.darker (0.2f), 0, (float) kTopBarH, false });
+    // barra superior chumbo (como o cabecalho do SILVER AXES)
+    g.setGradientFill ({ juce::Colour (0xff30353c), 0, 0, juce::Colour (0xff1a1d21), 0, (float) kTopBarH, false });
     g.fillRect (top);
-    g.setColour (colours::panelLine);
+    g.setGradientFill ({ juce::Colour (0xff1a1d21), 0, (float) kTopBarH, juce::Colour (0xff121417), 0, (float) (kTopBarH + kToolbarH), false });
+    g.fillRect (0, kTopBarH, getWidth(), kToolbarH);
+    g.setColour (juce::Colours::white.withAlpha (0.08f));
+    g.drawHorizontalLine (1, 0, (float) getWidth());
+    g.setColour (juce::Colours::black);
     g.drawHorizontalLine (kTopBarH - 1, 0, (float) getWidth());
     g.drawHorizontalLine (kTopBarH + kToolbarH - 1, 0, (float) getWidth());
 
@@ -453,7 +467,9 @@ void MainComponent::paint (juce::Graphics& g)
 
     // relogio
     auto clock = juce::Rectangle<int> (382, 12, 150, 40);
-    g.setColour (colours::lcd);
+    g.setColour (juce::Colours::black);
+    g.fillRoundedRectangle (clock.toFloat().expanded (1.0f), 5.0f);
+    g.setGradientFill ({ juce::Colour (0xff0e2147), 0, (float) clock.getY(), colours::lcd, 0, (float) clock.getBottom(), false });
     g.fillRoundedRectangle (clock.toFloat(), 4.0f);
     g.setColour (colours::lcdText);
     g.setFont (uiFont (22.0f, true));
@@ -625,7 +641,10 @@ void MainComponent::timerCallback()
               << bs << " (" << juce::String (bs * 1000.0 / sr, 1) << " ms)  |  CPU "
               << juce::roundToInt (deviceManager.getCpuUsage() * 100.0) << "%";
             const int workers = engine.isMultiCore() ? engine.getRealtimeWorkerCount() : 0;
-            s << " (" << juce::String (workers + 1) << juce::String::fromUTF8 (workers > 0 ? " n\xc3\xba" "cleos" : " n\xc3\xba" "cleo") << ")";
+            s << " (" << juce::String (workers + 1) << juce::String::fromUTF8 (workers > 0 ? " n\xc3\xba" "cleos" : " n\xc3\xba" "cleo");
+            // economia de CPU: canais com plugins parados agora (silencio)
+            if (engine.isCpuSaver()) s << ", " << juce::String (engine.getSleepingCount()) << " dormindo";
+            s << ")";
             s << "  |  PDC " << juce::String (engine.getTotalLatency() * 1000.0 / sr, 1) << " ms";
             // Diagnostico de estalos: XRUN = callback passou do prazo (CPU);
             // DISCO = audio do disco nao chegou a tempo; LOCK = edicao concorrente.
@@ -947,6 +966,23 @@ void MainComponent::channelMenu (Channel& c, juce::Component& source)
         m.addItem (3, "Mover para a esquerda");
         m.addItem (4, "Mover para a direita");
     }
+    {
+        const bool frozen = c.kind == ChannelKind::track && static_cast<Track&> (c).isFrozen();
+        bool anyLoaded = false, anyOffline = false;
+        for (auto& s : c.inserts)
+        {
+            anyLoaded = anyLoaded || s.processor != nullptr || s.remote != nullptr;
+            anyOffline = anyOffline || s.isOffline();
+        }
+        m.addSeparator();
+        if (c.kind == ChannelKind::track)
+        {
+            if (frozen) m.addItem (21, "Descongelar faixa (plugins voltam online)");
+            else m.addItem (20, juce::String::fromUTF8 ("Congelar faixa (grava os plugins em \xc3\xa1udio e libera a CPU)"), anyLoaded);
+        }
+        m.addItem (22, juce::String::fromUTF8 ("Todos os plugins offline (sem CPU/mem\xc3\xb3ria)"), anyLoaded && ! frozen);
+        m.addItem (23, "Todos os plugins online", anyOffline && ! frozen);
+    }
     m.addSeparator();
     m.addItem (9, c.kind == ChannelKind::track ? "Remover faixa" : "Remover bus");
 
@@ -969,6 +1005,15 @@ void MainComponent::channelMenu (Channel& c, juce::Component& source)
                 if (engine.tracks[(size_t) i].get() == cp) { engine.moveTrack (i, i + (r == 3 ? -1 : 1)); break; }
             rebuildStrips();
             markDirty();
+        }
+        else if (r == 20) freezeTrack (*static_cast<Track*> (cp));
+        else if (r == 21) unfreezeTrack (*static_cast<Track*> (cp));
+        else if (r == 22) setChannelPluginsOffline (*cp);
+        else if (r == 23)
+        {
+            juce::StringArray failed;
+            restoreOfflineInserts (*cp, -1, false, failed);
+            if (! failed.isEmpty()) alert ("Plugins online", juce::String::fromUTF8 ("N\xc3\xa3o foi poss\xc3\xadvel recarregar (ficaram offline):\n") + failed.joinIntoString ("\n"));
         }
         else if (r == 9) removeChannel (*cp);
     });
@@ -1037,6 +1082,19 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
 {
     if (! c.hasInsert (slot)) return;
     auto& s = c.inserts[(size_t) slot];
+    if (c.kind == ChannelKind::track && static_cast<Track&> (c).isFrozen())
+    {
+        // Congelada: os plugins estao gravados no audio. Nada muda ate descongelar.
+        juce::PopupMenu m;
+        m.addSectionHeader ("Faixa congelada - " + c.name);
+        m.addItem (1, "Descongelar faixa (plugins voltam online)");
+        auto* tp = static_cast<Track*> (&c);
+        m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&source), [this, tp] (int r)
+        {
+            if (r == 1 && channelExists (tp)) unfreezeTrack (*tp);
+        });
+        return;
+    }
     if (s.isEmpty())
     {
         // botao direito no ultimo slot vazio: opcao de remove-lo
@@ -1069,7 +1127,10 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
     if (! e.mods.isPopupMenu() && s.processor != nullptr) { openEditor (c, slot); return; }
 
     juce::PopupMenu m;
-    m.addSectionHeader (s.getName() + (s.isMissing() ? juce::String::fromUTF8 (" (n\xc3\xa3o encontrado)") : juce::String()));
+    m.addSectionHeader (s.getName() + (s.isMissing() ? juce::String::fromUTF8 (" (n\xc3\xa3o encontrado)")
+                                     : s.isOffline() ? juce::String (" (offline)") : juce::String()));
+    if (s.isOffline())
+        m.addItem (8, "Colocar online");
     m.addItem (1, "Abrir editor", s.processor != nullptr);
     m.addItem (2, "Bypass", s.processor != nullptr || s.remote != nullptr, s.bypassed.load());
     if (s.remote != nullptr)
@@ -1084,6 +1145,8 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
         sm.addItem (73, juce::String::fromUTF8 ("Modo compat\xc3\xadvel do Windows (sem DPI)"), true, cur == PluginScaleMode::compatibility);
         m.addSubMenu ("Escala da janela", sm);
     }
+    if (s.processor != nullptr || s.remote != nullptr)
+        m.addItem (7, juce::String::fromUTF8 ("Colocar offline (libera CPU e mem\xc3\xb3ria, guarda o ajuste)"));
     m.addSeparator();
     m.addItem (3, "Substituir...");
     m.addItem (4, "Mover para cima", slot > 0);
@@ -1097,6 +1160,13 @@ void MainComponent::insertSlotClicked (Channel& c, int slot, juce::Component& so
         if (r == 0 || ! channelExists (cp)) return;
         auto& sl = cp->inserts[(size_t) slot];
         if (r == 1) openEditor (*cp, slot);
+        else if (r == 7) setInsertOffline (*cp, slot);
+        else if (r == 8)
+        {
+            juce::StringArray failed;
+            restoreOfflineInserts (*cp, slot, false, failed);
+            if (! failed.isEmpty()) alert ("Plugin", juce::String::fromUTF8 ("N\xc3\xa3o foi poss\xc3\xadvel recarregar:\n") + failed.joinIntoString ("\n"));
+        }
         else if (r == 2) engine.setBypass (*cp, slot, ! sl.bypassed.load());
         else if (r == 3) { if (src != nullptr) showPluginMenu (*cp, slot, *src, true); }
         else if (r == 6 && sl.remote != nullptr)
@@ -1217,6 +1287,13 @@ void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::Stri
     for (auto& in : data.inserts)
     {
         juce::String err;
+        if (in.offline)
+        {
+            // Offline no projeto: so o estado; o plugin nao e carregado (sem CPU/memoria).
+            engine.setMissingInsert (c, in.slot, in.desc, in.state, in.isolated, true);
+            if (in.bypass) engine.setBypass (c, in.slot, true);
+            continue;
+        }
         if (in.isolated)
         {
             const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
@@ -1250,6 +1327,148 @@ void MainComponent::loadInserts (Channel& c, const ChannelData& data, juce::Stri
         if (in.bypass) engine.setBypass (c, in.slot, true); // preserva o bypass ao salvar de novo
         problems.add (c.name + ": plugin " + in.desc.name + (err.isNotEmpty() ? " (" + err + ")" : juce::String()));
     }
+}
+
+//==============================================================================
+// Plugin offline e congelar faixa
+void MainComponent::setInsertOffline (Channel& c, int slot)
+{
+    closeEditor (c, slot);
+    auto old = engine.takeInsertOffline (c, slot);
+    old.reset(); // destruido fora do lock do motor
+    if (auto* st = stripFor (&c)) st->refresh();
+    markDirty();
+}
+
+void MainComponent::setChannelPluginsOffline (Channel& c)
+{
+    closeEditorsFor (c);
+    for (int i = 0; i < c.inserts.size(); ++i)
+    {
+        auto old = engine.takeInsertOffline (c, i);
+        old.reset();
+    }
+    if (auto* st = stripFor (&c)) st->refresh();
+    markDirty();
+}
+
+bool MainComponent::createFromSlot (const InsertSlot& s, Engine::RestoredInsert& out, juce::String& error)
+{
+    if (s.preferRemote)
+    {
+        const auto exe = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getSiblingFile ("ScDspWorker.exe");
+        out.remote = RemoteDspInsert::start (s.description, s.missingState, exe, engine.getSampleRate(), engine.getBlockSize(), error);
+        return out.remote != nullptr;
+    }
+    auto inst = pluginHost.create (s.description, engine.getSampleRate(), engine.getBlockSize(), error);
+    if (inst == nullptr) return false;
+    if (s.missingState.getSize() > 0) inst->setStateInformation (s.missingState.getData(), (int) s.missingState.getSize());
+    error = engine.prepareProcessor (*inst);
+    if (error.isNotEmpty()) return false;
+    out.local = std::move (inst);
+    return true;
+}
+
+void MainComponent::restoreOfflineInserts (Channel& c, int onlySlot, bool unfreeze, juce::StringArray& failed)
+{
+    std::vector<Engine::RestoredInsert> restored;
+    juce::MouseCursor::showWaitCursor();
+    for (int i = 0; i < c.inserts.size(); ++i)
+    {
+        if (onlySlot >= 0 && i != onlySlot) continue;
+        const auto& s = c.inserts[(size_t) i];
+        if (! s.isOffline()) continue;
+        Engine::RestoredInsert r;
+        r.slot = i;
+        juce::String err;
+        if (createFromSlot (s, r, err)) restored.push_back (std::move (r));
+        else failed.add (s.getName() + (err.isNotEmpty() ? " (" + err + ")" : juce::String()));
+    }
+    juce::MouseCursor::hideWaitCursor();
+    engine.restoreInserts (c, restored, unfreeze); // tudo volta no mesmo instante
+    if (auto* st = stripFor (&c)) st->refresh();
+    markDirty();
+}
+
+juce::File MainComponent::freezeFileFor (const Track& t) const
+{
+    // Ao lado do projeto salvo; sem projeto, na pasta de dados do aplicativo.
+    auto dir = currentFile != juce::File()
+                   ? currentFile.getParentDirectory().getChildFile (currentFile.getFileNameWithoutExtension() + " - congeladas")
+                   : juce::File::getSpecialLocation (juce::File::userApplicationDataDirectory)
+                         .getChildFile ("SilverConsole").getChildFile ("Congeladas");
+    dir.createDirectory();
+    return dir.getNonexistentChildFile (juce::File::createLegalFileName (t.name.isNotEmpty() ? t.name : juce::String ("Faixa")),
+                                        ".wav", false);
+}
+
+void MainComponent::freezeTrack (Track& t)
+{
+    if (job != nullptr || t.isFrozen()) return;
+    bool anyPlugin = false;
+    double tail = 0.0;
+    for (auto& s : t.inserts)
+    {
+        if (s.bypassed.load()) continue;
+        if (s.remote != nullptr) anyPlugin = true;
+        if (auto* p = s.processor.get())
+        {
+            anyPlugin = true;
+            const double tl = p->getTailLengthSeconds();
+            if (std::isfinite (tl)) tail = juce::jmax (tail, tl);
+        }
+    }
+    if (! anyPlugin)
+    {
+        alert ("Congelar faixa", juce::String::fromUTF8 ("A faixa n\xc3\xa3o tem plugins ativos: n\xc3\xa3o h\xc3\xa1 CPU para economizar."), false);
+        return;
+    }
+    const double tailSeconds = juce::jlimit (2.0, 20.0, tail + 1.0); // cauda de reverb/delay depois do fim do audio
+    const auto file = freezeFileFor (t);
+    closeEditorsFor (t);
+    struct Result { bool ok = false; juce::String error; std::shared_ptr<StreamingAudio> stream; };
+    auto result = std::make_shared<Result>();
+    auto* tp = &t;
+    const double sr = engine.getSampleRate();
+    runJob ("Congelando " + t.name + "...", true,
+            [this, tp, file, tailSeconds, sr, result] (Job& j)
+            {
+                result->ok = engine.renderFreeze (*tp, file, tailSeconds, j.progress, j.cancel, result->error);
+                if (result->ok)
+                {
+                    result->stream = StreamingAudio::open (file, sr, result->error);
+                    result->ok = result->stream != nullptr;
+                }
+            },
+            [this, tp, file, result] (Job& j)
+    {
+        if (! result->ok || ! channelExists (tp))
+        {
+            file.deleteFile();
+            if (! j.cancel.load() && channelExists (tp)) alert ("Congelar faixa", result->error);
+            return;
+        }
+        std::vector<std::unique_ptr<juce::AudioProcessor>> unloaded;
+        engine.setFrozen (*tp, file, result->stream, unloaded); // arquivo entra e plugins saem juntos
+        unloaded.clear(); // libera a memoria dos plugins fora do lock
+        if (auto* st = stripFor (tp)) st->refresh();
+        lanesChanged();
+        markDirty();
+    });
+}
+
+void MainComponent::unfreezeTrack (Track& t)
+{
+    if (! t.isFrozen()) return;
+    const auto file = t.frozenFile;
+    juce::StringArray failed;
+    restoreOfflineInserts (t, -1, true, failed);
+    // O arquivo congelado vai para a lixeira (recuperavel), nao e apagado de vez.
+    if (file.existsAsFile()) file.moveToTrash();
+    lanesChanged();
+    if (! failed.isEmpty())
+        alert ("Descongelar faixa", juce::String::fromUTF8 ("Estes plugins n\xc3\xa3o abriram e ficaram offline (o ajuste continua guardado):\n")
+                                    + failed.joinIntoString ("\n"));
 }
 
 // Modo de escala por plugin: linhas "modo|identificador" em pluginScaleModes.
@@ -1531,6 +1750,7 @@ void MainComponent::audioMenu()
     m.addItem (2, juce::String::fromUTF8 ("Processar faixas em v\xc3\xa1rios n\xc3\xba" "cleos (")
                       + juce::String (workers + 1) + juce::String::fromUTF8 (" n\xc3\xba" "cleos)"),
                workers > 0, engine.isMultiCore() && workers > 0);
+    m.addItem (4, juce::String::fromUTF8 ("Economizar CPU: pausar plugins de canais em sil\xc3\xaancio"), true, engine.isCpuSaver());
     m.addItem (3, juce::String::fromUTF8 ("Zerar contadores (XRUN / DISCO / LOCK)"));
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&audioButton), [this] (int r)
     {
@@ -1542,6 +1762,12 @@ void MainComponent::audioMenu()
             props.getUserSettings()->saveIfNeeded();
         }
         else if (r == 3) engine.resetRealtimeStats();
+        else if (r == 4)
+        {
+            engine.setCpuSaver (! engine.isCpuSaver());
+            props.getUserSettings()->setValue ("cpuSaver", engine.isCpuSaver());
+            props.getUserSettings()->saveIfNeeded();
+        }
     });
 }
 
@@ -1606,6 +1832,11 @@ void MainComponent::importFiles (const juce::Array<juce::File>& files)
 
 void MainComponent::replaceAudio (Track& t)
 {
+    if (t.isFrozen())
+    {
+        alert (juce::String::fromUTF8 ("Trocar \xc3\xa1udio"), juce::String::fromUTF8 ("Descongele a faixa antes de trocar o \xc3\xa1udio."));
+        return;
+    }
     chooser = std::make_unique<juce::FileChooser> (juce::String::fromUTF8 ("Trocar \xc3\xa1udio - ") + t.name,
                                                    t.sourceFile.getParentDirectory(), audioWildcard());
     auto* tp = &t;
@@ -1642,11 +1873,19 @@ void MainComponent::startResampleIfNeeded()
         juce::File file;
         bool wasStream = false;
         std::shared_ptr<StreamingAudio> stream;
+        bool needsAudio = true;
+        juce::File frozenFile;                       // congelada em outra taxa: reabre o render
+        std::shared_ptr<StreamingAudio> frozenStream;
     };
     auto items = std::make_shared<std::vector<Item>>();
     for (auto& t : engine.tracks)
-        if ((t->original != nullptr || t->diskStream != nullptr) && t->playbackRate != sr)
-            items->push_back ({ t.get(), t->original, nullptr, t->originalRate, t->sourceFile, t->diskStream != nullptr, nullptr });
+    {
+        const bool audio = (t->original != nullptr || t->diskStream != nullptr) && t->playbackRate != sr;
+        const bool frozen = t->frozenStream != nullptr && t->frozenStream->getRate() != sr;
+        if (! audio && ! frozen) continue;
+        items->push_back ({ t.get(), t->original, nullptr, t->originalRate, t->sourceFile, t->diskStream != nullptr, nullptr,
+                            audio, frozen ? t->frozenFile : juce::File(), nullptr });
+    }
     if (items->empty()) return;
 
     runJob ("Ajustando a taxa de amostragem (" + juce::String (sr / 1000.0, 1) + " kHz)...", false,
@@ -1655,6 +1894,12 @@ void MainComponent::startResampleIfNeeded()
                 parallelFor ((int) items->size(), j, [&] (int i)
                 {
                     auto& it = (*items)[(size_t) i];
+                    if (it.frozenFile.existsAsFile())
+                    {
+                        juce::String reason;
+                        it.frozenStream = StreamingAudio::open (it.frozenFile, sr, reason); // conversao por trechos
+                    }
+                    if (! it.needsAudio) return;
                     // Faixa em streaming: so reabre o arquivo na nova taxa (a conversao
                     // e feita trecho a trecho pelo disco); nada vai inteiro para a RAM.
                     if (it.wasStream && it.file.existsAsFile())
@@ -1681,6 +1926,12 @@ void MainComponent::startResampleIfNeeded()
         for (auto& it : *items)
         {
             if (! channelExists (it.track)) continue;
+            if (it.frozenStream != nullptr && it.track->isFrozen())
+            {
+                std::vector<std::unique_ptr<juce::AudioProcessor>> none; // plugins ja estao offline
+                engine.setFrozen (*it.track, it.frozenFile, it.frozenStream, none);
+            }
+            if (! it.needsAudio) continue;
             if (it.stream != nullptr) engine.setTrackStream (*it.track, it.stream);
             else if (it.result != nullptr) engine.setTrackAudio (*it.track, it.original, it.rate, it.result, sr);
         }
@@ -2182,7 +2433,7 @@ void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
     if (! readProject (file, *data, err)) { alert ("Abrir", err); return; }
 
     auto decoded = std::make_shared<std::vector<DecodedFile>>();
-    for (auto& t : data->tracks) decoded->push_back ({ t.file, {}, {} });
+    for (auto& t : data->tracks) decoded->push_back ({ t.file, {}, {}, {}, t.frozenFile, {} });
     const double sr = engine.getSampleRate();
 
     runJob ("Abrindo " + file.getFileName() + "...", true,
@@ -2192,6 +2443,11 @@ void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
                 {
                     auto& d = (*decoded)[(size_t) i];
                     if (d.file != juce::File()) decodeInto (d, sr);
+                    if (d.frozenFile.existsAsFile())
+                    {
+                        juce::String reason;
+                        d.frozen = StreamingAudio::open (d.frozenFile, sr, reason);
+                    }
                 });
             },
             [this, data, decoded, file, sr] (Job& j)
@@ -2227,6 +2483,21 @@ void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
             else if (d.audio.ok()) engine.setTrackAudio (*raw, d.audio.original, d.audio.rate, d.playback, sr);
             else problems.add (raw->name + ": " + (d.audio.error.isNotEmpty() ? d.audio.error : juce::String ("sem arquivo de audio")));
             loadInserts (*raw, td.ch, problems);
+            if (td.frozenFile != juce::File())
+            {
+                if (d.frozen != nullptr)
+                {
+                    std::vector<std::unique_ptr<juce::AudioProcessor>> unloaded;
+                    engine.setFrozen (*raw, td.frozenFile, d.frozen, unloaded);
+                }
+                else
+                {
+                    juce::StringArray failed;
+                    restoreOfflineInserts (*raw, -1, false, failed);
+                    problems.add (raw->name + juce::String::fromUTF8 (": arquivo congelado n\xc3\xa3o encontrado; a faixa foi descongelada")
+                                  + (failed.isEmpty() ? juce::String() : " (offline: " + failed.joinIntoString (", ") + ")"));
+                }
+            }
         }
         applyChannelBasics (engine, engine.master, data->master);
         engine.master.name = "MASTER";

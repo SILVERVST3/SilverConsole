@@ -40,6 +40,8 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - **Janela do plugin**: alguns plugins aplicam a escala do Windows duas vezes e abriam gigantes (BSA Drum Bus num monitor 4K a 250% abria com 625%). A janela detecta isso e corrige sozinha; plugins redimensionáveis que ainda não cabem são reduzidos para caber no monitor (com bordas para redimensionar). Plugins não redimensionáveis maiores que a tela ficam com barras de rolagem. No menu do insert, **Escala da janela** permite escolher por plugin: *Automática* (padrão), *Sempre corrigir escala dupla*, *Escala do monitor, sem correção* ou *Modo compatível do Windows (sem DPI)*. A escolha fica salva por plugin.
 - **Compensação automática de latência (PDC)** em faixas, buses e master: plugins com lookahead (limitadores, EQs de fase linear) não desalinham a mix.
 - O estado de todos os plugins é salvo no projeto. Se um plugin não estiver instalado ao abrir, o slot fica **vermelho** e o estado é preservado; ao salvar, nada se perde.
+- **Plugin offline**: no menu do insert (botão direito), **Colocar offline** descarrega o plugin (não usa CPU nem memória) e guarda o ajuste; o slot fica apagado com **OFF**. **Colocar online** recarrega com o mesmo ajuste. O menu do nome da faixa/bus tem **Todos os plugins offline/online**. Fica salvo no projeto (o plugin nem é carregado ao abrir).
+- **Congelar faixa** (menu do nome da faixa): grava a faixa com os plugins (inversão de fase, inserts, automação dos plugins e a cauda de reverb/delay) num WAV ao lado do projeto (pasta "<projeto> - congeladas") e descarrega os plugins. A faixa mostra **CONGELADA** e toca o arquivo, lido do disco. Volume, pan, envios, mute e a automação de volume/pan continuam funcionando. **Descongelar** recarrega os plugins com o ajuste e manda o arquivo congelado para a lixeira.
 
 **Automação**
 - Volume, pan, mute e **qualquer parâmetro dos plugins VST3** podem ser automatizados em faixas, buses e master.
@@ -139,6 +141,8 @@ Em **Áudio → Placa de som**, escolha o dispositivo e o tamanho do buffer. No 
 - As faixas (leitura, inserts e compensação de latência) e depois os **buses** (inserts de reverb/delay etc.) são processados em **vários núcleos** ao mesmo tempo. Dá para desligar em **Áudio → Processar faixas em vários núcleos**. A soma das faixas, a soma dos buses e o master continuam em sequência, na ordem original (resultado idêntico ao de um núcleo).
 - O que roda fora da thread de áudio: leitura do disco (2 threads de E/S), escaneamento de plugins (processo separado), plugins isolados (processo DSP separado, opcional por insert), importação/reamostragem e exportação (thread de trabalho) e a gravação da cópia de recuperação (thread separada, a interface não trava em projetos grandes).
 - A exportação usa os mesmos núcleos do playback (até 8 workers), já que o áudio fica suspenso durante o render.
+- **Economizar CPU** (Áudio → Economizar CPU, ligado por padrão): uma faixa ou bus com a entrada em silêncio, cuja saída dos plugins ficou abaixo de -100 dBFS pelo tempo da cauda declarada pelo plugin (no mínimo 3 s), para de chamar os plugins até o som voltar. O som volta no mesmo bloco, sem diferença no resultado. Com o transporte parado, praticamente todos os plugins dormem. O canal mostra **zz** ao lado de INSERTS e a barra de status mostra, ao lado do CPU, quantos canais estão **dormindo**. Plugins que declaram cauda "infinita" (comum em reverbs e delays) esperam 10 s de silêncio real na saída; enquanto produzirem som (feedback, freeze) não dormem. Inserts isolados (processo DSP) nunca dormem. A exportação sempre processa tudo.
+- **Prioridade no Windows**: o SilverConsole desliga o modo de economia de energia do Windows 11 (que joga programas para os núcleos de eficiência e baixa o clock quando a janela não está em foco), pede timer de 1 ms e roda com prioridade "acima do normal". As threads que processam áudio usam a prioridade "Pro Audio" do Windows.
 - A barra de status mostra os contadores que explicam estalos:
   - **XRUN**: o processamento passou do tempo do buffer (CPU). Aumente o buffer ou alivie os plugins.
   - **DISCO**: o áudio do disco não chegou a tempo (disco lento ou muitas faixas grandes).
@@ -168,7 +172,8 @@ O .exe fica em `build/SilverConsole_artefacts/Release/SilverConsole.exe`.
 
 ## Estrutura do código
 
-- `Source/Engine.*`: motor de mixagem em tempo real (faixas, inserts, envios, buses, master, PDC, transporte, exportação offline).
+- `Source/Engine.*`: motor de mixagem em tempo real (faixas, inserts, envios, buses, master, PDC, transporte, exportação offline, economia de CPU, congelar).
+- `Source/RealtimeThread.*`: prioridade de áudio no Windows (MMCSS, sem economia de energia).
 - `Source/AudioLoader.*`: leitura de arquivos e reamostragem.
 - `Source/StreamingAudio.*`: cache por janela, pré-leitura assíncrona e visão resumida de forma de onda.
 - `Source/Project.*`: formato `.sconsole`.

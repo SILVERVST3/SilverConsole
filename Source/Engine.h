@@ -116,11 +116,13 @@ struct InsertSlot
     juce::MemoryBlock missingState;   // estado guardado quando o plugin nao abriu
     std::atomic<bool> bypassed { false };
     std::atomic<bool> faulted { false }; // Falha C++ em processBlock; exibida na interface, sem locks
+    bool offline = false;              // plugin descarregado de proposito (estado em missingState)
     int bufferChannels = 2;
     int mainOutChannels = 2;
 
     bool isEmpty() const noexcept     { return processor == nullptr && remote == nullptr && ! hasDescription; }
-    bool isMissing() const noexcept   { return processor == nullptr && remote == nullptr && hasDescription; }
+    bool isMissing() const noexcept   { return processor == nullptr && remote == nullptr && hasDescription && ! offline; }
+    bool isOffline() const noexcept   { return processor == nullptr && remote == nullptr && hasDescription && offline; }
     juce::String getName() const
     {
         if (hasDescription) return description.name;
@@ -161,6 +163,16 @@ struct Channel
     juce::LinearSmoothedValue<float> smoothL, smoothR;
     DelayLine pdc;
     int chainLatency = 0;
+
+    // Economia de CPU: com a entrada em silencio e a saida dos plugins abaixo de
+    // -100 dBFS por sleepHoldSamples (cauda dos plugins + margem), o canal para
+    // de chamar os plugins ate o som voltar. So a thread de audio mexe nestes,
+    // exceto sleepHoldSamples (calculado em updateLatency, sob o lock).
+    int sleepHoldSamples = 0; // 0 = sem plugins ativos; -1 = nunca dorme
+    int silentSamples = 0;
+    bool sleeping = false;
+    std::atomic<bool> asleep { false }; // leitura pela interface
+    void wake() noexcept { sleeping = false; silentSamples = 0; asleep.store (false, std::memory_order_relaxed); }
 };
 
 struct Send
@@ -185,6 +197,13 @@ struct Track : Channel
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
     SlotList<Send> sends { kDefaultSends };
+
+    // Congelada: toca o render da faixa (inserts e inversao de fase ja aplicados,
+    // antes do fader) lido do disco; os plugins ficam offline. O audio original
+    // continua carregado para descongelar.
+    juce::File frozenFile;
+    std::shared_ptr<StreamingAudio> frozenStream;
+    bool isFrozen() const noexcept { return frozenStream != nullptr; }
 };
 
 struct Bus : Channel { Bus() : Channel (ChannelKind::bus) {} };
@@ -234,7 +253,11 @@ public:
         Channel&, int slot, std::shared_ptr<RemoteDspInsert>, const juce::PluginDescription&);
     std::unique_ptr<juce::AudioProcessor> clearInsert (Channel&, int slot);
     void setMissingInsert (Channel&, int slot, const juce::PluginDescription&,
-                           const juce::MemoryBlock& state, bool preferRemote = false);
+                           const juce::MemoryBlock& state, bool preferRemote = false, bool offline = false);
+    /** Plugin offline: guarda o estado e descarrega o plugin (sem CPU nem memoria);
+        a latencia sai da PDC. Devolve o processador para destruir fora do lock.
+        Para voltar, a interface recria o plugin com o estado guardado. */
+    std::unique_ptr<juce::AudioProcessor> takeInsertOffline (Channel&, int slot);
     void swapInserts (Channel&, int a, int b);
     void setBypass (Channel&, int slot, bool);
     /** Numero de slots de insert/envio. Diminuir so remove slots vazios do fim.
@@ -311,9 +334,48 @@ public:
     {
         juce::uint64 sum = 0;
         for (auto& t : tracks)
+        {
             if (t->diskStream != nullptr) sum += t->diskStream->getMissingSamples();
+            if (t->frozenStream != nullptr) sum += t->frozenStream->getMissingSamples();
+        }
         return sum;
     }
+
+    /** Economia de CPU: canais em silencio param de chamar os plugins. */
+    void setCpuSaver (bool on) noexcept { cpuSaver.store (on, std::memory_order_relaxed); }
+    bool isCpuSaver() const noexcept { return cpuSaver.load (std::memory_order_relaxed); }
+    /** Canais com plugins que estao dormindo agora / que podem dormir (thread de mensagens). */
+    int getSleepingCount() const noexcept
+    {
+        int n = 0;
+        for (auto& t : tracks) n += t->asleep.load (std::memory_order_relaxed) ? 1 : 0;
+        for (auto& b : buses) n += b->asleep.load (std::memory_order_relaxed) ? 1 : 0;
+        return n;
+    }
+
+    // ---- Congelar faixa ---------------------------------------------------------
+    /** Renderiza a faixa (leitura, inversao de fase, inserts com automacao,
+        latencia removida; antes do fader) num WAV float 32 bits + cauda.
+        Roda numa thread de trabalho (o audio fica suspenso como na exportacao). */
+    bool renderFreeze (Track&, const juce::File&, double tailSeconds, std::atomic<float>& progress,
+                       std::atomic<bool>& cancel, juce::String& error);
+    /** Passa a tocar o arquivo congelado e, no MESMO instante, descarrega os
+        plugins da faixa (estado guardado, slots offline). Os processadores voltam
+        em 'unloaded' para destruir fora do lock. Tambem troca so o arquivo
+        (mudanca de taxa) quando os plugins ja estao offline. */
+    void setFrozen (Track&, const juce::File&, std::shared_ptr<StreamingAudio>,
+                    std::vector<std::unique_ptr<juce::AudioProcessor>>& unloaded);
+
+    /** Plugin recriado (na thread de mensagens) para voltar a um slot offline. */
+    struct RestoredInsert
+    {
+        int slot = -1;
+        std::unique_ptr<juce::AudioProcessor> local;
+        std::shared_ptr<RemoteDspInsert> remote;
+    };
+    /** Coloca os plugins de volta online (mantem bypass e automacao). Com
+        unfreeze, para de tocar o arquivo congelado no mesmo instante. */
+    void restoreInserts (Channel&, std::vector<RestoredInsert>&, bool unfreeze);
 
     /** Processamento das faixas em varios nucleos no callback da placa. */
     void setMultiCore (bool shouldUse) noexcept { multiCore.store (shouldUse, std::memory_order_relaxed); }
@@ -322,7 +384,11 @@ public:
 
     void resetRealtimeStats() noexcept
     {
-        for (auto& t : tracks) if (t->diskStream != nullptr) t->diskStream->resetMissingSamples();
+        for (auto& t : tracks)
+        {
+            if (t->diskStream != nullptr) t->diskStream->resetMissingSamples();
+            if (t->frozenStream != nullptr) t->frozenStream->resetMissingSamples();
+        }
         lockContentions.store (0, std::memory_order_relaxed);
         renderSuspensions.store (0, std::memory_order_relaxed);
         processedCallbacks.store (0, std::memory_order_relaxed);
@@ -388,6 +454,12 @@ private:
     void prepareSlot (InsertSlot&);
     int chainLatencyOf (const Channel&) const;
     void runInserts (Channel&, int n, juce::AudioBuffer<float>&, juce::MidiBuffer&);
+    /** runInserts com a economia de CPU (canal em silencio dorme). */
+    void processChain (Channel&, int n, juce::AudioBuffer<float>&, juce::MidiBuffer&, bool allowSleep);
+    int sleepHoldFor (const Channel&) const;
+    struct ReadSeg { juce::int64 src; int dst; int len; };
+    /** Le o audio da faixa (congelado, disco ou RAM) nos trechos pedidos. */
+    void readTrackSource (Track&, float* left, float* right, const ReadSeg*, int numSegs, double sr) noexcept;
     void forEachChannel (const std::function<void (Channel&)>&);
     template <typename Fn> void forEachChannelNoAlloc (Fn&& fn)
     {
@@ -400,6 +472,7 @@ private:
     std::unique_ptr<OfflineTrackPool> offlineTrackPool;
     std::unique_ptr<RealtimeTrackPool> realtimePool;
     std::atomic<bool> multiCore { true };
+    std::atomic<bool> cpuSaver { true };
     TruePeak4x truePeakMeter;
     MomentaryLoudness momentaryLoudness; // estado exclusivo do motor sob engine.lock
     std::atomic<juce::uint64> lockContentions { 0 }, renderSuspensions { 0 }, processedCallbacks { 0 }, callbackOverruns { 0 }, pluginExceptions { 0 };

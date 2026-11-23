@@ -1,4 +1,5 @@
-// SilverConsole - visual SILVER (grafite + aluminio escovado). Codigo original (MIT).
+// SilverConsole - visual SILVER escuro (mesma paleta do SILVER AXES / SILVER ANGEL):
+// fundo quase preto, placas azul-marinho, chumbo, prata e LEDs azul-gelo. Codigo original (MIT).
 #pragma once
 #include <JuceHeader.h>
 
@@ -6,19 +7,27 @@ namespace sc
 {
 namespace colours
 {
-    const juce::Colour background  { 0xff11161c };
-    const juce::Colour panel       { 0xff202832 };
-    const juce::Colour panelLine   { 0xff35414d };
-    const juce::Colour silverTop   { 0xffdfe3e7 };
-    const juce::Colour silverBot   { 0xffa9b0b8 };
-    const juce::Colour silverDark  { 0xff7d858e };
-    const juce::Colour ink         { 0xff1b1f23 };
-    const juce::Colour inkSoft     { 0xff4a525b };
-    const juce::Colour text        { 0xffe4e8ec };
-    const juce::Colour textDim     { 0xff8b949e };
-    const juce::Colour lcd         { 0xff12161a };
-    const juce::Colour lcdText     { 0xff8fd8ff };
-    const juce::Colour accent      { 0xff46b9ed };
+    const juce::Colour background  { 0xff0a0b0d };
+    const juce::Colour panel       { 0xff1c2026 }; // chumbo escuro (barras, dialogos)
+    const juce::Colour panelLine   { 0xff3b4149 }; // chumbo
+    const juce::Colour silverTop   { 0xffdde3ea }; // prata
+    const juce::Colour silverBot   { 0xffaab3be }; // prata apagado
+    const juce::Colour silverDark  { 0xff5b636d };
+    const juce::Colour ink         { 0xff101418 }; // texto sobre fundo claro/colorido
+    const juce::Colour inkSoft     { 0xff3a414a };
+    const juce::Colour text        { 0xffdde3ea };
+    const juce::Colour textDim     { 0xff8a94a0 };
+    const juce::Colour lcd         { 0xff040a16 }; // tela
+    const juce::Colour lcdText     { 0xff8cc4ff }; // azul gelo
+    const juce::Colour accent      { 0xff8cc4ff }; // azul gelo (arcos, LEDs, linhas)
+    const juce::Colour accentDeep  { 0xff2f5d96 }; // azul gelo escuro (botao ligado, selecao)
+    const juce::Colour navyHi      { 0xff1a3468 }; // placa azul-marinho
+    const juce::Colour navyLo      { 0xff081429 };
+    const juce::Colour navyDeep    { 0xff050c1a };
+    const juce::Colour gunHi       { 0xff5a626d }; // cinza chumbo
+    const juce::Colour gun         { 0xff3b4149 };
+    const juce::Colour gunLo       { 0xff23272c };
+    const juce::Colour grid        { 0xff13264a };
     const juce::Colour mute        { 0xffe0892c };
     const juce::Colour solo        { 0xffe8c42a };
     const juce::Colour danger      { 0xffe2453c };
@@ -46,18 +55,30 @@ public:
         setColourScheme ({ panel, background, panel, panelLine, text, accent, juce::Colours::black, accent, text });
         setColour (juce::ResizableWindow::backgroundColourId, background);
         setColour (juce::DocumentWindow::backgroundColourId, background);
-        setColour (juce::TextButton::buttonColourId, juce::Colour (0xff2a3036));
-        setColour (juce::TextButton::buttonOnColourId, accent);
+        setColour (juce::TextButton::buttonColourId, gun);
+        setColour (juce::TextButton::buttonOnColourId, accentDeep);
         setColour (juce::TextButton::textColourOffId, text);
-        setColour (juce::TextButton::textColourOnId, ink);
+        setColour (juce::TextButton::textColourOnId, juce::Colours::white);
         setColour (juce::Label::textColourId, text);
         setColour (juce::Slider::thumbColourId, silverTop);
         setColour (juce::Slider::trackColourId, accent);
         setColour (juce::Slider::backgroundColourId, lcd);
-        setColour (juce::PopupMenu::backgroundColourId, juce::Colour (0xff23282e));
+        setColour (juce::PopupMenu::backgroundColourId, navyDeep);
         setColour (juce::PopupMenu::textColourId, text);
-        setColour (juce::PopupMenu::highlightedBackgroundColourId, accent);
-        setColour (juce::PopupMenu::highlightedTextColourId, ink);
+        setColour (juce::PopupMenu::highlightedBackgroundColourId, accentDeep);
+        setColour (juce::PopupMenu::highlightedTextColourId, juce::Colours::white);
+        setColour (juce::TooltipWindow::backgroundColourId, navyDeep);
+        setColour (juce::TooltipWindow::textColourId, text);
+        setColour (juce::TooltipWindow::outlineColourId, accentDeep);
+        setColour (juce::AlertWindow::backgroundColourId, panel);
+        setColour (juce::AlertWindow::textColourId, text);
+        setColour (juce::AlertWindow::outlineColourId, gun);
+        setColour (juce::ComboBox::textColourId, lcdText);
+        setColour (juce::ComboBox::outlineColourId, gun);
+        setColour (juce::ComboBox::arrowColourId, silverBot);
+        setColour (juce::ToggleButton::textColourId, text);
+        setColour (juce::ToggleButton::tickColourId, accent);
+        setColour (juce::ToggleButton::tickDisabledColourId, silverDark);
         setColour (juce::PopupMenu::headerTextColourId, textDim);
         setColour (juce::TextEditor::backgroundColourId, lcd);
         setColour (juce::TextEditor::textColourId, lcdText);
@@ -69,8 +90,27 @@ public:
         setColour (juce::Slider::textBoxOutlineColourId, panelLine);
         setColour (juce::ListBox::backgroundColourId, panel);
         setColour (juce::ComboBox::backgroundColourId, lcd);
-        setColour (juce::ProgressBar::foregroundColourId, accent);
+        setColour (juce::ProgressBar::foregroundColourId, accentDeep);
         setColour (juce::ProgressBar::backgroundColourId, lcd);
+    }
+
+    // placa de canal: azul-marinho (faixas/master) ou chumbo (buses), com textura escovada fina
+    static void drawPlate (juce::Graphics& g, juce::Rectangle<float> r, juce::Colour hi, juce::Colour lo, int seed)
+    {
+        g.setColour (juce::Colours::black.withAlpha (0.7f));
+        g.fillRoundedRectangle (r.translated (0.0f, 1.5f), 5.0f);
+        g.setGradientFill ({ hi, r.getCentreX(), r.getY() + r.getHeight() * 0.35f, lo, r.getX(), r.getBottom(), true });
+        g.fillRoundedRectangle (r, 5.0f);
+        juce::Random rnd (seed);
+        for (int y = (int) r.getY() + 2; y < (int) r.getBottom() - 2; y += 3)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.008f + rnd.nextFloat() * 0.018f));
+            g.drawHorizontalLine (y, r.getX() + 2, r.getRight() - 2);
+        }
+        g.setColour (juce::Colours::white.withAlpha (0.10f));
+        g.drawHorizontalLine ((int) r.getY() + 1, r.getX() + 4, r.getRight() - 4);
+        g.setColour (juce::Colours::black.withAlpha (0.9f));
+        g.drawRoundedRectangle (r, 5.0f, 1.0f);
     }
 
     juce::Font getTextButtonFont (juce::TextButton&, int h) override { return uiFont (juce::jmin (13.0f, h * 0.62f), true); }
@@ -80,15 +120,17 @@ public:
     void drawButtonBackground (juce::Graphics& g, juce::Button& b, const juce::Colour& bg, bool over, bool down) override
     {
         auto r = b.getLocalBounds().toFloat().reduced (0.5f);
+        // botao de chumbo (como os do SILVER AXES): gradiente vertical, brilho no topo, borda preta
         auto base = b.getToggleState() ? b.findColour (juce::TextButton::buttonOnColourId) : bg;
-        if (down) base = base.darker (0.25f);
-        else if (over) base = base.brighter (0.12f);
-        g.setGradientFill ({ base.brighter (0.10f), 0, r.getY(), base.darker (0.12f), 0, r.getBottom(), false });
-        g.fillRoundedRectangle (r, 5.0f);
-        g.setColour (juce::Colours::white.withAlpha (over ? 0.18f : 0.07f));
-        g.drawRoundedRectangle (r.reduced (1.0f), 4.0f, 1.0f);
-        g.setColour (juce::Colours::black.withAlpha (0.45f));
-        g.drawRoundedRectangle (r, 5.0f, 1.0f);
+        if (over) base = base.brighter (0.12f);
+        auto topC = base.brighter (0.28f), botC = base.darker (0.35f);
+        if (down) std::swap (topC, botC);
+        g.setGradientFill ({ topC, 0, r.getY(), botC, 0, r.getBottom(), false });
+        g.fillRoundedRectangle (r, 4.0f);
+        g.setColour (juce::Colours::white.withAlpha (down ? 0.04f : 0.16f));
+        g.drawHorizontalLine ((int) r.getY() + 1, r.getX() + 3.0f, r.getRight() - 3.0f);
+        g.setColour (juce::Colours::black);
+        g.drawRoundedRectangle (r, 4.0f, 1.0f);
     }
 
     void drawLinearSlider (juce::Graphics& g, int x, int y, int w, int h, float pos, float, float,
@@ -117,9 +159,9 @@ public:
         g.drawRoundedRectangle (groove, 2.5f, 1.0f);
 
         auto cap = juce::Rectangle<float> (juce::jmin ((float) w - 4.0f, 36.0f), 24.0f).withCentre ({ cx, pos });
-        g.setColour (juce::Colours::black.withAlpha (0.45f));
+        g.setColour (juce::Colours::black.withAlpha (0.6f));
         g.fillRoundedRectangle (cap.translated (0, 2), 3.0f);
-        g.setGradientFill ({ colours::silverTop, 0, cap.getY(), colours::silverDark, 0, cap.getBottom(), false });
+        g.setGradientFill ({ juce::Colour (0xfff6f8fb), 0, cap.getY(), juce::Colour (0xff6b737e), 0, cap.getBottom(), false });
         g.fillRoundedRectangle (cap, 3.0f);
         g.setColour (juce::Colours::white.withAlpha (0.55f));
         g.drawHorizontalLine ((int) cap.getY() + 2, cap.getX() + 3, cap.getRight() - 3);
@@ -145,19 +187,28 @@ public:
         juce::Path bg, arc;
         bg.addCentredArc (c.x, c.y, radius - 1.5f, radius - 1.5f, 0, a0, a1, true);
         arc.addCentredArc (c.x, c.y, radius - 1.5f, radius - 1.5f, 0, juce::jmin (from, angle), juce::jmax (from, angle), true);
-        g.setColour (colours::lcd);
+        g.setColour (juce::Colours::black.withAlpha (0.8f));
         g.strokePath (bg, juce::PathStrokeType (3.0f));
-        g.setColour (s.findColour (juce::Slider::trackColourId));
-        g.strokePath (arc, juce::PathStrokeType (3.0f));
+        const auto arcColour = s.findColour (juce::Slider::trackColourId);
+        g.setColour (arcColour.withAlpha (0.25f));
+        g.strokePath (arc, juce::PathStrokeType (5.0f));
+        g.setColour (arcColour);
+        g.strokePath (arc, juce::PathStrokeType (2.5f));
 
+        // knob preto (como os do SILVER AXES): sombra, corpo escuro com brilho e ponteiro prata
         auto body = knob.reduced (5.0f);
-        g.setGradientFill ({ colours::silverTop, body.getX(), body.getY(), colours::silverDark, body.getRight(), body.getBottom(), false });
+        g.setColour (juce::Colours::black.withAlpha (0.6f));
+        g.fillEllipse (body.translated (0.0f, 1.5f));
+        g.setGradientFill ({ juce::Colour (0xff3a3d43), body.getX() + body.getWidth() * 0.2f, body.getY(),
+                             juce::Colour (0xff040405), body.getRight() - body.getWidth() * 0.2f, body.getBottom(), false });
         g.fillEllipse (body);
-        g.setColour (juce::Colours::black.withAlpha (0.55f));
+        g.setColour (juce::Colours::white.withAlpha (0.14f));
+        g.drawEllipse (body.reduced (0.5f), 1.0f);
+        g.setColour (juce::Colours::black);
         g.drawEllipse (body, 1.0f);
         juce::Path ptr;
-        ptr.addRoundedRectangle (-1.25f, -body.getHeight() * 0.5f + 2.0f, 2.5f, body.getHeight() * 0.38f, 1.0f);
-        g.setColour (colours::ink);
+        ptr.addRoundedRectangle (-1.25f, -body.getHeight() * 0.5f + 2.0f, 2.5f, body.getHeight() * 0.40f, 1.0f);
+        g.setColour (colours::silverTop);
         g.fillPath (ptr, juce::AffineTransform::rotation (angle).translated (c.x, c.y));
     }
 
@@ -168,10 +219,10 @@ public:
         g.fillRoundedRectangle (r, 3.0f);
         if (progress >= 0)
         {
-            g.setColour (colours::accent);
+            g.setColour (colours::accentDeep);
             g.fillRoundedRectangle (r.withWidth ((float) (w * juce::jlimit (0.0, 1.0, progress))), 3.0f);
         }
-        g.setColour (colours::text);
+        g.setColour (juce::Colours::white);
         g.setFont (uiFont (13.0f, true));
         g.drawText (text, r, juce::Justification::centred);
     }

@@ -245,7 +245,7 @@ public:
     {
         if (shown != channel.getAutoMode()) refresh();
         auto r = getLocalBounds();
-        g.setGradientFill ({ colours::silverTop, 0, 0, colours::silverBot, 0, (float) getHeight(), false });
+        g.setGradientFill ({ colours::navyHi, 0, 0, colours::navyLo, 0, (float) getHeight(), false });
         g.fillRect (r.removeFromLeft (headerW));
         g.setColour (colours::panel.brighter (0.06f));
         g.fillRect (r);
@@ -255,7 +255,7 @@ public:
         juce::Path tri;
         if (open) tri.addTriangle (12.0f, 11.0f, 22.0f, 11.0f, 17.0f, 18.0f);
         else tri.addTriangle (13.0f, 9.0f, 20.0f, 14.5f, 13.0f, 20.0f);
-        g.setColour (colours::ink);
+        g.setColour (colours::silverTop);
         g.fillPath (tri);
         g.setFont (uiFont (13.0f, true));
         g.drawFittedText (channel.name, 28, 0, headerW - 28 - 104, getHeight(), juce::Justification::centredLeft, 1, 0.8f);

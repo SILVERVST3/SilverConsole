@@ -11,6 +11,7 @@ struct InsertData
     bool bypass = false;
     bool hasDesc = false;
     bool isolated = false; // opcional, compativel com projetos anteriores
+    bool offline = false;  // plugin descarregado de proposito (so o estado fica)
     juce::PluginDescription desc;
     juce::MemoryBlock state;
 };
@@ -41,6 +42,7 @@ struct TrackData
 {
     ChannelData ch;
     juce::File file;
+    juce::File frozenFile; // faixa congelada: render tocado no lugar do audio + plugins offline
     int output = -1;
     std::vector<SendData> sends = std::vector<SendData> ((size_t) kDefaultSends);
     LoadedAudio audio; // preenchido ao carregar

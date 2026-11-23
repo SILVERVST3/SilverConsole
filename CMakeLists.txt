@@ -48,6 +48,7 @@ set(SC_COMMON_DEFS
 
 set(SC_ENGINE_SOURCES
     Source/Engine.cpp Source/Engine.h Source/Metering.h
+    Source/RealtimeThread.cpp Source/RealtimeThread.h
     Source/AudioLoader.cpp Source/AudioLoader.h
     Source/StreamingAudio.cpp Source/StreamingAudio.h
     Source/DspIpcProtocol.h Source/DspIpcWatchdog.h
@@ -114,7 +115,8 @@ juce_add_console_app(ScDspWorker PRODUCT_NAME "SilverConsole DSP Worker")
 set_target_properties(ScDspWorker PROPERTIES OUTPUT_NAME "ScDspWorker")
 juce_generate_juce_header(ScDspWorker)
 target_sources(ScDspWorker PRIVATE
-    Source/DspWorkerMain.cpp Source/DspIpcProtocol.h)
+    Source/DspWorkerMain.cpp Source/DspIpcProtocol.h
+    Source/RealtimeThread.cpp Source/RealtimeThread.h)
 target_compile_definitions(ScDspWorker PRIVATE ${SC_COMMON_DEFS})
 target_link_libraries(ScDspWorker PRIVATE
     juce::juce_audio_utils juce::juce_audio_processors

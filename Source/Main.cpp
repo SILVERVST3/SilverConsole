@@ -1,6 +1,7 @@
 // SilverConsole - aplicativo. Codigo original (MIT).
 #include <JuceHeader.h>
 #include "MainComponent.h"
+#include "RealtimeThread.h"
 
 class SilverConsoleApplication : public juce::JUCEApplication
 {
@@ -11,6 +12,7 @@ public:
 
     void initialise (const juce::String& commandLine) override
     {
+        sc::rt::configureProcessForAudio(); // sem EcoQoS, timer 1 ms, prioridade acima do normal
         juce::PropertiesFile::Options o;
         o.applicationName = "SilverConsole";
         o.folderName = "SilverConsole";
@@ -58,7 +60,7 @@ private:
     {
     public:
         explicit MainWindow (juce::ApplicationProperties& props)
-            : DocumentWindow ("SilverConsole", juce::Colour (0xff15181c), juce::DocumentWindow::allButtons)
+            : DocumentWindow ("SilverConsole", juce::Colour (0xff0a0b0d), juce::DocumentWindow::allButtons)
         {
             setUsingNativeTitleBar (true);
             setContentOwned (new sc::MainComponent (props), true);

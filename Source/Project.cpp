@@ -25,6 +25,7 @@ namespace
             in.bypass = s.bypassed.load();
             in.hasDesc = s.hasDescription;
             in.isolated = s.preferRemote;
+            in.offline = s.offline;
             in.desc = s.description;
             if (s.processor != nullptr) s.processor->getStateInformation (in.state);
             else in.state = s.missingState;
@@ -55,6 +56,7 @@ namespace
             x->setAttribute ("slot", in.slot);
             x->setAttribute ("bypass", in.bypass);
             x->setAttribute ("isolated", in.isolated);
+            if (in.offline) x->setAttribute ("offline", true);
             if (auto desc = in.desc.createXml()) x->addChildElement (desc.release());
             x->createNewChildElement ("STATE")->addTextElement (in.state.toBase64Encoding());
         }
@@ -89,6 +91,7 @@ namespace
             in.slot = x->getIntAttribute ("slot", -1);
             in.bypass = x->getBoolAttribute ("bypass");
             in.isolated = x->getBoolAttribute ("isolated", false);
+            in.offline = x->getBoolAttribute ("offline", false);
             if (! juce::isPositiveAndBelow (in.slot, kMaxInsertsPerChannel)) continue;
             if (auto* p = x->getChildByName ("PLUGIN")) in.hasDesc = in.desc.loadFromXml (*p);
             if (auto* s = x->getChildByName ("STATE")) in.state.fromBase64Encoding (s->getAllSubText().trim());
@@ -133,6 +136,7 @@ ProjectData captureProject (Engine& engine)
         TrackData td;
         td.ch = captureChannel (*t);
         td.file = t->sourceFile;
+        td.frozenFile = t->frozenFile;
         td.output = t->outputBus.load();
         td.sends.clear();
         for (auto& s : t->sends)
@@ -186,6 +190,11 @@ bool writeProject (const ProjectData& p, const juce::File& file, juce::String& e
         e->setAttribute ("file", t.file.getFullPathName());
         if (t.file != juce::File())
             e->setAttribute ("relFile", t.file.getRelativePathFrom (dir).replaceCharacter ('\\', '/'));
+        if (t.frozenFile != juce::File())
+        {
+            e->setAttribute ("frozenFile", t.frozenFile.getFullPathName());
+            e->setAttribute ("relFrozenFile", t.frozenFile.getRelativePathFrom (dir).replaceCharacter ('\\', '/'));
+        }
         e->setAttribute ("output", t.output);
         e->setAttribute ("sends", (int) t.sends.size());
         for (int i = 0; i < (int) t.sends.size(); ++i)
@@ -246,6 +255,10 @@ bool readProject (const juce::File& file, ProjectData& p, juce::String& error)
         const auto abs = e->getStringAttribute ("file");
         if (rel.isNotEmpty() && dir.getChildFile (rel).existsAsFile()) t.file = dir.getChildFile (rel);
         else if (juce::File::isAbsolutePath (abs)) t.file = juce::File (abs);
+        const auto relFrozen = e->getStringAttribute ("relFrozenFile");
+        const auto absFrozen = e->getStringAttribute ("frozenFile");
+        if (relFrozen.isNotEmpty() && dir.getChildFile (relFrozen).existsAsFile()) t.frozenFile = dir.getChildFile (relFrozen);
+        else if (juce::File::isAbsolutePath (absFrozen)) t.frozenFile = juce::File (absFrozen);
         t.output = validBus (e->getIntAttribute ("output", -1));
         t.sends.assign ((size_t) juce::jlimit (1, kMaxSendsPerTrack, e->getIntAttribute ("sends", kDefaultSends)), SendData {});
         for (auto* x : e->getChildWithTagNameIterator ("SEND"))

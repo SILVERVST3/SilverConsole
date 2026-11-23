@@ -113,6 +113,7 @@ private:
     juce::Label nameLabel, infoLabel, gainLabel, panLabel;
     juce::OwnedArray<InsertSlotComponent> slots;
     std::vector<int> lastInsertVisualState; // evita 30x repaints/s por faixa sem mudancas
+    bool shownAsleep = false;               // indicador "zz" (economia de CPU)
     juce::OwnedArray<SendRow> sends;
     juce::TextButton addInsertButton { "+" }, addSendButton { "+" };
     void refreshAutoButton();

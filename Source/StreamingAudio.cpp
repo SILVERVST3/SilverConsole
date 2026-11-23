@@ -1,5 +1,6 @@
 // Streaming assíncrono com cache imutavel de tamanho limitado (MIT).
 #include "StreamingAudio.h"
+#include "RealtimeThread.h"
 #include "AudioLoader.h"
 #include <algorithm>
 #include <cmath>
@@ -228,7 +229,11 @@ void StreamingAudio::copy (float* left, float* right, int destOffset,
 struct StreamWorker::IoThread final : public juce::Thread
 {
     IoThread (StreamWorker& o, int index) : juce::Thread ("SilverConsole disk " + juce::String (index)), owner (o) {}
-    void run() override { while (! threadShouldExit()) owner.runOnce (*this); }
+    void run() override
+    {
+        rt::disableThreadThrottling(); // leitura de disco sem nucleo de eficiencia
+        while (! threadShouldExit()) owner.runOnce (*this);
+    }
     StreamWorker& owner;
 };
 

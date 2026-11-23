@@ -1,5 +1,6 @@
 // SilverConsole - motor de mixagem. Codigo original (MIT).
 #include "Engine.h"
+#include "RealtimeThread.h"
 #if JUCE_WINDOWS
  #ifndef NOMINMAX
   #define NOMINMAX
@@ -191,15 +192,9 @@ private:
    #if JUCE_WINDOWS
     void workerLoop()
     {
-        // Prioridade de audio: MMCSS "Pro Audio" (se disponivel) + tempo critico.
-        using AvSet = HANDLE (WINAPI*) (LPCWSTR, LPDWORD);
-        if (auto* avrt = ::LoadLibraryW (L"avrt.dll"))
-            if (auto set = reinterpret_cast<AvSet> (::GetProcAddress (avrt, "AvSetMmThreadCharacteristicsW")))
-            {
-                DWORD taskIndex = 0;
-                set (L"Pro Audio", &taskIndex);
-            }
-        ::SetThreadPriority (::GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        // Prioridade de audio: MMCSS "Pro Audio", tempo critico e sem economia
+        // de energia do Windows 11 (nunca em nucleo de eficiencia/clock baixo).
+        rt::promoteAudioThread();
         while (! stopping.load (std::memory_order_relaxed))
         {
             ::WaitForSingleObject (semaphore, INFINITE);
@@ -534,7 +529,9 @@ std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, s
         if (desc != nullptr) s.description = *desc;
         s.missingState.reset();
         s.bypassed = false;
+        s.offline = false;
         s.faulted.store (false, std::memory_order_relaxed);
+        c.wake();
         if (auto* np = s.processor.get())
         {
             s.bufferChannels = juce::jlimit (2, kMaxPluginChannels,
@@ -569,6 +566,8 @@ std::unique_ptr<juce::AudioProcessor> Engine::setRemoteInsert (
         entry.missingState = entry.remote->getInitialState();
         entry.bypassed.store (false, std::memory_order_relaxed);
         entry.faulted.store (false, std::memory_order_relaxed);
+        entry.offline = false;
+        c.wake();
         entry.bufferChannels = 2;
         entry.mainOutChannels = 2;
         updateLatency();
@@ -587,12 +586,39 @@ std::unique_ptr<juce::AudioProcessor> Engine::clearInsert (Channel& c, int slot)
 }
 
 void Engine::setMissingInsert (Channel& c, int slot, const juce::PluginDescription& d,
-                               const juce::MemoryBlock& state, bool preferRemote)
+                               const juce::MemoryBlock& state, bool preferRemote, bool offline)
 {
     auto old = setInsert (c, slot, nullptr, &d);
     c.inserts[(size_t) slot].missingState = state;
     c.inserts[(size_t) slot].preferRemote = preferRemote;
+    c.inserts[(size_t) slot].offline = offline;
     jassert (old == nullptr);
+}
+
+std::unique_ptr<juce::AudioProcessor> Engine::takeInsertOffline (Channel& c, int slot)
+{
+    if (! c.hasInsert (slot)) return {};
+    auto& s = c.inserts[(size_t) slot];
+    if (s.processor == nullptr && s.remote == nullptr) return {};
+    // Estado lido na thread de mensagens, antes de tirar o plugin do motor.
+    juce::MemoryBlock state;
+    if (s.processor != nullptr) s.processor->getStateInformation (state);
+    else state = s.missingState; // DSP isolado: estado inicial guardado
+    std::unique_ptr<juce::AudioProcessor> old;
+    std::shared_ptr<RemoteDspInsert> retiredRemote;
+    {
+        const juce::ScopedLock sl (lock);
+        old = std::move (s.processor);
+        retiredRemote = std::move (s.remote);
+        s.missingState = std::move (state);
+        s.offline = true;
+        s.faulted.store (false, std::memory_order_relaxed);
+        c.wake();
+        updateLatency();
+    }
+    if (old != nullptr) old->removeListener (this);
+    retiredRemote.reset(); // processo DSP encerrado fora do lock
+    return old;
 }
 
 void Engine::swapInserts (Channel& c, int a, int b)
@@ -613,6 +639,7 @@ void Engine::swapInserts (Channel& c, int a, int b)
     std::swap (x.hasDescription, y.hasDescription);
     std::swap (x.preferRemote, y.preferRemote);
     std::swap (x.missingState, y.missingState);
+    std::swap (x.offline, y.offline);
     std::swap (x.bufferChannels, y.bufferChannels);
     std::swap (x.mainOutChannels, y.mainOutChannels);
     const bool bx = x.bypassed.load();
@@ -621,6 +648,7 @@ void Engine::swapInserts (Channel& c, int a, int b)
     const bool fx = x.faulted.load();
     x.faulted = y.faulted.load();
     y.faulted = fx;
+    c.wake();
 }
 
 void Engine::setBypass (Channel& c, int slot, bool b)
@@ -630,6 +658,7 @@ void Engine::setBypass (Channel& c, int slot, bool b)
     auto& insert = c.inserts[(size_t) slot];
     insert.bypassed = b;
     if (! b) insert.faulted.store (false, std::memory_order_relaxed); // retry explicito
+    c.wake();
     updateLatency();
 }
 
@@ -723,6 +752,7 @@ void Engine::clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& t
             s.preferRemote = false;
             s.missingState.reset();
             s.bypassed = false;
+            s.offline = false;
         }
         master.gainDb = 0.0f; master.pan = 0.0f; master.mute = false; master.mono = false;
         updateLatency();
@@ -899,6 +929,30 @@ void Engine::updateLatency()
     if (directDelay.getDelay() != busMax) directDelay.setDelay (busMax);
     master.chainLatency = chainLatencyOf (master);
     totalLatency = trackMax + busMax + master.chainLatency;
+    for (auto& t : tracks) t->sleepHoldSamples = sleepHoldFor (*t);
+    for (auto& b : buses)  b->sleepHoldSamples = sleepHoldFor (*b);
+}
+
+int Engine::sleepHoldFor (const Channel& c) const
+{
+    // Tempo de silencio na saida antes de dormir: cauda declarada pelos plugins
+    // + 0,5 s, no minimo 3 s (cobre delays longos com eco esparso), mais a
+    // latencia da cadeia. Cauda "infinita" (muitos reverbs/delays declaram assim
+    // por nao saber o tamanho): espera 10 s de saida em silencio real; enquanto
+    // o plugin produzir som (feedback, freeze) ele nunca dorme. DSP isolado: nunca.
+    double tail = 0.0;
+    bool any = false;
+    for (auto& s : c.inserts)
+    {
+        if (s.remote != nullptr) return -1; // o worker espera blocos continuos
+        if (s.processor == nullptr || s.bypassed.load (std::memory_order_relaxed)) continue;
+        any = true;
+        const double t = s.processor->getTailLengthSeconds();
+        tail = juce::jmax (tail, (! std::isfinite (t) || t > 60.0) ? 10.0 : juce::jmax (0.0, t));
+    }
+    if (! any) return 0;
+    const double sr = sampleRate.load (std::memory_order_relaxed);
+    return (int) (juce::jmax (3.0, tail + 0.5) * sr) + c.chainLatency;
 }
 
 void Engine::updateLength()
@@ -982,14 +1036,86 @@ void Engine::runInserts (Channel& c, int n,
     }
 }
 
+namespace
+{
+    constexpr float kSleepInputThreshold = 1.0e-6f;  // -120 dBFS: entrada em silencio
+    constexpr float kSleepOutputThreshold = 1.0e-5f; // -100 dBFS: cauda dos plugins acabou
+}
+
+void Engine::processChain (Channel& c, int n, juce::AudioBuffer<float>& work, juce::MidiBuffer& eventMidi, bool allowSleep)
+{
+    const int hold = c.sleepHoldSamples;
+    if (! allowSleep || hold <= 0)
+    {
+        if (c.sleeping || c.silentSamples != 0) c.wake();
+        runInserts (c, n, work, eventMidi);
+        return;
+    }
+    const bool inputSilent = juce::jmax (work.getMagnitude (0, 0, n), work.getMagnitude (1, 0, n)) < kSleepInputThreshold;
+    if (inputSilent && c.sleeping)
+    {
+        // Dormindo: os plugins nao sao chamados. A saida fica em silencio exato
+        // (a cauda deles ja estava abaixo de -100 dBFS ao adormecer).
+        work.clear (0, 0, n);
+        work.clear (1, 0, n);
+        return;
+    }
+    if (c.sleeping) c.wake(); // som voltou: processa ja este bloco
+    runInserts (c, n, work, eventMidi);
+    if (inputSilent && juce::jmax (work.getMagnitude (0, 0, n), work.getMagnitude (1, 0, n)) < kSleepOutputThreshold)
+    {
+        c.silentSamples += n;
+        if (c.silentSamples >= hold)
+        {
+            c.sleeping = true;
+            c.asleep.store (true, std::memory_order_relaxed);
+        }
+    }
+    else
+        c.silentSamples = 0;
+}
+
+void Engine::readTrackSource (Track& t, float* TL, float* TR, const ReadSeg* segs, int numSegs, double sr) noexcept
+{
+    if (auto* frozen = t.frozenStream.get())
+    {
+        if (frozen->getRate() == sr)
+            for (int i = 0; i < numSegs; ++i)
+                if (segs[i].src >= 0) frozen->copy (TL, TR, segs[i].dst, segs[i].src, segs[i].len);
+        return;
+    }
+    const auto* buf = t.playback.get();
+    if (t.diskStream != nullptr && t.playbackRate == sr)
+    {
+        for (int i = 0; i < numSegs; ++i)
+        {
+            const auto& sg = segs[i];
+            if (sg.src >= 0)
+                t.diskStream->copy (TL, TR, sg.dst, sg.src, sg.len);
+        }
+    }
+    else if (buf != nullptr && t.playbackRate == sr)
+    {
+        const auto len = (juce::int64) buf->getNumSamples();
+        const bool mono = buf->getNumChannels() == 1;
+        for (int i = 0; i < numSegs; ++i)
+        {
+            const auto& sg = segs[i];
+            if (sg.src >= len || sg.src < 0) continue;
+            const int cnt = (int) juce::jmin ((juce::int64) sg.len, len - sg.src);
+            juce::FloatVectorOperations::copy (TL + sg.dst, buf->getReadPointer (0, (int) sg.src), cnt);
+            juce::FloatVectorOperations::copy (TR + sg.dst, buf->getReadPointer (mono ? 0 : 1, (int) sg.src), cnt);
+        }
+    }
+}
+
 juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bool play, bool allowLoop)
 {
     jassert (n <= blockSize);
     const double sr = sampleRate.load();
 
     // Trechos do arquivo lidos neste bloco (o loop pode dividir o bloco).
-    struct Seg { juce::int64 src; int dst; int len; };
-    Seg segs[8];
+    ReadSeg segs[8];
     int numSegs = 0;
     juce::int64 p = pos;
     if (play)
@@ -1032,6 +1158,8 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
 
     auto* L = scratch.getWritePointer (0);
     auto* R = scratch.getWritePointer (1);
+    // Economia de CPU so no playback: a exportacao processa tudo, sempre.
+    const bool allowSleep = cpuSaver.load (std::memory_order_relaxed) && ! rendering.load (std::memory_order_relaxed);
 
     // Pre-processamento de leitura/inserts/PDC independente por faixa.
     // Na exportacao offline, distribui-se entre nucleos; no callback da
@@ -1046,36 +1174,14 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         juce::FloatVectorOperations::clear (TL, n);
         juce::FloatVectorOperations::clear (TR, n);
 
-        const auto* buf = t.playback.get();
-        if (play && t.diskStream != nullptr && t.playbackRate == sr)
-        {
-            for (int i = 0; i < numSegs; ++i)
-            {
-                const auto& sg = segs[i];
-                if (sg.src >= 0)
-                    t.diskStream->copy (TL, TR, sg.dst, sg.src, sg.len);
-            }
-        }
-        else if (play && buf != nullptr && t.playbackRate == sr)
-        {
-            const auto len = (juce::int64) buf->getNumSamples();
-            const bool mono = buf->getNumChannels() == 1;
-            for (int i = 0; i < numSegs; ++i)
-            {
-                const auto& sg = segs[i];
-                if (sg.src >= len || sg.src < 0) continue;
-                const int cnt = (int) juce::jmin ((juce::int64) sg.len, len - sg.src);
-                juce::FloatVectorOperations::copy (TL + sg.dst, buf->getReadPointer (0, (int) sg.src), cnt);
-                juce::FloatVectorOperations::copy (TR + sg.dst, buf->getReadPointer (mono ? 0 : 1, (int) sg.src), cnt);
-            }
-        }
-        if (t.phase.load (std::memory_order_relaxed))
+        if (play) readTrackSource (t, TL, TR, segs, numSegs, sr);
+        if (t.phase.load (std::memory_order_relaxed) && ! t.isFrozen()) // congelada: fase ja aplicada
         {
             juce::FloatVectorOperations::negate (TL, TL, n);
             juce::FloatVectorOperations::negate (TR, TR, n);
         }
 
-        runInserts (t, n, t.processingBuffer, t.processingMidi);
+        processChain (t, n, t.processingBuffer, t.processingMidi, allowSleep);
         t.pdc.process (TL, TR, n);
 
     };
@@ -1160,7 +1266,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             juce::FloatVectorOperations::negate (BL, BL, n);
             juce::FloatVectorOperations::negate (BR, BR, n);
         }
-        runInserts (b, n, b.processingBuffer, b.processingMidi);
+        processChain (b, n, b.processingBuffer, b.processingMidi, allowSleep);
         b.pdc.process (BL, BR, n);
 
         const float g = b.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (b.gainDb.load (std::memory_order_relaxed));
@@ -1229,6 +1335,10 @@ void Engine::audioDeviceIOCallbackWithContext (const float* const*, int, float* 
                                                const juce::AudioIODeviceCallbackContext&)
 {
     if (out == nullptr || n <= 0 || numOut <= 0) return;
+    // Thread da placa (WASAPI ja usa MMCSS; ASIO e do driver): uma vez por thread,
+    // tira do modo de economia do Windows 11. Chamada de sistema unica, sem alocacao.
+    static thread_local bool throttlingOff = false;
+    if (! throttlingOff) { throttlingOff = true; rt::disableThreadThrottling(); }
     // Denormais (caudas de reverb/filtros quase em silencio) podem multiplicar o
     // custo de CPU de plugins que nao se protegem: FTZ/DAZ no callback inteiro.
     juce::ScopedNoDenormals noDenormals;
@@ -1339,6 +1449,7 @@ juce::String Engine::beginOfflineRender()
             if (s.remote != nullptr) s.remote->setOffline (true); // espera o worker no bounce
         }
         c.pdc.clear();
+        c.wake();
     });
     directDelay.clear();
     snapGains = true; // primeiro bloco ja com os ganhos do estado atual (solo/mute/automacao)
@@ -1365,6 +1476,7 @@ void Engine::endOfflineRender()
             if (s.remote != nullptr) s.remote->setOffline (false);
         }
         c.pdc.clear();
+        c.wake();
     });
     directDelay.clear();
     lastRenderEnd = -1;
@@ -1450,8 +1562,11 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
         // O bounce corre mais rapido que o playback. Prefetch sincrono fora da
         // thread realtime impede silencio por cache vazio em exports longos.
         for (auto& t : tracks)
-            if (t->diskStream != nullptr && t->playbackRate == sr)
+        {
+            if (t->frozenStream != nullptr) t->frozenStream->prefetchBlocking (pos, bs);
+            else if (t->diskStream != nullptr && t->playbackRate == sr)
                 t->diskStream->prefetchBlocking (pos, bs);
+        }
         pos = render (buf.getWritePointer (0), buf.getWritePointer (1), bs, pos, true, false);
         if (remoteFailedDuringRender())
             return fail ("Um insert isolado (processo DSP) falhou ou travou durante a exportacao. "
@@ -1574,8 +1689,11 @@ bool Engine::exportStems (const StemExport& req, std::atomic<float>& progress, s
             if (cancel.load()) return fail ("Exportacao cancelada.");
             const int m = (int) juce::jmin ((juce::int64) bs, toProduce - produced);
             for (auto& t : tracks)
-                if (t->diskStream != nullptr && t->playbackRate == sr)
+            {
+                if (t->frozenStream != nullptr) t->frozenStream->prefetchBlocking (pos, bs);
+                else if (t->diskStream != nullptr && t->playbackRate == sr)
                     t->diskStream->prefetchBlocking (pos, bs);
+            }
             pos = render (mix.getWritePointer (0), mix.getWritePointer (1), bs, pos, true, false);
             if (remoteFailedDuringRender())
                 return fail ("Um insert isolado (processo DSP) falhou ou travou durante a exportacao. "
@@ -1649,6 +1767,158 @@ bool Engine::exportStems (const StemExport& req, std::atomic<float>& progress, s
     }
     progress = 1.0f;
     return true;
+}
+
+//==============================================================================
+// Congelar faixa: so esta faixa e processada (os outros plugins ficam parados).
+bool Engine::renderFreeze (Track& t, const juce::File& file, double tailSeconds, std::atomic<float>& progress,
+                           std::atomic<bool>& cancel, juce::String& error)
+{
+    const juce::ScopedLock sl (lock);
+    const double sr = sampleRate.load();
+    const int bs = blockSize;
+    if (t.isFrozen()) { error = "A faixa ja esta congelada."; return false; }
+
+    juce::int64 sourceLength = 0;
+    if (t.diskStream != nullptr && t.playbackRate == sr) sourceLength = t.diskStream->getLength();
+    else if (t.playback != nullptr && t.playbackRate == sr) sourceLength = t.playback->getNumSamples();
+    if (sourceLength <= 0) { error = "A faixa nao tem audio carregado na taxa atual do motor."; return false; }
+
+    juce::TemporaryFile temp (file);
+    auto writer = createWavWriter (temp, sr, 2, 32, error); // WAV float: sem perda nem clip
+    if (writer == nullptr) return false;
+
+    error = beginOfflineRender();
+    if (error.isNotEmpty()) return false;
+    offlineTrackPool.reset(); // uma faixa so: nada para dividir entre nucleos
+    auto fail = [&] (const juce::String& message) { endOfflineRender(); writer.reset(); error = message; return false; };
+
+    const int latency = t.chainLatency; // a saida dos plugins vem atrasada: descarta o inicio
+    const juce::int64 toProduce = sourceLength + (juce::int64) (juce::jmax (0.0, tailSeconds) * sr) + latency;
+    auto& work = t.processingBuffer;
+    juce::AudioBuffer<float> out (2, bs);
+    juce::int64 pos = 0, produced = 0;
+    while (produced < toProduce)
+    {
+        if (cancel.load()) return fail ("Congelamento cancelado.");
+        // Bloco inteiro sempre (inserts isolados so aceitam o tamanho configurado).
+        const int m = (int) juce::jmin ((juce::int64) bs, toProduce - produced);
+        if (t.diskStream != nullptr && t.playbackRate == sr) t.diskStream->prefetchBlocking (pos, bs);
+        auto* TL = work.getWritePointer (0);
+        auto* TR = work.getWritePointer (1);
+        juce::FloatVectorOperations::clear (TL, bs);
+        juce::FloatVectorOperations::clear (TR, bs);
+        const ReadSeg seg { pos, 0, bs };
+        readTrackSource (t, TL, TR, &seg, 1, sr);
+        if (t.phase.load (std::memory_order_relaxed))
+        {
+            juce::FloatVectorOperations::negate (TL, TL, bs);
+            juce::FloatVectorOperations::negate (TR, TR, bs);
+        }
+        applyAutomation (t, (double) pos / sr); // automacao dos plugins fica gravada no render
+        runInserts (t, bs, work, t.processingMidi);
+        if (remoteFailedDuringRender())
+            return fail ("Um insert isolado (processo DSP) falhou durante o congelamento.");
+
+        const int skip = produced < latency ? (int) juce::jmin ((juce::int64) m, (juce::int64) latency - produced) : 0;
+        const int w = m - skip;
+        if (w > 0)
+        {
+            out.copyFrom (0, 0, work, 0, skip, w);
+            out.copyFrom (1, 0, work, 1, skip, w);
+            if (! writer->writeFromAudioSampleBuffer (out, 0, w))
+                return fail ("Falha ao gravar o arquivo congelado (disco cheio?).");
+        }
+        pos += bs;
+        produced += m;
+        progress = (float) ((double) produced / (double) juce::jmax ((juce::int64) 1, toProduce));
+    }
+    writer.reset();
+    endOfflineRender();
+    if (! temp.overwriteTargetFileWithTemporary()) { error = "Nao foi possivel gravar " + file.getFullPathName(); return false; }
+    progress = 1.0f;
+    return true;
+}
+
+void Engine::setFrozen (Track& t, const juce::File& file, std::shared_ptr<StreamingAudio> stream,
+                        std::vector<std::unique_ptr<juce::AudioProcessor>>& unloaded)
+{
+    if (stream == nullptr) return;
+    // Estados lidos antes (thread de mensagens), fora do lock do audio.
+    std::vector<juce::MemoryBlock> states ((size_t) t.inserts.size());
+    for (int i = 0; i < t.inserts.size(); ++i)
+        if (auto* p = t.inserts[(size_t) i].processor.get()) p->getStateInformation (states[(size_t) i]);
+
+    std::vector<std::shared_ptr<RemoteDspInsert>> retiredRemote;
+    {
+        const juce::ScopedLock sl (lock);
+        for (int i = 0; i < t.inserts.size(); ++i)
+        {
+            auto& s = t.inserts[(size_t) i];
+            if (s.processor == nullptr && s.remote == nullptr) continue;
+            if (s.processor != nullptr)
+            {
+                s.missingState = std::move (states[(size_t) i]);
+                unloaded.push_back (std::move (s.processor));
+            }
+            if (s.remote != nullptr) retiredRemote.push_back (std::move (s.remote)); // estado inicial ja em missingState
+            s.offline = true;
+            s.faulted.store (false, std::memory_order_relaxed);
+        }
+        t.frozenFile = file;
+        t.frozenStream = stream;
+        t.pdc.clear();
+        t.wake();
+        updateLatency();
+    }
+    for (auto& p : unloaded) if (p != nullptr) p->removeListener (this);
+    retiredRemote.clear(); // processos DSP encerrados fora do lock
+    streamingWorker->add (stream);
+}
+
+void Engine::restoreInserts (Channel& c, std::vector<RestoredInsert>& restored, bool unfreeze)
+{
+    std::shared_ptr<StreamingAudio> oldFrozen;
+    {
+        const juce::ScopedLock sl (lock);
+        for (auto& r : restored)
+        {
+            if (! c.hasInsert (r.slot)) continue;
+            auto& s = c.inserts[(size_t) r.slot];
+            if (! s.isOffline() && ! s.isMissing()) continue;
+            if (r.local != nullptr)
+            {
+                s.processor = std::move (r.local);
+                s.bufferChannels = juce::jlimit (2, kMaxPluginChannels,
+                                                 juce::jmax (s.processor->getTotalNumInputChannels(), s.processor->getTotalNumOutputChannels()));
+                s.mainOutChannels = s.processor->getMainBusNumOutputChannels();
+                s.missingState.reset();
+                s.preferRemote = false;
+                s.processor->addListener (this);
+            }
+            else if (r.remote != nullptr)
+            {
+                s.remote = std::move (r.remote);
+                s.missingState = s.remote->getInitialState();
+                s.preferRemote = true;
+                s.bufferChannels = 2;
+                s.mainOutChannels = 2;
+            }
+            else continue;
+            s.offline = false;
+            s.faulted.store (false, std::memory_order_relaxed);
+        }
+        if (unfreeze && c.kind == ChannelKind::track)
+        {
+            auto& t = static_cast<Track&> (c);
+            oldFrozen = std::move (t.frozenStream);
+            t.frozenFile = juce::File();
+            t.pdc.clear();
+        }
+        c.wake();
+        updateLatency();
+    }
+    oldFrozen.reset(); // fecha o arquivo fora do lock
 }
 
 } // namespace sc

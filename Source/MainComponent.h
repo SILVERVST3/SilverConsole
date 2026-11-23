@@ -162,6 +162,15 @@ private:
     void loadPluginIntoRemote (Channel&, int slot, const juce::PluginDescription&,
                                const juce::MemoryBlock& state = {});
     void loadInserts (Channel&, const ChannelData&, juce::StringArray& problems);
+    // Plugin offline / congelar faixa (economia de CPU e memoria)
+    void setInsertOffline (Channel&, int slot);
+    bool createFromSlot (const InsertSlot&, Engine::RestoredInsert&, juce::String& error);
+    /** Recria os plugins offline (onlySlot = -1: todos). Falhas ficam offline. */
+    void restoreOfflineInserts (Channel&, int onlySlot, bool unfreeze, juce::StringArray& failed);
+    void setChannelPluginsOffline (Channel&);
+    void freezeTrack (Track&);
+    void unfreezeTrack (Track&);
+    juce::File freezeFileFor (const Track&) const;
     void openEditor (Channel&, int slot);
     PluginScaleMode scaleModeFor (const juce::PluginDescription&) const;
     void setScaleMode (const juce::PluginDescription&, PluginScaleMode);
