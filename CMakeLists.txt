@@ -47,7 +47,7 @@ set(SC_COMMON_DEFS
     JUCE_DISPLAY_SPLASH_SCREEN=0)
 
 set(SC_ENGINE_SOURCES
-    Source/Engine.cpp Source/Engine.h Source/Metering.h
+    Source/Engine.cpp Source/Engine.h Source/Metering.h Source/BusCompressor.h
     Source/RealtimeThread.cpp Source/RealtimeThread.h
     Source/AudioLoader.cpp Source/AudioLoader.h
     Source/StreamingAudio.cpp Source/StreamingAudio.h
@@ -72,7 +72,7 @@ target_sources(SilverConsole PRIVATE
     Source/ChannelStrip.cpp Source/ChannelStrip.h
     Source/AutomationView.cpp Source/AutomationView.h
     Source/SilverLookAndFeel.h
-    Source/PluginHost.h
+    Source/PluginHost.h Source/PluginScanCache.h
     Source/PluginWindow.h)
 target_compile_definitions(SilverConsole PRIVATE ${SC_COMMON_DEFS}
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:SilverConsole,JUCE_PRODUCT_NAME>"

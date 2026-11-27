@@ -7,6 +7,7 @@
 #include "StreamingAudio.h"
 #include "Metering.h"
 #include "RemoteDspInsert.h"
+#include "BusCompressor.h"
 #include <array>
 #include <atomic>
 #include <memory>
@@ -18,6 +19,7 @@ namespace sc
 // abaixo so protegem contra arquivos de projeto corrompidos.
 constexpr int kDefaultInserts = 4;
 constexpr int kDefaultSends = 4;
+constexpr int kDefaultBusSends = 2; // envios de bus para bus (aux)
 constexpr int kMaxInsertsPerChannel = 64;
 constexpr int kMaxSendsPerTrack = 64;
 constexpr int kMaxBuses = 16;
@@ -139,6 +141,16 @@ struct InsertSlot
 
 enum class ChannelKind { track, bus, master };
 
+struct Send
+{
+    std::atomic<int> bus { -1 };
+    std::atomic<float> levelDb { 0.0f };
+    std::atomic<bool> preFader { false };
+    std::atomic<bool> preFx { false }; // antes dos plugins (tambem independe do fader); so faixas
+    juce::LinearSmoothedValue<float> smooth;
+    DelayLine align; // envio de bus: alinha com as outras entradas do bus de destino (PDC)
+};
+
 struct Channel
 {
     explicit Channel (ChannelKind k) : kind (k) {}
@@ -154,6 +166,10 @@ struct Channel
 
     SlotList<InsertSlot> inserts { kDefaultInserts };
     bool hasInsert (int slot) const noexcept { return juce::isPositiveAndBelow (slot, inserts.size()); }
+    // envios: faixas -> buses e bus -> bus (o master nao tem envios)
+    SlotList<Send> sends { kind == ChannelKind::track ? kDefaultSends : kind == ChannelKind::bus ? kDefaultBusSends : 0 };
+    // solo: cala so a saida do canal (com rampa); os envios continuam valendo
+    juce::LinearSmoothedValue<float> soloGate { 1.0f };
 
     // medidores (audio escreve, interface le e zera)
     std::atomic<float> peakL { 0.0f }, peakR { 0.0f };
@@ -185,15 +201,6 @@ struct Channel
     void wake() noexcept { sleeping = false; silentSamples = 0; asleep.store (false, std::memory_order_relaxed); }
 };
 
-struct Send
-{
-    std::atomic<int> bus { -1 };
-    std::atomic<float> levelDb { 0.0f };
-    std::atomic<bool> preFader { false };
-    std::atomic<bool> preFx { false }; // antes dos plugins (tambem independe do fader)
-    juce::LinearSmoothedValue<float> smooth;
-};
-
 struct Track : Channel
 {
     Track() : Channel (ChannelKind::track) {}
@@ -207,7 +214,6 @@ struct Track : Channel
     double playbackRate = 0.0;
 
     std::atomic<int> outputBus { -1 }; // -1 = Master
-    SlotList<Send> sends { kDefaultSends };
 
     // Congelada: toca o render da faixa (inserts e inversao de fase ja aplicados,
     // antes do fader) lido do disco; os plugins ficam offline. O audio original
@@ -218,13 +224,16 @@ struct Track : Channel
     // Envios pre-FX: sinal antes dos inserts, atrasado pela latencia das faixas (PDC).
     juce::AudioBuffer<float> preFxBuffer;
     DelayLine preFxPdc;
-    // solo: cala so a saida da faixa (com rampa); os envios continuam valendo
-    juce::LinearSmoothedValue<float> soloGate { 1.0f };
     bool preFxActive = false; // thread de audio
     bool isFrozen() const noexcept { return frozenStream != nullptr; }
 };
 
-struct Bus : Channel { Bus() : Channel (ChannelKind::bus) {} };
+struct Bus : Channel
+{
+    Bus() : Channel (ChannelKind::bus) {}
+    juce::AudioBuffer<float> sendTap; // sinal pre-fader para os envios pre-fader do bus
+    DelayLine trackInDelay;           // atrasa o que vem das faixas ate a chegada dos outros buses
+};
 
 struct Master : Channel
 {
@@ -234,6 +243,9 @@ struct Master : Channel
     // Estimativa de true peak 4x, publicada sem locks para interface.
     std::atomic<float> truePeakL { 0.0f }, truePeakR { 0.0f };
     std::atomic<float> momentaryLufs { -120.0f }; // valor LUFS-M, nao integrado
+    // Compressor de barramento (depois dos inserts, antes do fader do master)
+    BusCompParams comp;
+    std::atomic<float> compGr { 0.0f }; // maior reducao de ganho desde a ultima leitura (dB)
 };
 
 //==============================================================================
@@ -272,6 +284,13 @@ public:
     std::unique_ptr<Bus> removeBus (Bus*);
     int indexOfBus (const Bus*) const;
     void moveTrack (int from, int to);
+    /** Muda a ordem dos buses (saidas e envios que apontam para eles acompanham). */
+    void moveBus (int from, int to);
+    /** true = um envio do bus 'from' para o bus 'to' fecharia um ciclo (to ja chega em from). */
+    bool busSendWouldLoop (int from, int to) const;
+    /** Recalcula a PDC depois de mudar envios entre buses (a thread de audio tambem
+        percebe a mudanca sozinha, mas com ate um ciclo da interface de atraso). */
+    void routingChanged() { const juce::ScopedLock sl (lock); updateLatency(); }
 
     /** Prepara o processador para o motor. Retorna erro ou vazio. */
     juce::String prepareProcessor (juce::AudioProcessor&);
@@ -312,11 +331,15 @@ public:
         Para voltar, a interface recria o plugin com o estado guardado. */
     std::unique_ptr<juce::AudioProcessor> takeInsertOffline (Channel&, int slot);
     void swapInserts (Channel&, int a, int b);
+    /** Troca o slot sa do canal a com o slot sb do canal b (plugin, estado, bypass,
+        mix, automacao do plugin). Mesma troca desfaz. Sidechain que apontaria para
+        o proprio canal e desligado. */
+    void swapInsertsAcross (Channel& a, int sa, Channel& b, int sb);
     void setBypass (Channel&, int slot, bool);
     /** Numero de slots de insert/envio. Diminuir so remove slots vazios do fim.
         Retorna false se nada mudou. */
     bool setInsertCount (Channel&, int count);
-    bool setSendCount (Track&, int count);
+    bool setSendCount (Channel&, int count);
     void setTrackAudio (Track&, std::shared_ptr<const juce::AudioBuffer<float>> original, double rate,
                         std::shared_ptr<const juce::AudioBuffer<float>> playback, double playbackRate);
     void setTrackStream (Track&, std::shared_ptr<StreamingAudio>);
@@ -543,6 +566,24 @@ private:
         fn (master);
     }
 
+    /** Ordem de processamento dos buses (quem envia vem antes de quem recebe).
+        pos[b] = posicao de b na ordem; um envio a->d so vale se pos[a] < pos[d]
+        (ciclos sao ignorados). level = profundidade (buses do mesmo nivel rodam
+        em paralelo). Sem alocacao: serve para o callback. */
+    struct BusOrder
+    {
+        std::array<int, kMaxBuses> order {}, pos {}, level {};
+        int count = 0, numLevels = 0;
+        juce::uint64 hash = 0;
+        bool honored (int from, int to) const noexcept
+        {
+            return from != to && juce::isPositiveAndBelow (from, count) && juce::isPositiveAndBelow (to, count) && pos[(size_t) from] < pos[(size_t) to];
+        }
+    };
+    void computeBusOrder (BusOrder&) const noexcept;
+    juce::uint64 latencyRoutingHash = 0; // roteamento bus->bus usado na ultima PDC
+    BusCompressor busComp;
+
     std::unique_ptr<StreamWorker> streamingWorker;
     std::unique_ptr<OfflineTrackPool> offlineTrackPool;
     std::unique_ptr<RealtimeTrackPool> realtimePool;
@@ -559,7 +600,8 @@ private:
     std::atomic<int> totalLatency { 0 };
 
     juce::AudioBuffer<float> scratch, direct, masterBuf, deviceBuf;
-    std::array<juce::AudioBuffer<float>, kMaxBuses> busIn;
+    std::array<juce::AudioBuffer<float>, kMaxBuses> busIn, busSendIn; // entradas das faixas / dos outros buses
+    juce::AudioBuffer<float> sendTemp;
     juce::MidiBuffer midi;
     DelayLine directDelay;
     juce::int64 lastRenderEnd = -1;

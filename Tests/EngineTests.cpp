@@ -7,6 +7,7 @@
 #include "AutomationRecorder.h"
 #include "PluginScanPolicy.h"
 #include "PluginScanSupervisor.h"
+#include "PluginScanCache.h"
 #include "DspIpcWatchdog.h"
 #include "RemoteDspInsert.h"
 #include <cstdio>
@@ -658,6 +659,10 @@ static void testProjectRoundTrip()
     juce::MemoryBlock state ("abc", 3);
     e.setMissingInsert (*t, 2, desc, state);
     e.master.mono = true; e.master.gainDb = -1.0f;
+    e.addBus ("Delay");
+    e.buses[1]->sends[1].bus = 0; e.buses[1]->sends[1].levelDb = -7.0f; e.buses[1]->sends[1].preFader = true;
+    e.master.comp.enabled = true; e.master.comp.thresholdDb = -14.5f; e.master.comp.ratio = 2; e.master.comp.release = 4;
+    e.master.comp.makeupDb = 3.0f; e.master.comp.mix = 0.6f; e.master.comp.sidechainHpf = 2; e.master.comp.attack = 5;
     t->autoMode = (int) AutoMode::touch;
     auto* vl = e.getOrCreateLane (*t, AutoTarget::volume);
     auto* pl = e.getOrCreateLane (*t, AutoTarget::plugin, 2, 5);
@@ -671,7 +676,14 @@ static void testProjectRoundTrip()
     check (writeProject (captureProject (e), file, err), "salvar projeto " + err);
     ProjectData p;
     check (readProject (file, p, err), "abrir projeto " + err);
-    check (p.tracks.size() == 1 && p.buses.size() == 1, "faixas e buses");
+    check (p.tracks.size() == 1 && p.buses.size() == 2, "faixas e buses");
+    check (p.busSends.size() == 2 && p.busSends[1].size() == (size_t) kDefaultBusSends && p.busSends[1][1].bus == 0
+           && near (p.busSends[1][1].levelDb, -7.0f) && p.busSends[1][1].pre && p.busSends[0][0].bus == -1, "envio de bus salvo");
+    {
+        const auto& c = p.masterComp;
+        check (c.on && near (c.thresholdDb, -14.5f) && c.ratio == 2 && c.release == 4 && near (c.makeupDb, 3.0f)
+               && near (c.mix, 0.6f) && c.hpf == 2 && c.attack == 5, "compressor do master salvo");
+    }
     if (p.tracks.size() == 1)
     {
         const auto& td = p.tracks[0];
@@ -1620,6 +1632,140 @@ static void testLoudnessNormalize()
     dir.deleteRecursively();
 }
 
+// Bloco D: envios bus -> bus (ordem, PDC, solo, ciclos), mover buses e compressor do master.
+static void testBusToBusSends()
+{
+    Engine e; e.prepare (48000, 256);
+    auto* t = addTrack (e, makeBuffer (2, 48000, [] (int, int) { return 0.25f; }), "t");
+    auto* a = e.addBus ("A");
+    auto* b = e.addBus ("B");
+    check (a->sends.size() == kDefaultBusSends && e.master.sends.size() == 0, "buses tem envios, master nao");
+    t->outputBus = 0;
+    a->sends[0].bus = 1; a->sends[0].levelDb = 0.0f;
+    e.routingChanged();
+    auto out = run (e, 4096);
+    check (near (out.getSample (0, 4000), 0.5f), "envio bus A -> bus B soma no master (A + B)");
+
+    a->gainDb = kMinDb;
+    out = run (e, 4096);
+    check (near (out.getSample (0, 4000), 0.0f), "envio de bus pos-fader segue o fader do bus");
+    a->sends[0].preFader = true;
+    out = run (e, 4096);
+    check (near (out.getSample (0, 4000), 0.25f), "envio de bus pre-fader ignora o fader");
+    a->gainDb = 0.0f; a->sends[0].preFader = false;
+
+    // solo no bus de destino: ouve so o retorno (o bus A continua alimentando)
+    b->solo = true;
+    out = run (e, 8192);
+    check (near (out.getSample (0, 8000), 0.25f), "solo no bus de destino: so o retorno");
+    b->solo = false;
+    a->solo = true;
+    out = run (e, 8192);
+    check (near (out.getSample (0, 8000), 0.5f), "solo no bus de origem: ouve o bus e o destino dele");
+    a->solo = false;
+
+    // ciclo: B -> A seria um laco
+    check (e.busSendWouldLoop (1, 0) && ! e.busSendWouldLoop (0, 1) && e.busSendWouldLoop (0, 0), "detecta envio que fecharia um ciclo");
+    b->sends[0].bus = 0; // forcado (projeto antigo/corrompido): o motor ignora o lado que fecha o ciclo
+    e.routingChanged();
+    out = run (e, 8192);
+    check (std::isfinite (out.getSample (0, 8000)) && std::abs (out.getSample (0, 8000)) < 2.0f, "ciclo de envios nao realimenta");
+    b->sends[0].bus = -1;
+
+    // mover buses: saidas e envios acompanham
+    e.moveBus (0, 1);
+    check (e.buses[0].get() == b && e.buses[1].get() == a && t->outputBus.load() == 1 && a->sends[0].bus.load() == 0,
+           "mover bus reindexa saidas e envios");
+    e.routingChanged();
+    out = run (e, 4096);
+    check (near (out.getSample (0, 4000), 0.5f), "som igual depois de mover o bus");
+
+    auto removed = e.removeBus (b);
+    check (a->sends[0].bus.load() == -1 && t->outputBus.load() == 0, "remover bus limpa os envios de outros buses");
+}
+
+static void testBusSendLatency()
+{
+    Engine e; e.prepare (48000, 256);
+    auto impulse = makeBuffer (2, 8000, [] (int, int i) { return i == 1000 ? 1.0f : 0.0f; });
+    auto* t = addTrack (e, impulse, "t");
+    auto* a = e.addBus ("A");
+    e.addBus ("B");
+    auto pa = std::make_unique<InternalDelay> (37);
+    e.prepareProcessor (*pa);
+    e.setInsert (*a, 0, std::move (pa), nullptr);
+    t->outputBus = 0;                                // faixa -> A (latencia 37)
+    t->sends[0].bus = 1; t->sends[0].levelDb = 0.0f; // faixa -> B direto
+    a->sends[0].bus = 1; a->sends[0].levelDb = 0.0f; // A -> B
+    e.routingChanged();
+    check (e.getTotalLatency() == 37, "latencia com cadeia de buses = 37 (" + juce::String (e.getTotalLatency()) + ")");
+    auto out = run (e, 8000);
+    // A sai em 1037 (1x); B recebe a faixa atrasada + A alinhados (2x) -> 3x em 1037
+    check (peakIndex (out, 0) == 1037 && near (out.getSample (0, 1037), 3.0f, 1.0e-3f),
+           "PDC alinha faixa e bus no bus de destino (pico " + juce::String (out.getSample (0, 1037), 3) + " em " + juce::String (peakIndex (out, 0)) + ")");
+
+    // B com latencia propria tambem: master alinha A (que sai antes) com B
+    auto pb = std::make_unique<InternalDelay> (11);
+    e.prepareProcessor (*pb);
+    e.setInsert (*e.buses[1], 0, std::move (pb), nullptr);
+    check (e.getTotalLatency() == 48, "latencia A + B = 48");
+    out = run (e, 8000);
+    check (peakIndex (out, 0) == 1048 && near (out.getSample (0, 1048), 3.0f, 1.0e-3f), "PDC em cadeia no master");
+}
+
+static void testMasterBusComp()
+{
+    Engine e; e.prepare (48000, 256);
+    // seno 1 kHz de pico 0,5 (-6 dBFS): o detector de pico segue a envoltoria
+    addTrack (e, makeBuffer (2, 48000 * 2, [] (int, int i)
+              { return 0.5f * std::sin (2.0f * juce::MathConstants<float>::pi * 1000.0f * (float) i / 48000.0f); }), "s");
+    auto& c = e.master.comp;
+    auto peakOf = [] (const juce::AudioBuffer<float>& b, int from) { return b.getMagnitude (0, from, b.getNumSamples() - from); };
+    auto out = run (e, 48000);
+    check (near (peakOf (out, 24000), 0.5f, 1.0e-3f), "compressor desligado nao mexe no sinal");
+
+    c.enabled = true; c.thresholdDb = -20.0f; c.ratio = 1; c.attack = 2; c.release = 0; c.makeupDb = 0.0f;
+    e.master.compGr = 0.0f;
+    out = run (e, 48000);
+    // 14 dB acima do limiar, ratio 4:1 -> 10,5 dB de reducao
+    const float expected = 0.5f * juce::Decibels::decibelsToGain (-10.5f);
+    const float gr = e.master.compGr.exchange (0.0f);
+    const float out4Db = juce::Decibels::gainToDecibels (peakOf (out, 24000));
+    check (std::abs (juce::Decibels::gainToDecibels (peakOf (out, 24000)) - juce::Decibels::gainToDecibels (expected)) < 0.6f
+           && std::abs (gr - 10.5f) < 0.6f,
+           "4:1 com 14 dB acima do limiar reduz ~10,5 dB (saida " + juce::String (juce::Decibels::gainToDecibels (peakOf (out, 24000)), 2)
+           + " dBFS, GR " + juce::String (gr, 2) + ")");
+    c.makeupDb = 10.5f;
+    out = run (e, 48000);
+    check (std::abs (juce::Decibels::gainToDecibels (peakOf (out, 24000)) - juce::Decibels::gainToDecibels (0.5f)) < 0.6f, "makeup devolve o nivel");
+    c.makeupDb = 0.0f; c.mix = 0.0f;
+    out = run (e, 48000);
+    check (near (peakOf (out, 24000), 0.5f, 2.0e-3f), "mix 0% = sinal seco");
+    c.mix = 1.0f; c.ratio = 2; // 10:1
+    out = run (e, 48000);
+    const float out10Db = juce::Decibels::gainToDecibels (peakOf (out, 24000));
+    check (out10Db < out4Db - 1.5f, "10:1 comprime mais que 4:1 (" + juce::String (out4Db, 2) + " -> " + juce::String (out10Db, 2) + " dBFS)");
+
+    // filtro no sidechain: grave (40 Hz) quase nao aciona com HPF 150 Hz
+    Engine g; g.prepare (48000, 256);
+    addTrack (g, makeBuffer (2, 48000 * 2, [] (int, int i)
+              { return 0.5f * std::sin (2.0f * juce::MathConstants<float>::pi * 40.0f * (float) i / 48000.0f); }), "grave");
+    auto& gc = g.master.comp;
+    gc.enabled = true; gc.thresholdDb = -20.0f; gc.ratio = 1; gc.release = 0;
+    run (g, 48000);
+    const float grNoHpf = g.master.compGr.exchange (0.0f);
+    gc.sidechainHpf = 3;
+    run (g, 24000);
+    g.master.compGr = 0.0f;
+    run (g, 24000);
+    const float grHpf = g.master.compGr.exchange (0.0f);
+    check (grHpf < grNoHpf - 6.0f, "HPF no sidechain alivia o grave (" + juce::String (grNoHpf, 1) + " -> " + juce::String (grHpf, 1) + " dB)");
+    // release automatico funciona e nao explode
+    gc.release = BusCompParams::numReleases - 1;
+    out = run (g, 48000);
+    check (std::isfinite (out.getSample (0, 47000)), "release automatico");
+}
+
 // Inserts e envios dinamicos (botao "+"), 16 buses e persistencia no projeto.
 static void testDynamicSlots()
 {
@@ -1850,6 +1996,64 @@ static void testScanSupervisor (const juce::File& worker)
            "scan supervisor: cancelamento encerra filho ja em execucao");
 }
 
+// Cache do scanner (como o REAPER): so arquivos novos ou alterados abrem de novo.
+static void testPluginScanCache (const juce::File& worker, const juce::File& plugin)
+{
+    if (! worker.existsAsFile() || ! plugin.exists()) { check (false, "scan cache: worker ou plugin de teste ausente"); return; }
+    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_scan_cache_test");
+    dir.deleteRecursively();
+    dir.createDirectory();
+    auto bad = dir.getChildFile ("Quebrado.vst3");
+    bad.replaceWithText ("nao e um plugin");
+
+    juce::KnownPluginList known;
+    PluginScanCache cache;
+    juce::StringArray quarantine;
+    std::atomic<bool> cancel { false };
+    std::atomic<float> progress { 0 };
+    auto scan = [&] (PluginScanRun::Mode mode, juce::StringArray candidates, int& added, int& removed)
+    {
+        PluginScanRun::Request req;
+        req.worker = worker; req.mode = mode; req.candidates = candidates; req.quarantined = quarantine; req.cache = cache;
+        PluginScanRun::Result r;
+        PluginScanRun::run (req, r, cancel, progress);
+        PluginScanRun::apply (r, mode, known, cache, quarantine, added, removed);
+        return r;
+    };
+    using M = PluginScanRun::Mode;
+    const juce::StringArray both { plugin.getFullPathName(), bad.getFullPathName() };
+    int added = 0, removed = 0;
+    auto r = scan (M::newOnly, both, added, removed);
+    check (r.scanned == 2 && added == 1 && r.failed == 1 && known.getNumTypes() == 1 && cache.size() == 2 && quarantine.size() == 1,
+           "scan cache: primeira varredura abre tudo (1 plugin, 1 falha em quarentena)");
+    r = scan (M::newOnly, both, added, removed);
+    check (r.scanned == 0 && r.skippedKnown == 1 && r.skippedFailed == 1 && added == 0 && known.getNumTypes() == 1,
+           "scan cache: segunda varredura nao abre nada (" + juce::String (r.scanned) + " examinados)");
+    bad.replaceWithText ("arquivo alterado, ainda nao e um plugin valido");
+    r = scan (M::newOnly, both, added, removed);
+    check (r.scanned == 1 && r.failedPaths.size() == 1 && r.skippedKnown == 1, "scan cache: arquivo em quarentena alterado e testado de novo");
+    r = scan (M::everything, both, added, removed);
+    check (r.scanned == 1 && r.skippedFailed == 1 && added == 0 && known.getNumTypes() == 1, "scan cache: reescanear tudo reabre os conhecidos sem duplicar");
+
+    check (PluginScanCache::keyFor ("C:\\VST3\\X.vst3\\Contents\\x86_64-win\\X.vst3") == PluginScanCache::keyFor ("c:/vst3/x.vst3"),
+           "scan cache: binario dentro do bundle e o bundle tem a mesma chave");
+    auto restored = PluginScanCache::deserialize (cache.serialize());
+    check (restored.size() == cache.size() && restored.isUpToDate (plugin.getFullPathName(), PluginScanCache::fingerprintOf (plugin))
+           && ! restored.find (bad.getFullPathName())->ok, "scan cache: persistencia (caminho, tamanho, data, falha)");
+
+    bad.deleteFile();
+    r = scan (M::newOnly, { plugin.getFullPathName() }, added, removed);
+    check (cache.size() == 1 && quarantine.isEmpty(), "scan cache: arquivo apagado sai do cache e da quarentena");
+
+    // migracao: lista antiga sem cache -> semeia e nao reescaneia
+    PluginScanCache seeded;
+    PluginScanRun::seedFromKnown (seeded, known, {});
+    cache = seeded;
+    r = scan (M::newOnly, { plugin.getFullPathName() }, added, removed);
+    check (seeded.size() == 1 && r.scanned == 0 && r.skippedKnown == 1, "scan cache: lista ja escaneada vira cache sem reabrir os plugins");
+    dir.deleteRecursively();
+}
+
 static void testPluginScanQuarantine()
 {
     auto failed = PluginScanPolicy::deserialize (
@@ -1940,6 +2144,9 @@ int main (int argc, char** argv)
     testFreezeTrack();
     testMixerBlockB();
     testLoudnessNormalize();
+    testBusToBusSends();
+    testBusSendLatency();
+    testMasterBusComp();
     testDynamicSlots();
     testDiskStreaming();
     testStereoBalanceMuteSolo();
@@ -1957,7 +2164,10 @@ int main (int argc, char** argv)
     if (argc > 2 && scannedDescXml.isNotEmpty()) // opcional: grava a descricao do plugin de teste
         juce::File (juce::String::fromUTF8 (argv[2])).replaceWithText (scannedDescXml);
     if (argc > 3)
+    {
         testScanSupervisor (juce::File (juce::String::fromUTF8 (argv[3])));
+        testPluginScanCache (juce::File (juce::String::fromUTF8 (argv[3])), juce::File (juce::String::fromUTF8 (argv[1])));
+    }
 #if JUCE_WINDOWS
     if (argc > 4 && argc > 1)
         testRemoteDspWorker (juce::File (juce::String::fromUTF8 (argv[4])),

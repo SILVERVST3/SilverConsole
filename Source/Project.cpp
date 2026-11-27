@@ -154,8 +154,15 @@ ProjectData captureProject (Engine& engine)
             td.sends.push_back ({ s.bus.load(), s.levelDb.load(), s.preFader.load(), s.preFx.load() });
         p.tracks.push_back (std::move (td));
     }
-    for (auto& b : engine.buses) p.buses.push_back (captureChannel (*b, engine.tracks));
+    for (auto& b : engine.buses)
+    {
+        p.buses.push_back (captureChannel (*b, engine.tracks));
+        std::vector<SendData> sends;
+        for (auto& s : b->sends) sends.push_back ({ s.bus.load(), s.levelDb.load(), s.preFader.load(), false });
+        p.busSends.push_back (std::move (sends));
+    }
     p.master = captureChannel (engine.master, engine.tracks);
+    p.masterComp = CompData::from (engine.master.comp);
     p.masterMono = engine.master.mono.load();
     for (int g = 0; g < kMaxGroups; ++g)
         p.vca[(size_t) g] = { engine.vca[(size_t) g].gainDb.load(), engine.vca[(size_t) g].mute.load(), engine.vca[(size_t) g].shown };
@@ -188,6 +195,52 @@ void applyChannelBasics (Engine& engine, Channel& c, const ChannelData& d)
     c.group = d.group;
 }
 
+namespace
+{
+    void writeSends (juce::XmlElement& e, const std::vector<SendData>& sends)
+    {
+        e.setAttribute ("sends", (int) sends.size());
+        for (int i = 0; i < (int) sends.size(); ++i)
+        {
+            const auto& s = sends[(size_t) i];
+            if (s.bus < 0) continue;
+            auto* x = e.createNewChildElement ("SEND");
+            x->setAttribute ("index", i);
+            x->setAttribute ("bus", s.bus);
+            x->setAttribute ("levelDb", s.levelDb);
+            x->setAttribute ("pre", s.pre);
+            if (s.preFx) x->setAttribute ("preFx", true);
+        }
+    }
+
+    std::vector<SendData> readSends (const juce::XmlElement& e, int defaultCount, const std::function<int (int)>& validBus)
+    {
+        std::vector<SendData> sends ((size_t) juce::jlimit (1, kMaxSendsPerTrack, e.getIntAttribute ("sends", defaultCount)));
+        for (auto* x : e.getChildWithTagNameIterator ("SEND"))
+        {
+            const int i = x->getIntAttribute ("index", -1);
+            if (! juce::isPositiveAndBelow (i, kMaxSendsPerTrack)) continue;
+            if (i >= (int) sends.size()) sends.resize ((size_t) i + 1);
+            sends[(size_t) i] = { validBus (x->getIntAttribute ("bus", -1)),
+                                  juce::jlimit (kMinDb, 12.0f, (float) x->getDoubleAttribute ("levelDb", 0.0)),
+                                  x->getBoolAttribute ("pre"), x->getBoolAttribute ("preFx", false) };
+        }
+        return sends;
+    }
+}
+
+void applySends (Engine& engine, Channel& c, const std::vector<SendData>& sends)
+{
+    engine.setSendCount (c, (int) sends.size());
+    for (int s = 0; s < (int) sends.size() && s < c.sends.size(); ++s)
+    {
+        c.sends[(size_t) s].bus = sends[(size_t) s].bus;
+        c.sends[(size_t) s].levelDb = sends[(size_t) s].levelDb;
+        c.sends[(size_t) s].preFader = sends[(size_t) s].pre;
+        c.sends[(size_t) s].preFx = c.kind == ChannelKind::track && sends[(size_t) s].preFx;
+    }
+}
+
 bool writeProject (const ProjectData& p, const juce::File& file, juce::String& error)
 {
     juce::XmlElement root ("SILVERCONSOLE");
@@ -210,23 +263,29 @@ bool writeProject (const ProjectData& p, const juce::File& file, juce::String& e
             e->setAttribute ("relFrozenFile", t.frozenFile.getRelativePathFrom (dir).replaceCharacter ('\\', '/'));
         }
         e->setAttribute ("output", t.output);
-        e->setAttribute ("sends", (int) t.sends.size());
-        for (int i = 0; i < (int) t.sends.size(); ++i)
-        {
-            const auto& s = t.sends[(size_t) i];
-            if (s.bus < 0) continue;
-            auto* x = e->createNewChildElement ("SEND");
-            x->setAttribute ("index", i);
-            x->setAttribute ("bus", s.bus);
-            x->setAttribute ("levelDb", s.levelDb);
-            x->setAttribute ("pre", s.pre);
-            if (s.preFx) x->setAttribute ("preFx", true);
-        }
+        writeSends (*e, t.sends);
     }
-    for (auto& b : p.buses) writeChannel (*root.createNewChildElement ("BUS"), b);
+    for (size_t bi = 0; bi < p.buses.size(); ++bi)
+    {
+        auto* e = root.createNewChildElement ("BUS");
+        writeChannel (*e, p.buses[bi]);
+        if (bi < p.busSends.size()) writeSends (*e, p.busSends[bi]);
+    }
     auto* m = root.createNewChildElement ("MASTER");
     writeChannel (*m, p.master);
     m->setAttribute ("mono", p.masterMono);
+    {
+        const auto& c = p.masterComp;
+        auto* x = m->createNewChildElement ("BUSCOMP");
+        x->setAttribute ("on", c.on);
+        x->setAttribute ("threshold", c.thresholdDb);
+        x->setAttribute ("ratio", c.ratio);
+        x->setAttribute ("attack", c.attack);
+        x->setAttribute ("release", c.release);
+        x->setAttribute ("makeup", c.makeupDb);
+        x->setAttribute ("mix", c.mix);
+        x->setAttribute ("hpf", c.hpf);
+    }
     for (int g = 0; g < kMaxGroups; ++g)
     {
         const auto& v = p.vca[(size_t) g];
@@ -283,6 +342,18 @@ bool readProject (const juce::File& file, ProjectData& p, juce::String& error)
     }
     const int numBuses = (int) p.buses.size();
     auto validBus = [numBuses] (int b) { return b >= 0 && b < numBuses ? b : -1; };
+    {
+        int bi = 0;
+        for (auto* e : root->getChildWithTagNameIterator ("BUS"))
+        {
+            if (bi >= numBuses) break;
+            const int self = bi;
+            auto sends = readSends (*e, kDefaultBusSends, [&validBus, self] (int b) { return b == self ? -1 : validBus (b); });
+            for (auto& s : sends) s.preFx = false; // pre-FX so existe nas faixas
+            p.busSends.push_back (std::move (sends));
+            ++bi;
+        }
+    }
 
     for (auto* e : root->getChildWithTagNameIterator ("TRACK"))
     {
@@ -298,22 +369,25 @@ bool readProject (const juce::File& file, ProjectData& p, juce::String& error)
         if (relFrozen.isNotEmpty() && dir.getChildFile (relFrozen).existsAsFile()) t.frozenFile = dir.getChildFile (relFrozen);
         else if (juce::File::isAbsolutePath (absFrozen)) t.frozenFile = juce::File (absFrozen);
         t.output = validBus (e->getIntAttribute ("output", -1));
-        t.sends.assign ((size_t) juce::jlimit (1, kMaxSendsPerTrack, e->getIntAttribute ("sends", kDefaultSends)), SendData {});
-        for (auto* x : e->getChildWithTagNameIterator ("SEND"))
-        {
-            const int i = x->getIntAttribute ("index", -1);
-            if (! juce::isPositiveAndBelow (i, kMaxSendsPerTrack)) continue;
-            if (i >= (int) t.sends.size()) t.sends.resize ((size_t) i + 1);
-            t.sends[(size_t) i] = { validBus (x->getIntAttribute ("bus", -1)),
-                                    juce::jlimit (kMinDb, 12.0f, (float) x->getDoubleAttribute ("levelDb", 0.0)),
-                                    x->getBoolAttribute ("pre"), x->getBoolAttribute ("preFx", false) };
-        }
+        t.sends = readSends (*e, kDefaultSends, validBus);
         p.tracks.push_back (std::move (t));
     }
     if (auto* m = root->getChildByName ("MASTER"))
     {
         readChannel (*m, p.master);
         p.masterMono = m->getBoolAttribute ("mono");
+        if (auto* x = m->getChildByName ("BUSCOMP"))
+        {
+            auto& c = p.masterComp;
+            c.on = x->getBoolAttribute ("on");
+            c.thresholdDb = juce::jlimit (-30.0f, 10.0f, (float) x->getDoubleAttribute ("threshold", -10.0));
+            c.ratio = juce::jlimit (0, BusCompParams::numRatios - 1, x->getIntAttribute ("ratio", 1));
+            c.attack = juce::jlimit (0, BusCompParams::numAttacks - 1, x->getIntAttribute ("attack", 2));
+            c.release = juce::jlimit (0, BusCompParams::numReleases - 1, x->getIntAttribute ("release", 4));
+            c.makeupDb = juce::jlimit (0.0f, 20.0f, (float) x->getDoubleAttribute ("makeup", 0.0));
+            c.mix = juce::jlimit (0.0f, 1.0f, (float) x->getDoubleAttribute ("mix", 1.0));
+            c.hpf = juce::jlimit (0, BusCompParams::numHpf - 1, x->getIntAttribute ("hpf", 0));
+        }
     }
     for (auto* x : root->getChildWithTagNameIterator ("VCA"))
     {

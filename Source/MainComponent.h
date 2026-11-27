@@ -8,6 +8,7 @@
 #include "AutomationRecorder.h"
 #include "AutomationView.h"
 #include "SilverLookAndFeel.h"
+#include "PluginScanCache.h"
 
 namespace sc
 {
@@ -114,7 +115,7 @@ public:
     Engine& getEngine() override { return engine; }
     void insertSlotClicked (Channel&, int slot, juce::Component&, const juce::MouseEvent&) override;
     void channelMenu (Channel&, juce::Component&) override;
-    void sendMenu (Track&, int send, juce::Component&) override;
+    void sendMenu (Channel&, int send, juce::Component&) override;
     void outputMenu (Track&, juce::Component&) override;
     bool isEditorOpen (const Channel&, int slot) const override;
     void markDirty() override;
@@ -123,7 +124,7 @@ public:
     void autoModeMenu (Channel&, juce::Component&) override;
     void lanesChanged() override;
     void addInsertSlot (Channel& c) override { setInsertSlots (c, c.inserts.size() + 1); }
-    void addSendSlot (Track& t) override { setSendSlots (t, t.sends.size() + 1); }
+    void addSendSlot (Channel& c) override { setSendSlots (c, c.sends.size() + 1); }
 
 private:
     void timerCallback() override;
@@ -160,6 +161,10 @@ private:
     void runStemExport (Engine::StemExport request);
     void timelineMenu (juce::Component&) override;
     void stripDrag (Channel&, const juce::MouseEvent&, int phase) override;
+    void insertDrag (Channel&, int slot, const juce::MouseEvent&, int phase) override;
+    /** Move (ou copia) o plugin de src.from para o destino; desfazer volta tudo. */
+    void moveInsert (Channel& src, int from, Channel& dst, ChannelStrip::InsertDrop, bool copy);
+    void compEdited (int param, float before, float after) override;
     // desfazer/refazer
     void valueEdited (Channel&, Param, float before, float after) override;
     void liveValueChanged (Channel&, Param, float before, float after) override;
@@ -167,7 +172,7 @@ private:
     void vcaMenu (int group, juce::Component&) override;
     void setChannelGroup (Channel&, int group);
     void setVcaShown (int group, bool shown);
-    void sendLevelEdited (Track&, int index, float before, float after) override;
+    void sendLevelEdited (Channel&, int index, float before, float after) override;
     void renamed (Channel&, const juce::String& before) override;
     void automationEdited (Channel&, AutoTarget, int slot, int param, const std::vector<AutoPoint>& before) override;
     void playSelection() override;
@@ -223,8 +228,9 @@ private:
     void mixEdited (Channel*, int slot, float before, float after);
     struct SendState { int bus = -1; float level = 0.0f; bool pre = false, preFx = false; };
     static SendState sendStateOf (const Send&);
-    void applySendState (Track*, int index, SendState);
+    void applySendState (Channel*, int index, SendState);
     void moveTrackUndoable (int from, int to);
+    void moveBusUndoable (int from, int to);
     void showInsertMix (Channel&, int slot, juce::Component& source);
     bool createFromSlot (const InsertSlot&, Engine::RestoredInsert&, juce::String& error);
     /** Recria os plugins offline (onlySlot = -1: todos). Falhas ficam offline. */
@@ -240,7 +246,13 @@ private:
     void closeEditorsFor (Channel&);
     void closeAllEditors();
     void showPluginManager (bool startScan);
-    void scanPluginsIsolated (bool retryFailed = false, bool probeDsp = false);
+    /** Scanner isolado. newOnly: so arquivos novos/alterados (o cache guarda os ja vistos). */
+    void scanPluginsIsolated (PluginScanRun::Mode mode = PluginScanRun::Mode::newOnly);
+    PluginScanRun::Request makeScanRequest (PluginScanRun::Mode, juce::String& error);
+    /** Aplica o resultado na lista de plugins; silent = sem aviso (scan ao abrir). */
+    void finishScan (const PluginScanRun::Result&, PluginScanRun::Mode, bool silent);
+    void startBackgroundScan();
+    juce::String scanStatusText();
     void showAudioSettings();
     void audioMenu();
     juce::Rectangle<int> statusArea() const;
@@ -253,7 +265,7 @@ private:
     void removeChannel (Channel&);
     Bus* createBus();
     void setInsertSlots (Channel&, int count);
-    void setSendSlots (Track&, int count);
+    void setSendSlots (Channel&, int count);
 
     void runJob (const juce::String& title, bool cancellable, std::function<void (Job&)> work, std::function<void (Job&)> done);
     void togglePlay();
@@ -284,6 +296,20 @@ private:
         DropMarker() { setInterceptsMouseClicks (false, false); }
         void paint (juce::Graphics& g) override { g.fillAll (colours::accent); }
     } dropMarker; // onde a faixa arrastada vai entrar
+    struct InsertDropMarker : juce::Component
+    {
+        InsertDropMarker() { setInterceptsMouseClicks (false, false); }
+        bool into = false, copy = false;
+        void paint (juce::Graphics& g) override
+        {
+            const auto c = copy ? colours::solo : colours::accent;
+            if (! into) { g.fillAll (c); return; }
+            g.setColour (c.withAlpha (0.22f));
+            g.fillRoundedRectangle (getLocalBounds().toFloat(), 2.0f);
+            g.setColour (c);
+            g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (0.75f), 2.0f, 1.5f);
+        }
+    } insertDropMarker; // onde o plugin arrastado vai entrar (azul: mover, amarelo: copiar)
     juce::OwnedArray<ChannelStrip> strips;
     std::unique_ptr<ChannelStrip> masterStrip;
     juce::OwnedArray<VcaStrip> vcaStrips;
@@ -311,7 +337,23 @@ private:
     juce::int64 playStart = 0;
     juce::String statusText;
     int tickCount = 0;
-    bool scanPromptShown = false;
+    bool startupScanChecked = false;
+    // Procura de plugins novos ao abrir (segundo plano, sem janela de progresso)
+    struct BackgroundScan : juce::Thread
+    {
+        BackgroundScan() : Thread ("SilverConsole plugin scan") {}
+        ~BackgroundScan() override { cancel = true; stopThread (30000); }
+        void run() override { PluginScanRun::run (request, result, cancel, progress, nullptr, &current, &currentLock); }
+        PluginScanRun::Request request;
+        PluginScanRun::Result result;
+        std::atomic<bool> cancel { false };
+        std::atomic<float> progress { 0.0f };
+        juce::String current;
+        juce::CriticalSection currentLock;
+    };
+    std::unique_ptr<BackgroundScan> backgroundScan;
+    juce::String scanNotice;
+    juce::uint32 scanNoticeUntil = 0;
     bool recoveryPromptShown = false;
     juce::int64 lastAutosaveMs = 0;
     juce::File openedRecoveryFile;

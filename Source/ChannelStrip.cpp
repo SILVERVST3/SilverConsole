@@ -134,8 +134,8 @@ void InsertSlotComponent::paint (juce::Graphics& g)
         g.setFont (uiFont (9.0f, true));
         g.drawText ("OFF", r.withTrimmedRight (3.0f), juce::Justification::centredRight);
         const bool frozen = channel.kind == ChannelKind::track && static_cast<const Track&> (channel).isFrozen();
-        setTooltip (frozen ? s.getName() + juce::String::fromUTF8 (" - gravado no Ã¡udio congelado. Clique: descongelar")
-                           : s.getName() + juce::String::fromUTF8 (" - offline (sem CPU/memÃ³ria, ajuste guardado). Clique: colocar online"));
+        setTooltip (frozen ? s.getName() + juce::String::fromUTF8 (" - gravado no \xc3\xa1udio congelado. Clique: descongelar")
+                           : s.getName() + juce::String::fromUTF8 (" - offline (sem CPU/mem\xc3\xb3ria, ajuste guardado). Clique: colocar online"));
         return;
     }
     const float mixValue = s.mix.load (std::memory_order_relaxed);
@@ -169,7 +169,7 @@ void InsertSlotComponent::paint (juce::Graphics& g)
 }
 
 //==============================================================================
-SendRow::SendRow (Track& t, int i, StripHost& h) : track (t), index (i), host (h)
+SendRow::SendRow (Channel& c, int i, StripHost& h) : channel (c), index (i), host (h)
 {
     level.setSliderStyle (juce::Slider::LinearHorizontal);
     level.setTextBoxStyle (juce::Slider::NoTextBox, false, 0, 0);
@@ -177,17 +177,17 @@ SendRow::SendRow (Track& t, int i, StripHost& h) : track (t), index (i), host (h
     level.setSkewFactorFromMidPoint (-12.0);
     level.setDoubleClickReturnValue (true, 0.0);
     level.setColour (juce::Slider::trackColourId, colours::busTint);
-    level.onDragStart = [this] { gesture = true; gestureStart = track.sends[(size_t) index].levelDb.load(); };
+    level.onDragStart = [this] { gesture = true; gestureStart = channel.sends[(size_t) index].levelDb.load(); };
     level.onDragEnd = [this]
     {
         gesture = false;
-        host.sendLevelEdited (track, index, gestureStart, track.sends[(size_t) index].levelDb.load());
+        host.sendLevelEdited (channel, index, gestureStart, channel.sends[(size_t) index].levelDb.load());
     };
     level.onValueChange = [this]
     {
-        const float before = track.sends[(size_t) index].levelDb.load();
-        track.sends[(size_t) index].levelDb = (float) level.getValue();
-        if (! gesture) host.sendLevelEdited (track, index, before, (float) level.getValue());
+        const float before = channel.sends[(size_t) index].levelDb.load();
+        channel.sends[(size_t) index].levelDb = (float) level.getValue();
+        if (! gesture) host.sendLevelEdited (channel, index, before, (float) level.getValue());
         level.setTooltip ("Envio " + juce::String (index + 1) + ": " + dbText ((float) level.getValue()) + " dB");
         host.markDirty();
         repaint();
@@ -198,7 +198,8 @@ SendRow::SendRow (Track& t, int i, StripHost& h) : track (t), index (i), host (h
 
 void SendRow::refresh()
 {
-    auto& s = track.sends[(size_t) index];
+    if (index >= channel.sends.size()) return;
+    auto& s = channel.sends[(size_t) index];
     level.setValue (s.levelDb.load(), juce::dontSendNotification);
     level.setEnabled (s.bus.load() >= 0);
     level.setTooltip ("Envio " + juce::String (index + 1) + ": " + dbText (s.levelDb.load()) + " dB");
@@ -209,7 +210,8 @@ void SendRow::resized() { level.setBounds (getLocalBounds().withTrimmedLeft (36)
 
 void SendRow::paint (juce::Graphics& g)
 {
-    auto& s = track.sends[(size_t) index];
+    if (index >= channel.sends.size()) return;
+    auto& s = channel.sends[(size_t) index];
     auto box = getLocalBounds().withWidth (34).toFloat().reduced (0.5f, 1.5f);
     g.setColour (colours::lcd);
     g.fillRoundedRectangle (box, 2.0f);
@@ -230,7 +232,50 @@ void SendRow::paint (juce::Graphics& g)
 
 void SendRow::mouseDown (const juce::MouseEvent& e)
 {
-    if (e.x < 36) host.sendMenu (track, index, *this);
+    if (e.x < 36) host.sendMenu (channel, index, *this);
+}
+
+//==============================================================================
+void InsertSlotComponent::mouseDown (const juce::MouseEvent& e)
+{
+    clickPending = dragging = false;
+    const auto& s = channel.inserts[(size_t) slot];
+    const bool frozen = channel.kind == ChannelKind::track && static_cast<const Track&> (channel).isFrozen();
+    // clique esquerdo simples num plugin: espera para ver se e arraste (mover o plugin)
+    if (! e.mods.isPopupMenu() && ! e.mods.isShiftDown() && ! s.isEmpty() && ! frozen)
+    {
+        clickPending = true;
+        return;
+    }
+    host.insertSlotClicked (channel, slot, *this, e);
+}
+
+void InsertSlotComponent::mouseDrag (const juce::MouseEvent& e)
+{
+    if (! clickPending && ! dragging) return;
+    if (! dragging && e.getDistanceFromDragStart() < 5) return;
+    if (! dragging)
+    {
+        dragging = true;
+        clickPending = false;
+        host.insertDrag (channel, slot, e, 0);
+    }
+    host.insertDrag (channel, slot, e, 1);
+}
+
+void InsertSlotComponent::mouseUp (const juce::MouseEvent& e)
+{
+    if (dragging)
+    {
+        dragging = false;
+        host.insertDrag (channel, slot, e, 2);
+        return;
+    }
+    if (clickPending)
+    {
+        clickPending = false;
+        host.insertSlotClicked (channel, slot, *this, e);
+    }
 }
 
 //==============================================================================
@@ -254,8 +299,8 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
         host.markDirty();
     };
     nameLabel.addMouseListener (this, false);
-    nameLabel.setTooltip (c.kind == ChannelKind::track ? "Arrastar: mudar a posicao | duplo clique: renomear | botao direito: opcoes"
-                                                       : "Duplo clique: renomear | botao direito: opcoes");
+    nameLabel.setTooltip (! isMaster ? "Arrastar (aqui ou no fundo do canal): mudar a posicao | duplo clique: renomear | botao direito: opcoes"
+                                     : "Botao direito: opcoes");
     addAndMakeVisible (nameLabel);
 
     setupSmallLabel (infoLabel, 10.0f, colours::textDim);
@@ -272,10 +317,19 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     setupPlus (addInsertButton, "Adicionar mais um slot de insert (botao direito no ultimo slot vazio: remover)");
     addInsertButton.onClick = [this] { host.addInsertSlot (channel); };
 
+    if (! isMaster)
+    {
+        setupPlus (addSendButton, isTrack ? "Adicionar mais um envio (menu do ultimo envio: remover)"
+                                          : "Adicionar mais um envio deste bus para outro bus (menu do ultimo envio: remover)");
+        addSendButton.onClick = [this] { host.addSendSlot (channel); };
+    }
+    if (isMaster)
+    {
+        compPanel = std::make_unique<BusCompPanel> (static_cast<Master&> (c), h);
+        addAndMakeVisible (*compPanel);
+    }
     if (isTrack)
     {
-        setupPlus (addSendButton, "Adicionar mais um envio (menu do ultimo envio: remover)");
-        addSendButton.onClick = [this] { host.addSendSlot (static_cast<Track&> (channel)); };
         outputButton.onClick = [this] { host.outputMenu (static_cast<Track&> (channel), outputButton); };
         outputButton.setTooltip ("Saida da faixa: Master ou um bus");
         addAndMakeVisible (outputButton);
@@ -421,7 +475,7 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     }
     insertsView.setViewedComponent (&insertsContent, false);
     addAndMakeVisible (insertsView);
-    if (isTrack)
+    if (! isMaster)
     {
         sendsView.setViewedComponent (&sendsContent, false);
         addAndMakeVisible (sendsView);
@@ -441,13 +495,12 @@ void ChannelStrip::syncSlots()
         changed = true;
     }
     lastInsertVisualState.resize ((size_t) slots.size(), 0);
-    if (channel.kind == ChannelKind::track)
+    if (channel.kind != ChannelKind::master)
     {
-        auto& t = static_cast<Track&> (channel);
-        while (sends.size() > t.sends.size()) { sends.removeLast(); changed = true; }
-        while (sends.size() < t.sends.size())
+        while (sends.size() > channel.sends.size()) { sends.removeLast(); changed = true; }
+        while (sends.size() < channel.sends.size())
         {
-            sendsContent.addAndMakeVisible (sends.add (new SendRow (t, sends.size(), host)));
+            sendsContent.addAndMakeVisible (sends.add (new SendRow (channel, sends.size(), host)));
             changed = true;
         }
     }
@@ -510,19 +563,20 @@ void ChannelStrip::refresh()
         }
         infoLabel.setColour (juce::Label::textColourId, t.isFrozen() ? colours::accent : colours::textDim);
         phaseButton.setEnabled (! t.isFrozen()); // a fase ja esta gravada no audio congelado
-        phaseButton.setTooltip (t.isFrozen() ? juce::String::fromUTF8 ("Faixa congelada: a fase estÃ¡ gravada no Ã¡udio")
+        phaseButton.setTooltip (t.isFrozen() ? juce::String::fromUTF8 ("Faixa congelada: a fase est\xc3\xa1 gravada no \xc3\xa1udio")
                                              : juce::String ("Inverter polaridade"));
         const int ob = t.outputBus.load();
         outputButton.setButtonText (juce::String::fromUTF8 ("\xe2\x86\x92 ")
                                     + (ob >= 0 && ob < (int) engine.buses.size() ? engine.buses[(size_t) ob]->name : juce::String ("MASTER")));
-        for (auto* s : sends) s->refresh();
     }
     else if (channel.kind == ChannelKind::bus) info = "BUS AUX";
     else
     {
         info = "SAIDA";
         monoButton.setToggleState (engine.master.mono.load(), juce::dontSendNotification);
+        if (compPanel != nullptr) compPanel->refresh();
     }
+    for (auto* s : sends) s->refresh();
     infoLabel.setText (info, juce::dontSendNotification);
     refreshAutoButton();
     for (auto* s : slots) s->repaint();
@@ -597,6 +651,7 @@ void ChannelStrip::resized()
     const int w = getWidth(), H = getHeight();
     const bool isTrack = channel.kind == ChannelKind::track;
     const bool isMaster = channel.kind == ChannelKind::master;
+    const bool hasSends = ! isMaster;
     infoLabel.setBounds (4, 8, w - 8, 13);
 
     // ---- secao fixa (de baixo para cima): nome, volume, fader, botoes, automacao, pan, saida
@@ -637,17 +692,27 @@ void ChannelStrip::resized()
     }
     if (isMaster)
     {
-        loudnessArea = { 6, rackBottom - kLoudnessH, w - 12, kLoudnessH };
-        rackBottom = loudnessArea.getY() - 4;
+        // de baixo para cima: loudness, compressor de barramento, inserts (com rolagem).
+        // Janela baixa: some o loudness, depois o compressor fica compacto (so a agulha).
+        const int minInserts = kRackTop + kHeaderH + 2 * kSlotH;
+        const int room = rackBottom - minInserts;
+        const bool showLoudness = room >= BusCompPanel::fullHeight + kLoudnessH + 8;
+        const bool full = room >= BusCompPanel::fullHeight + 4;
+        loudnessArea = showLoudness ? juce::Rectangle<int> (6, rackBottom - kLoudnessH, w - 12, kLoudnessH) : juce::Rectangle<int>();
+        if (showLoudness) rackBottom = loudnessArea.getY() - 4;
+        compPanel->setCompact (! full);
+        const int ch = full ? BusCompPanel::fullHeight : BusCompPanel::compactHeight;
+        compPanel->setBounds (6, rackBottom - ch, w - 12, ch);
+        rackBottom = compPanel->getY() - 4;
     }
 
     // ---- rack: inserts (e envios) com rolagem. Divisao igual em todas as faixas,
     // pelo canal que tem mais linhas, para os cabecalhos ficarem alinhados.
     insertsHeader = { 6, kRackTop, w - 12, 12 };
     addInsertButton.setBounds (w - 6 - 18, kRackTop - 1, 18, 13);
-    const int avail = juce::jmax (0, rackBottom - kRackTop - kHeaderH - (isTrack ? kHeaderH + 4 : 0));
+    const int avail = juce::jmax (0, rackBottom - kRackTop - kHeaderH - (hasSends ? kHeaderH + 4 : 0));
     int insH = avail, sendH = 0;
-    if (isTrack)
+    if (hasSends)
     {
         const int needI = layoutInsertRows * kSlotH, needS = layoutSendRows * kSendH;
         if (needI + needS <= avail)          { sendH = needS; insH = avail - needS; }
@@ -662,7 +727,7 @@ void ChannelStrip::resized()
         insertsContent.setSize (cw, contentH);
         for (int i = 0; i < slots.size(); ++i) slots[i]->setBounds (0, i * kSlotH, cw, kSlotH - 1);
     }
-    if (isTrack)
+    if (hasSends)
     {
         const int sy = kRackTop + kHeaderH + insH + 4;
         sendsHeader = { 6, sy, w - 12, 12 };
@@ -708,8 +773,8 @@ void ChannelStrip::paint (juce::Graphics& g)
         g.setFont (uiFont (9.5f, true));
         g.drawText ("zz", insertsHeader.withTrimmedLeft (46), juce::Justification::centredLeft);
     }
-    if (channel.kind == ChannelKind::track) header (sendsHeader, "ENVIOS");
-    if (isMaster)
+    if (channel.kind != ChannelKind::master) header (sendsHeader, "ENVIOS");
+    if (isMaster && ! loudnessArea.isEmpty())
     {
         const auto& m = static_cast<const Master&> (channel);
         g.setColour (juce::Colours::black.withAlpha (0.35f));
@@ -886,27 +951,325 @@ void ChannelStrip::paintOverChildren (juce::Graphics& g)
     }
 }
 
+bool ChannelStrip::isDragArea (const juce::MouseEvent& e) const
+{
+    if (channel.kind == ChannelKind::master || e.mods.isPopupMenu()) return false;
+    return e.eventComponent == &nameLabel || e.eventComponent == this;
+}
+
 void ChannelStrip::mouseDrag (const juce::MouseEvent& e)
 {
-    // arrastar pelo nome muda a posicao da faixa
-    if (e.eventComponent != &nameLabel || channel.kind != ChannelKind::track || e.mods.isPopupMenu()) return;
+    // arrastar pelo nome ou pelo fundo do canal muda a posicao (faixas entre faixas, buses entre buses)
+    if (! isDragArea (e)) return;
     if (! draggingStrip && e.getDistanceFromDragStart() < 6) return;
-    if (! draggingStrip) { draggingStrip = true; host.stripDrag (channel, e, 0); }
+    if (! draggingStrip)
+    {
+        draggingStrip = true;
+        topClickPending = false;
+        setMouseCursor (juce::MouseCursor::DraggingHandCursor);
+        host.stripDrag (channel, e, 0);
+    }
     host.stripDrag (channel, e, 1);
 }
 
 void ChannelStrip::mouseUp (const juce::MouseEvent& e)
 {
-    if (! draggingStrip) return;
-    draggingStrip = false;
-    host.stripDrag (channel, e, 2);
+    if (draggingStrip)
+    {
+        draggingStrip = false;
+        setMouseCursor (juce::MouseCursor::NormalCursor);
+        host.stripDrag (channel, e, 2);
+        return;
+    }
+    if (topClickPending)
+    {
+        topClickPending = false;
+        host.channelMenu (channel, nameLabel);
+    }
 }
 
 void ChannelStrip::mouseDown (const juce::MouseEvent& e)
 {
+    topClickPending = false;
     const bool onName = e.eventComponent == &nameLabel;
-    const bool onTop = e.eventComponent == this && e.y < 22;
-    if ((onName && e.mods.isPopupMenu()) || onTop)
-        host.channelMenu (channel, nameLabel);
+    const bool onStrip = e.eventComponent == this;
+    if (e.mods.isPopupMenu() && (onName || onStrip)) { host.channelMenu (channel, nameLabel); return; }
+    if (onStrip && e.y < 22) topClickPending = true; // menu ao soltar (se nao arrastar)
+}
+
+bool ChannelStrip::insertDropAt (juce::Point<int> screen, InsertDrop& d, juce::Rectangle<int>& marker) const
+{
+    const auto vb = insertsView.getScreenBounds();
+    if (! vb.expanded (0, 6).contains (screen)) return false;
+    const auto local = insertsContent.getLocalPoint (nullptr, screen);
+    const int n = slots.size();
+    auto lineAt = [&] (int pos)
+    {
+        const auto pt = insertsContent.localPointToGlobal (juce::Point<int> (0, pos * kSlotH - 1));
+        return juce::Rectangle<int> (vb.getX(), juce::jlimit (vb.getY() - 1, vb.getBottom() - 2, pt.y - 1), vb.getWidth(), 3);
+    };
+    if (local.y >= n * kSlotH) { d = { n, false }; marker = lineAt (n); return true; }
+    const int idx = juce::jlimit (0, juce::jmax (0, n - 1), local.y / kSlotH);
+    if (n > 0 && channel.inserts[(size_t) idx].isEmpty())
+    {
+        d = { idx, true };
+        marker = slots[idx]->getScreenBounds();
+        return true;
+    }
+    const int pos = (local.y - idx * kSlotH) >= kSlotH / 2 ? idx + 1 : idx;
+    d = { juce::jlimit (0, n, pos), false };
+    marker = lineAt (d.slot);
+    return true;
+}
+
+void ChannelStrip::autoScrollInserts (juce::Point<int> screen)
+{
+    const auto v = insertsView.getLocalPoint (nullptr, screen);
+    insertsView.autoScroll (v.x, v.y, 14, 6);
+}
+
+//==============================================================================
+GrMeter::GrMeter (Master& m) : master (m)
+{
+    setTooltip (juce::String::fromUTF8 ("Redu\xc3\xa7\xc3\xa3o de ganho do compressor (dB). Marca vermelha: maior redu\xc3\xa7\xc3\xa3o recente (clique: limpa)"));
+    startTimerHz (60);
+}
+
+void GrMeter::timerCallback()
+{
+    const auto now = juce::Time::getMillisecondCounter();
+    const float dt = lastMs == 0 ? 1.0f / 60.0f : juce::jlimit (0.001f, 0.05f, (float) (now - lastMs) * 0.001f);
+    lastMs = now;
+    const bool on = master.comp.enabled.load (std::memory_order_relaxed);
+    const float target = on ? master.compGr.exchange (0.0f) : 0.0f;
+    if (! on) master.compGr.store (0.0f, std::memory_order_relaxed);
+    // agulha com massa e mola (um pouco de "balanco", como um VU de verdade)
+    constexpr float k = 260.0f, damping = 2.0f * 0.72f * 16.12f; // 16,12 = sqrt(k)
+    const float before = pos;
+    vel += (k * (target - pos) - damping * vel) * dt;
+    pos += vel * dt;
+    if (pos < 0.0f) { pos = 0.0f; vel = juce::jmax (0.0f, vel); }  // batente no 0
+    if (pos > 22.0f) { pos = 22.0f; vel = juce::jmin (0.0f, vel); } // batente no fim
+    if (target > peakHold) { peakHold = target; holdFrames = 90; }
+    else if (--holdFrames <= 0) peakHold = juce::jmax (0.0f, peakHold - 0.25f);
+    if (std::abs (pos - before) > 0.005f || holdFrames == 89 || (peakHold > 0.0f && holdFrames <= 0)) repaint();
+}
+
+void GrMeter::paint (juce::Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    g.setColour (juce::Colours::black);
+    g.fillRoundedRectangle (r, 5.0f);
+    g.setColour (colours::silverDark);
+    g.drawRoundedRectangle (r.reduced (0.5f), 5.0f, 1.0f);
+    const auto face = r.reduced (4.0f);
+    g.setGradientFill ({ juce::Colour (0xfff7edd2), face.getCentreX(), face.getY(),
+                         juce::Colour (0xffd9c48f), face.getCentreX(), face.getBottom(), false });
+    g.fillRoundedRectangle (face, 3.0f);
+
+    // Arco que ocupa a largura do mostrador: espaco para os numeros em cima e
+    // para o texto embaixo; a meia-abertura sai da proporcao do mostrador.
+    const float topRoom = 18.0f, bottomRoom = 11.0f;
+    const float span = juce::jmax (8.0f, face.getHeight() - topRoom - bottomRoom);
+    float half = 0.8f;
+    for (float a = 0.25f; a <= 1.0f; a += 0.01f)
+    {
+        const float rr = span / (1.0f - std::cos (a));
+        half = a;
+        if (rr * std::sin (a) <= face.getWidth() * 0.40f) break;
+    }
+    const float radius = span / (1.0f - std::cos (half));
+    const float cx = face.getCentreX();
+    const float cy = face.getY() + topRoom + radius;
+    const float a0 = -half, a1 = half; // 20 dB a esquerda, 0 dB a direita
+    auto angleOf = [&] (float db) { return a1 - juce::jlimit (0.0f, 22.0f, db) / 20.0f * (a1 - a0); };
+    auto at = [&] (float a, float rad) { return juce::Point<float> (cx + std::sin (a) * rad, cy - std::cos (a) * rad); };
+
+    const juce::Colour ink (0xff2b2117);
+    g.saveState();
+    g.reduceClipRegion (face.toNearestInt());
+    {
+        juce::Path arc;
+        arc.addCentredArc (cx, cy, radius, radius, 0.0f, a0, a1, true);
+        g.setColour (ink);
+        g.strokePath (arc, juce::PathStrokeType (1.3f));
+        juce::Path red;
+        red.addCentredArc (cx, cy, radius + 2.5f, radius + 2.5f, 0.0f, angleOf (20.0f), angleOf (12.0f), true);
+        g.setColour (juce::Colour (0xffc0392b));
+        g.strokePath (red, juce::PathStrokeType (3.0f));
+    }
+    g.setFont (uiFont (9.5f, true));
+    for (int db = 0; db <= 20; ++db)
+    {
+        const bool major = db % 4 == 0;
+        const float a = angleOf ((float) db);
+        g.setColour (ink);
+        g.drawLine ({ at (a, radius), at (a, radius + (major ? 7.0f : 4.0f)) }, major ? 1.4f : 0.9f);
+        if (major)
+        {
+            const auto p = at (a, radius + 14.0f);
+            g.drawText (juce::String (db), juce::Rectangle<float> (p.x - 10.0f, p.y - 6.0f, 20.0f, 12.0f), juce::Justification::centred);
+        }
+    }
+    g.setColour (ink.withAlpha (0.8f));
+    g.setFont (uiFont (8.0f, true));
+    g.drawText ("GAIN REDUCTION  dB", face.withTrimmedTop (face.getHeight() - 15.0f), juce::Justification::centred);
+
+    if (peakHold > 0.05f)
+    {
+        const float a = angleOf (peakHold);
+        g.setColour (juce::Colour (0xffd0392b));
+        g.drawLine ({ at (a, radius - 5.0f), at (a, radius + 3.0f) }, 2.0f);
+    }
+    // agulha
+    {
+        const float a = angleOf (pos);
+        g.setColour (juce::Colours::black.withAlpha (0.18f));
+        g.drawLine ({ at (a, 0.0f).translated (1.5f, 1.0f), at (a, radius + 9.0f).translated (1.5f, 1.0f) }, 1.6f);
+        g.setColour (juce::Colour (0xff141414));
+        g.drawLine ({ at (a, 0.0f), at (a, radius + 9.0f) }, 1.5f);
+    }
+    g.restoreState();
+    // vidro
+    g.setGradientFill ({ juce::Colours::white.withAlpha (0.22f), face.getX(), face.getY(),
+                         juce::Colours::white.withAlpha (0.0f), face.getX(), face.getCentreY(), false });
+    g.fillRoundedRectangle (face.withHeight (face.getHeight() * 0.5f), 3.0f);
+}
+
+//==============================================================================
+BusCompPanel::BusCompPanel (Master& m, StripHost& h) : master (m), host (h), meter (m)
+{
+    addAndMakeVisible (meter);
+    inButton.setClickingTogglesState (true);
+    inButton.setColour (juce::TextButton::buttonOnColourId, colours::accent);
+    inButton.setColour (juce::TextButton::textColourOnId, colours::ink);
+    inButton.setColour (juce::TextButton::buttonColourId, colours::gun);
+    inButton.setWantsKeyboardFocus (false);
+    inButton.setTooltip (juce::String::fromUTF8 ("Liga o compressor de barramento do master (depois dos inserts, antes do fader)"));
+    inButton.onClick = [this]
+    {
+        const float before = master.comp.get (BusCompParams::idEnabled);
+        master.comp.set (BusCompParams::idEnabled, inButton.getToggleState() ? 1.0f : 0.0f);
+        host.compEdited (BusCompParams::idEnabled, before, master.comp.get (BusCompParams::idEnabled));
+        host.markDirty();
+        repaint();
+    };
+    addAndMakeVisible (inButton);
+
+    struct Spec { int id; double lo, hi, step, def; int sens; const char* tip; };
+    const Spec specs[] {
+        { BusCompParams::idThreshold, -30.0, 10.0, 0.5, -10.0, 240, "Limiar (dB). Duplo clique: -10" },
+        { BusCompParams::idRatio, 0, BusCompParams::numRatios - 1, 1, 1, 60, "Ratio: 2:1, 4:1 ou 10:1" },
+        { BusCompParams::idAttack, 0, BusCompParams::numAttacks - 1, 1, 2, 80, "Ataque (ms): 0,1 a 30" },
+        { BusCompParams::idRelease, 0, BusCompParams::numReleases - 1, 1, 4, 80,
+          "Release (s): 0,1 a 1,2 ou AUTO (dois estagios: rapido nos transientes, lento na compressao sustentada)" },
+        { BusCompParams::idMakeup, 0.0, 20.0, 0.5, 0.0, 240, "Ganho de compensacao (dB)" },
+        { BusCompParams::idMix, 0.0, 1.0, 0.01, 1.0, 240, "Mix: 0% = seco, 100% = comprimido (compressao paralela)" },
+        { BusCompParams::idHpf, 0, BusCompParams::numHpf - 1, 1, 0, 80, "Filtro no sidechain: o grave aciona menos o compressor (OFF, 60, 90, 150 Hz)" },
+    };
+    for (size_t i = 0; i < knobs.size(); ++i)
+    {
+        auto& k = knobs[i];
+        const auto& sp = specs[i];
+        k.id = sp.id;
+        k.slider.setRange (sp.lo, sp.hi, sp.step);
+        k.slider.setDoubleClickReturnValue (true, sp.def);
+        k.slider.setMouseDragSensitivity (sp.sens);
+        k.slider.setColour (juce::Slider::trackColourId, colours::accent);
+        k.slider.setTooltip (juce::String::fromUTF8 (sp.tip));
+        k.slider.setValue (master.comp.get (k.id), juce::dontSendNotification);
+        k.slider.onDragStart = [this, &k] { k.gesture = true; k.start = master.comp.get (k.id); };
+        k.slider.onDragEnd = [this, &k]
+        {
+            k.gesture = false;
+            host.compEdited (k.id, k.start, master.comp.get (k.id));
+        };
+        k.slider.onValueChange = [this, &k]
+        {
+            const float before = master.comp.get (k.id);
+            master.comp.set (k.id, (float) k.slider.getValue());
+            if (! k.gesture) host.compEdited (k.id, before, master.comp.get (k.id));
+            host.markDirty();
+            repaint();
+        };
+        addAndMakeVisible (k.slider);
+    }
+    refresh();
+}
+
+juce::String BusCompPanel::valueText (int id) const
+{
+    const auto& c = master.comp;
+    switch (id)
+    {
+        case BusCompParams::idThreshold: return juce::String (c.thresholdDb.load(), 1);
+        case BusCompParams::idRatio:     return BusCompParams::ratioText (c.ratio.load());
+        case BusCompParams::idAttack:    return BusCompParams::attackText (c.attack.load()) + " ms";
+        case BusCompParams::idRelease:   { const auto t = BusCompParams::releaseText (c.release.load()); return c.releaseS (c.release.load()) < 0 ? t : t + " s"; }
+        case BusCompParams::idMakeup:    return "+" + juce::String (c.makeupDb.load(), 1);
+        case BusCompParams::idMix:       return juce::String (juce::roundToInt (c.mix.load() * 100.0f)) + "%";
+        case BusCompParams::idHpf:       { const auto t = BusCompParams::hpfText (c.sidechainHpf.load()); return c.sidechainHpf.load() > 0 ? t + " Hz" : t; }
+        default: return {};
+    }
+}
+
+void BusCompPanel::refresh()
+{
+    inButton.setToggleState (master.comp.enabled.load(), juce::dontSendNotification);
+    for (auto& k : knobs)
+        if (! k.slider.isMouseButtonDown()) k.slider.setValue (master.comp.get (k.id), juce::dontSendNotification);
+    repaint();
+}
+
+void BusCompPanel::setCompact (bool c)
+{
+    if (compact == c) return;
+    compact = c;
+    for (auto& k : knobs) k.slider.setVisible (! compact);
+    meter.setTooltip (compact ? juce::String::fromUTF8 ("Aumente a altura da janela para ver os controles do compressor")
+                              : juce::String::fromUTF8 ("Redu\xc3\xa7\xc3\xa3o de ganho do compressor (dB)"));
+    resized();
+    repaint();
+}
+
+void BusCompPanel::resized()
+{
+    const int w = getWidth();
+    inButton.setBounds (w - 40, 2, 36, 15);
+    meter.setBounds (4, 19, w - 8, compact ? getHeight() - 23 : 56);
+    if (compact) return;
+    // 2 linhas de botoes: THRESH RATIO ATTACK RELEASE / MAKEUP MIX S/C HPF
+    const int top = 78, rowH = 43;
+    const int cw = (w - 8) / 4;
+    for (size_t i = 0; i < knobs.size(); ++i)
+    {
+        const int row = (int) i / 4, col = (int) i % 4;
+        const int rowCount = row == 0 ? 4 : (int) knobs.size() - 4;
+        const int x0 = 4 + (w - 8 - rowCount * cw) / 2;
+        knobs[i].slider.setBounds (x0 + col * cw + (cw - 26) / 2, top + row * rowH + 9, 26, 24);
+    }
+}
+
+void BusCompPanel::paint (juce::Graphics& g)
+{
+    auto r = getLocalBounds().toFloat();
+    g.setColour (juce::Colours::black.withAlpha (0.38f));
+    g.fillRoundedRectangle (r, 4.0f);
+    g.setColour (master.comp.enabled.load() ? colours::accent.withAlpha (0.5f) : colours::panelLine);
+    g.drawRoundedRectangle (r.reduced (0.5f), 4.0f, 1.0f);
+    g.setColour (colours::silverTop);
+    g.setFont (uiFont (10.5f, true));
+    g.drawText ("BUS COMP", 7, 2, 100, 16, juce::Justification::centredLeft);
+    if (compact) return;
+    for (auto& k : knobs)
+    {
+        const auto b = k.slider.getBounds();
+        g.setColour (colours::textDim);
+        g.setFont (uiFont (8.5f, true));
+        g.drawText (BusCompParams::nameOf (k.id), b.getX() - 12, b.getY() - 9, b.getWidth() + 24, 9, juce::Justification::centred);
+        g.setColour (colours::lcdText);
+        g.setFont (uiFont (8.5f, true));
+        g.drawText (valueText (k.id), b.getX() - 12, b.getBottom(), b.getWidth() + 24, 10, juce::Justification::centred);
+    }
 }
 } // namespace sc

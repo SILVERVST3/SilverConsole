@@ -12,7 +12,7 @@ public:
     virtual Engine& getEngine() = 0;
     virtual void insertSlotClicked (Channel&, int slot, juce::Component& source, const juce::MouseEvent&) = 0;
     virtual void channelMenu (Channel&, juce::Component& source) = 0;
-    virtual void sendMenu (Track&, int send, juce::Component& source) = 0;
+    virtual void sendMenu (Channel&, int send, juce::Component& source) = 0;
     virtual void outputMenu (Track&, juce::Component& source) = 0;
     virtual bool isEditorOpen (const Channel&, int slot) const = 0;
     virtual void markDirty() = 0;
@@ -23,12 +23,16 @@ public:
     virtual void lanesChanged() = 0;
     // botao "+": mais um slot de insert (qualquer canal) ou de envio (faixa)
     virtual void addInsertSlot (Channel&) = 0;
-    virtual void addSendSlot (Track&) = 0;
+    virtual void addSendSlot (Channel&) = 0;
     // selecao de trecho (regua do tempo)
     virtual void timelineMenu (juce::Component&) {}
     virtual void playSelection() {}
-    // arrastar a faixa pelo nome para mudar a posicao (0 inicio, 1 arrastando, 2 soltou)
+    // arrastar a faixa/bus para mudar a posicao (0 inicio, 1 arrastando, 2 soltou)
     virtual void stripDrag (Channel&, const juce::MouseEvent&, int) {}
+    // arrastar um plugin para outro slot (mesmo canal ou outro canal); Ctrl ao soltar: copia
+    virtual void insertDrag (Channel&, int slot, const juce::MouseEvent&, int) { juce::ignoreUnused (slot); }
+    // compressor do master: cada ajuste concluido (desfazer)
+    virtual void compEdited (int param, float before, float after) { juce::ignoreUnused (param, before, after); }
     // desfazer/refazer: a interface avisa cada edicao concluida (valor antes/depois)
     enum class Param { gain, pan, mute, solo, phase, mono };
     virtual void valueEdited (Channel&, Param, float before, float after) { juce::ignoreUnused (before, after); }
@@ -36,7 +40,7 @@ public:
     virtual void liveValueChanged (Channel&, Param, float before, float after) { juce::ignoreUnused (before, after); }
     virtual void vcaEdited (int group, bool mute, float before, float after) { juce::ignoreUnused (group, mute, before, after); }
     virtual void vcaMenu (int group, juce::Component&) { juce::ignoreUnused (group); }
-    virtual void sendLevelEdited (Track&, int index, float before, float after) { juce::ignoreUnused (index, before, after); }
+    virtual void sendLevelEdited (Channel&, int index, float before, float after) { juce::ignoreUnused (index, before, after); }
     virtual void renamed (Channel&, const juce::String& before) { juce::ignoreUnused (before); }
     virtual void automationEdited (Channel&, AutoTarget, int slot, int param, const std::vector<AutoPoint>& before)
     { juce::ignoreUnused (slot, param, before); }
@@ -66,26 +70,30 @@ class InsertSlotComponent : public juce::Component, public juce::SettableTooltip
 public:
     InsertSlotComponent (Channel& c, int s, StripHost& h) : channel (c), slot (s), host (h) {}
     void paint (juce::Graphics&) override;
-    void mouseDown (const juce::MouseEvent& e) override { host.insertSlotClicked (channel, slot, *this, e); }
+    // clique simples abre o editor ao soltar (arrastar move o plugin para outro slot)
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
 
 private:
     Channel& channel;
     const int slot;
     StripHost& host;
+    bool clickPending = false, dragging = false;
 };
 
 //==============================================================================
 class SendRow : public juce::Component
 {
 public:
-    SendRow (Track& t, int index, StripHost& h);
+    SendRow (Channel& c, int index, StripHost& h);
     void paint (juce::Graphics&) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent&) override;
     void refresh();
 
 private:
-    Track& track;
+    Channel& channel;
     const int index;
     StripHost& host;
     juce::Slider level;
@@ -116,6 +124,47 @@ private:
 };
 
 //==============================================================================
+/** Medidor de reducao de ganho com agulha (VU analogico, 0 a 20 dB). */
+class GrMeter : public juce::Component, public juce::SettableTooltipClient, private juce::Timer
+{
+public:
+    explicit GrMeter (Master&);
+    ~GrMeter() override { stopTimer(); }
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override { peakHold = 0.0f; repaint(); }
+
+private:
+    void timerCallback() override;
+    Master& master;
+    float pos = 0.0f, vel = 0.0f, peakHold = 0.0f;
+    int holdFrames = 0;
+    juce::uint32 lastMs = 0;
+};
+
+/** Compressor de barramento do master: agulha de GR e controles. */
+class BusCompPanel : public juce::Component
+{
+public:
+    BusCompPanel (Master&, StripHost&);
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    void refresh();
+    /** compact: so a agulha e o botao IN (janela baixa). */
+    void setCompact (bool);
+    static constexpr int fullHeight = 164, compactHeight = 78;
+
+private:
+    struct Knob { juce::Slider slider { juce::Slider::RotaryVerticalDrag, juce::Slider::NoTextBox }; int id = 0; bool gesture = false; float start = 0.0f; };
+    juce::String valueText (int id) const;
+    Master& master;
+    StripHost& host;
+    GrMeter meter;
+    juce::TextButton inButton { "IN" };
+    std::array<Knob, 7> knobs; // THRESH, RATIO, ATTACK, RELEASE, MAKEUP, MIX, S/C HPF
+    bool compact = false;
+};
+
+//==============================================================================
 class ChannelStrip : public juce::Component
 {
 public:
@@ -134,13 +183,21 @@ public:
     /** Cria/remove slots de insert e envio na tela conforme o motor. */
     void syncSlots();
 
+    /** Destino de um plugin arrastado: slot vazio (into) ou posicao entre slots. */
+    struct InsertDrop { int slot = -1; bool into = false; };
+    /** Ponto da tela sobre a lista de inserts deste canal? marker: onde desenhar (tela). */
+    bool insertDropAt (juce::Point<int> screen, InsertDrop&, juce::Rectangle<int>& marker) const;
+    void autoScrollInserts (juce::Point<int> screen);
+    /** Ponto da tela sobre a area de arrastar o canal (fora de controles)? */
+    bool isDragArea (const juce::MouseEvent&) const;
+
     /** Linhas de insert/envio de TODOS os canais (alinhados pelo que tem mais). */
     static void setLayoutRows (int insertRows, int sendRows) noexcept { layoutInsertRows = insertRows; layoutSendRows = sendRows; }
     static int minimumHeight() noexcept;
 
     Channel& channel;
     static constexpr int width = 104;
-    static constexpr int masterWidth = 128;
+    static constexpr int masterWidth = 200;
 
 private:
     void updateGainLabel();
@@ -168,7 +225,8 @@ private:
     juce::Slider panKnob { juce::Slider::RotaryVerticalDrag, juce::Slider::NoTextBox };
     LevelMeter meter;
     juce::Rectangle<int> insertsHeader, sendsHeader, faderArea, loudnessArea;
-    bool draggingStrip = false;
+    bool draggingStrip = false, topClickPending = false;
+    std::unique_ptr<BusCompPanel> compPanel; // so no master
     bool faderGesture = false, panGesture = false;
     float faderGestureStart = 0.0f, panGestureStart = 0.0f;
 };

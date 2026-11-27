@@ -388,25 +388,30 @@ void Engine::prepareChannel (Channel& c)
     }
     c.dryBuffer.setSize (2, blockSize);
     c.sidechainBuffer.setSize (2, blockSize);
+    {
+        const float gate = c.soloGate.getTargetValue();
+        c.soloGate.reset (sr, 0.02);
+        c.soloGate.setCurrentAndTargetValue (gate);
+    }
     if (c.kind == ChannelKind::track)
     {
         auto& tr = static_cast<Track&> (c);
         tr.preFxBuffer.setSize (2, blockSize);
-        const float gate = tr.soloGate.getTargetValue();
-        tr.soloGate.reset (sr, 0.02);
-        tr.soloGate.setCurrentAndTargetValue (gate);
         tr.preFxPdc.clear();
         tr.preFxActive = false;
     }
-    if (c.kind == ChannelKind::track)
+    if (c.kind == ChannelKind::bus)
     {
-        auto& t = static_cast<Track&> (c);
-        for (auto& s : t.sends)
-        {
-            const float target = s.smooth.getTargetValue();
-            s.smooth.reset (sr, 0.02);
-            s.smooth.setCurrentAndTargetValue (target);
-        }
+        auto& b = static_cast<Bus&> (c);
+        b.sendTap.setSize (2, blockSize);
+        b.trackInDelay.clear();
+    }
+    for (auto& s : c.sends)
+    {
+        const float target = s.smooth.getTargetValue();
+        s.smooth.reset (sr, 0.02);
+        s.smooth.setCurrentAndTargetValue (target);
+        s.align.clear();
     }
     for (auto& s : c.inserts) prepareSlot (s);
     c.pdc.clear();
@@ -423,6 +428,9 @@ void Engine::prepare (double newRate, int newBlock)
     masterBuf.setSize (2, blockSize);
     deviceBuf.setSize (2, blockSize);
     for (auto& b : busIn) b.setSize (2, blockSize);
+    for (auto& b : busSendIn) b.setSize (2, blockSize);
+    sendTemp.setSize (2, blockSize);
+    busComp.prepare (sampleRate.load (std::memory_order_relaxed));
     midi.ensureSize (4096);
     truePeakMeter.reset();
     momentaryLoudness.prepare (sampleRate.load (std::memory_order_relaxed));
@@ -601,6 +609,108 @@ void Engine::moveTrack (int from, int to)
     tracks.insert (tracks.begin() + to, std::move (t));
 }
 
+void Engine::moveBus (int from, int to)
+{
+    const juce::ScopedLock sl (lock);
+    const int n = (int) buses.size();
+    if (! juce::isPositiveAndBelow (from, n)) return;
+    to = juce::jlimit (0, n - 1, to);
+    if (from == to) return;
+    // indice antigo -> novo (o bus sai de 'from' e entra em 'to')
+    auto remap = [from, to] (int v)
+    {
+        if (v < 0) return v;
+        if (v == from) return to;
+        if (from < to && v > from && v <= to) return v - 1;
+        if (to < from && v >= to && v < from) return v + 1;
+        return v;
+    };
+    auto fix = [&remap] (std::atomic<int>& a) { a = remap (a.load()); };
+    for (auto& t : tracks)
+    {
+        fix (t->outputBus);
+        for (auto& sd : t->sends) fix (sd.bus);
+    }
+    for (auto& b : buses)
+        for (auto& sd : b->sends) fix (sd.bus);
+    auto b = std::move (buses[(size_t) from]);
+    buses.erase (buses.begin() + from);
+    buses.insert (buses.begin() + to, std::move (b));
+    updateLatency();
+}
+
+bool Engine::busSendWouldLoop (int from, int to) const
+{
+    const int n = (int) buses.size();
+    if (! juce::isPositiveAndBelow (from, n) || ! juce::isPositiveAndBelow (to, n)) return false;
+    if (from == to) return true;
+    // 'to' ja chega em 'from' (por envios de bus)? Busca a partir de 'to'.
+    std::array<bool, kMaxBuses> seen {};
+    std::array<int, kMaxBuses> stack {};
+    int top = 0;
+    stack[(size_t) top++] = to;
+    seen[(size_t) to] = true;
+    while (top > 0)
+    {
+        const int b = stack[(size_t) --top];
+        for (auto& sd : buses[(size_t) b]->sends)
+        {
+            const int d = sd.bus.load();
+            if (d == from) return true;
+            if (juce::isPositiveAndBelow (d, n) && ! seen[(size_t) d]) { seen[(size_t) d] = true; stack[(size_t) top++] = d; }
+        }
+    }
+    return false;
+}
+
+void Engine::computeBusOrder (BusOrder& o) const noexcept
+{
+    const int n = juce::jmin ((int) buses.size(), kMaxBuses);
+    o.count = n;
+    o.numLevels = n > 0 ? 1 : 0;
+    o.hash = (juce::uint64) n;
+    std::array<int, kMaxBuses> indeg {};
+    for (int a = 0; a < n; ++a)
+        for (auto& sd : buses[(size_t) a]->sends)
+        {
+            const int d = sd.bus.load (std::memory_order_relaxed);
+            o.hash = o.hash * 1099511628211ull + (juce::uint64) (d + 2) * 31u + (juce::uint64) a;
+            if (d != a && juce::isPositiveAndBelow (d, n)) ++indeg[(size_t) d];
+        }
+    // Kahn: menor indice primeiro (ordem estavel); o que sobrar esta num ciclo
+    std::array<bool, kMaxBuses> done {};
+    int k = 0;
+    for (;;)
+    {
+        int pick = -1;
+        for (int b = 0; b < n && pick < 0; ++b)
+            if (! done[(size_t) b] && indeg[(size_t) b] == 0) pick = b;
+        if (pick < 0) break;
+        done[(size_t) pick] = true;
+        o.order[(size_t) k] = pick;
+        o.pos[(size_t) pick] = k++;
+        for (auto& sd : buses[(size_t) pick]->sends)
+        {
+            const int d = sd.bus.load (std::memory_order_relaxed);
+            if (d != pick && juce::isPositiveAndBelow (d, n)) --indeg[(size_t) d];
+        }
+    }
+    for (int b = 0; b < n; ++b)
+        if (! done[(size_t) b]) { o.order[(size_t) k] = b; o.pos[(size_t) b] = k++; }
+    // niveis: um bus fica depois de todos os que enviam para ele
+    for (int i = 0; i < n; ++i) o.level[(size_t) o.order[(size_t) i]] = 0;
+    for (int i = 0; i < n; ++i)
+    {
+        const int a = o.order[(size_t) i];
+        for (auto& sd : buses[(size_t) a]->sends)
+        {
+            const int d = sd.bus.load (std::memory_order_relaxed);
+            if (o.honored (a, d)) o.level[(size_t) d] = juce::jmax (o.level[(size_t) d], o.level[(size_t) a] + 1);
+        }
+        o.numLevels = juce::jmax (o.numLevels, o.level[(size_t) a] + 1);
+    }
+}
+
 Bus* Engine::addBus (const juce::String& name)
 {
     if ((int) buses.size() >= kMaxBuses) return nullptr;
@@ -643,6 +753,8 @@ std::unique_ptr<Bus> Engine::removeBus (Bus* b)
             fix (t->outputBus);
             for (auto& s : t->sends) fix (s.bus);
         }
+        for (auto& ob : buses)
+            for (auto& s : ob->sends) fix (s.bus);
         updateLatency();
     }
     for (auto& s : out->inserts)
@@ -795,7 +907,60 @@ void Engine::swapInserts (Channel& c, int a, int b)
     const bool fx = x.faulted.load();
     x.faulted = y.faulted.load();
     y.faulted = fx;
+    x.lastMix = x.mix.load();
+    y.lastMix = y.mix.load();
     c.wake();
+    updateLatency(); // o atraso do seco (dry/wet) e por slot
+}
+
+void Engine::swapInsertsAcross (Channel& ca, int a, Channel& cb, int b)
+{
+    if (&ca == &cb) { swapInserts (ca, a, b); return; }
+    if (! ca.hasInsert (a) || ! cb.hasInsert (b)) return;
+    const juce::ScopedLock sl (lock);
+    // a automacao do plugin vai junto para o outro canal
+    std::vector<std::unique_ptr<AutoLane>> fromA, fromB;
+    auto take = [] (Channel& c, int slot, std::vector<std::unique_ptr<AutoLane>>& out)
+    {
+        for (auto it = c.lanes.begin(); it != c.lanes.end();)
+            if ((*it)->target == AutoTarget::plugin && (*it)->slot == slot) { out.push_back (std::move (*it)); it = c.lanes.erase (it); }
+            else ++it;
+    };
+    take (ca, a, fromA);
+    take (cb, b, fromB);
+    for (auto& l : fromA) { l->slot = b; cb.lanes.push_back (std::move (l)); }
+    for (auto& l : fromB) { l->slot = a; ca.lanes.push_back (std::move (l)); }
+
+    auto& x = ca.inserts[(size_t) a];
+    auto& y = cb.inserts[(size_t) b];
+    std::swap (x.processor, y.processor);
+    std::swap (x.remote, y.remote);
+    std::swap (x.description, y.description);
+    std::swap (x.hasDescription, y.hasDescription);
+    std::swap (x.preferRemote, y.preferRemote);
+    std::swap (x.missingState, y.missingState);
+    std::swap (x.offline, y.offline);
+    std::swap (x.sidechain, y.sidechain);
+    if (x.sidechain == &ca) x.sidechain = nullptr;
+    if (y.sidechain == &cb) y.sidechain = nullptr;
+    const float mx = x.mix.load();
+    x.mix = y.mix.load();
+    y.mix = mx;
+    x.lastMix = x.mix.load();
+    y.lastMix = y.mix.load();
+    std::swap (x.bufferChannels, y.bufferChannels);
+    std::swap (x.mainOutChannels, y.mainOutChannels);
+    const bool bx = x.bypassed.load();
+    x.bypassed = y.bypassed.load();
+    y.bypassed = bx;
+    const bool fx = x.faulted.load();
+    x.faulted = y.faulted.load();
+    y.faulted = fx;
+    x.dryDelay.clear();
+    y.dryDelay.clear();
+    ca.wake();
+    cb.wake();
+    updateLatency();
 }
 
 void Engine::setBypass (Channel& c, int slot, bool b)
@@ -821,8 +986,9 @@ bool Engine::setInsertCount (Channel& c, int count)
     return c.inserts.size() != before;
 }
 
-bool Engine::setSendCount (Track& t, int count)
+bool Engine::setSendCount (Channel& t, int count)
 {
+    if (t.kind == ChannelKind::master) return false;
     count = juce::jlimit (1, kMaxSendsPerTrack, count);
     const juce::ScopedLock sl (lock);
     bool changed = false;
@@ -1071,9 +1237,41 @@ void Engine::updateLatency()
 {
     int trackMax = 0, busMax = 0;
     for (auto& t : tracks) { t->chainLatency = chainLatencyOf (*t); trackMax = juce::jmax (trackMax, t->chainLatency); }
-    for (auto& b : buses)  { b->chainLatency = chainLatencyOf (*b); busMax = juce::jmax (busMax, b->chainLatency); }
+    for (auto& b : buses)  b->chainLatency = chainLatencyOf (*b);
     for (auto& t : tracks) if (t->pdc.getDelay() != trackMax - t->chainLatency) t->pdc.setDelay (trackMax - t->chainLatency);
-    for (auto& b : buses)  if (b->pdc.getDelay() != busMax - b->chainLatency) b->pdc.setDelay (busMax - b->chainLatency);
+
+    // Buses com envios entre si: cada bus recebe as faixas (tempo 0) e os buses
+    // que enviam para ele (tempo de saida deles). Tudo chega junto: as faixas
+    // atrasam ate o envio mais tardio e cada envio atrasa a diferenca. Na soma do
+    // master todos os buses saem alinhados pelo mais tardio.
+    BusOrder order;
+    computeBusOrder (order);
+    latencyRoutingHash = order.hash;
+    const int nb = order.count;
+    std::array<int, kMaxBuses> inT {}, outT {};
+    for (int i = 0; i < nb; ++i)
+    {
+        const int b = order.order[(size_t) i];
+        outT[(size_t) b] = inT[(size_t) b] + buses[(size_t) b]->chainLatency;
+        busMax = juce::jmax (busMax, outT[(size_t) b]);
+        for (auto& sd : buses[(size_t) b]->sends)
+        {
+            const int d = sd.bus.load();
+            if (order.honored (b, d)) inT[(size_t) d] = juce::jmax (inT[(size_t) d], outT[(size_t) b]);
+        }
+    }
+    for (int b = 0; b < nb; ++b)
+    {
+        auto& bus = *buses[(size_t) b];
+        if (bus.pdc.getDelay() != busMax - outT[(size_t) b]) bus.pdc.setDelay (busMax - outT[(size_t) b]);
+        if (bus.trackInDelay.getDelay() != inT[(size_t) b]) bus.trackInDelay.setDelay (inT[(size_t) b]);
+        for (auto& sd : bus.sends)
+        {
+            const int d = sd.bus.load();
+            const int delay = order.honored (b, d) ? inT[(size_t) d] - outT[(size_t) b] : 0;
+            if (sd.align.getDelay() != delay) sd.align.setDelay (delay);
+        }
+    }
     if (directDelay.getDelay() != busMax) directDelay.setDelay (busMax);
     master.chainLatency = chainLatencyOf (master);
     totalLatency = trackMax + busMax + master.chainLatency;
@@ -1368,8 +1566,11 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     if (applyAuto) forEachChannelNoAlloc ([this, tSec] (Channel& c) { applyAutomation (c, tSec); });
 
     const int numBuses = (int) buses.size();
-    for (int b = 0; b < numBuses; ++b) busIn[(size_t) b].clear (0, n);
+    for (int b = 0; b < numBuses; ++b) { busIn[(size_t) b].clear (0, n); busSendIn[(size_t) b].clear (0, n); }
     direct.clear (0, n);
+    BusOrder order;
+    computeBusOrder (order);
+    if (order.hash != latencyRoutingHash) latencyDirty = true; // envios bus->bus mudaram: refaz a PDC
 
     // Solo: faixas e buses. Bus em solo = ouve o bus e o que chega nele (faixas
     // roteadas para ele e envios de qualquer faixa); faixas direto no master e
@@ -1397,6 +1598,33 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
                 if (sb >= 0 && sb < numBuses) busFedBySolo[(size_t) sb] = true;
             }
         }
+    // Envios bus->bus: o que sai de um bus em solo (ou alimentado por solo) tambem
+    // se ouve no destino (ex.: o retorno do reverb da bateria em solo). E um bus que
+    // alimenta um bus em solo continua recebendo as faixas, mas a saida dele fica muda.
+    std::array<bool, kMaxBuses> feedsSolo {}, busOpen {};
+    if (anyBusSolo)
+    {
+        for (int i = 0; i < order.count; ++i)
+        {
+            const int a = order.order[(size_t) i];
+            if (! busSoloed[(size_t) a] && ! busFedBySolo[(size_t) a]) continue;
+            for (auto& sd : buses[(size_t) a]->sends)
+            {
+                const int d = sd.bus.load (std::memory_order_relaxed);
+                if (order.honored (a, d)) busFedBySolo[(size_t) d] = true;
+            }
+        }
+        for (int i = order.count; --i >= 0;)
+        {
+            const int a = order.order[(size_t) i];
+            for (auto& sd : buses[(size_t) a]->sends)
+            {
+                const int d = sd.bus.load (std::memory_order_relaxed);
+                if (order.honored (a, d) && (busSoloed[(size_t) d] || feedsSolo[(size_t) d])) feedsSolo[(size_t) a] = true;
+            }
+        }
+    }
+    for (int b = 0; b < numBuses; ++b) busOpen[(size_t) b] = busSoloed[(size_t) b] || feedsSolo[(size_t) b];
 
     auto* L = scratch.getWritePointer (0);
     auto* R = scratch.getWritePointer (1);
@@ -1453,7 +1681,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         auto* TR = t.processingBuffer.getWritePointer (1);
         const int outBus = t.outputBus.load (std::memory_order_relaxed);
         const bool trackSolo = t.solo.load (std::memory_order_relaxed)
-                               || (outBus >= 0 && outBus < numBuses && busSoloed[(size_t) outBus]);
+                               || (outBus >= 0 && outBus < numBuses && busOpen[(size_t) outBus]);
         const bool notMuted = ! t.mute.load (std::memory_order_relaxed);
         const bool audible = notMuted && (! anySolo || trackSolo);
         // o fader vale tambem para os envios pos-fader; o solo so cala a saida
@@ -1469,7 +1697,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         {
             const int b = s.bus.load (std::memory_order_relaxed);
             const bool valid = b >= 0 && b < numBuses;
-            const bool sendOn = valid && notMuted && (! anySolo || trackSolo || busSoloed[(size_t) b]);
+            const bool sendOn = valid && notMuted && (! anySolo || trackSolo || busOpen[(size_t) b]);
             setGainTarget (s.smooth, sendOn ? dbToGain (s.levelDb.load (std::memory_order_relaxed)) : 0.0f, snap);
             if (! valid) { s.smooth.skip (n); continue; }
             const bool preFx = s.preFx.load (std::memory_order_relaxed);
@@ -1529,46 +1757,108 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
 
     // ---------------- Buses ----------------
     // Cada bus tem buffer proprio: inserts dos buses (reverbs, delays) rodam em
-    // paralelo como as faixas. A soma no master continua na ordem original.
+    // paralelo como as faixas, por nivel (quem envia para outro bus vem antes).
+    // Envios entre buses e a soma no master ficam em serie, na ordem original.
+    auto soloMutedBus = [&] (int bi) { return anyBusSolo && ! busSoloed[(size_t) bi] && ! busFedBySolo[(size_t) bi]; };
     const auto processBus = [&] (int bi)
     {
         auto& b = *buses[(size_t) bi];
         auto* BL = b.processingBuffer.getWritePointer (0);
         auto* BR = b.processingBuffer.getWritePointer (1);
-        juce::FloatVectorOperations::copy (BL, busIn[(size_t) bi].getReadPointer (0), n);
-        juce::FloatVectorOperations::copy (BR, busIn[(size_t) bi].getReadPointer (1), n);
+        auto& fromTracks = busIn[(size_t) bi];
+        b.trackInDelay.process (fromTracks.getWritePointer (0), fromTracks.getWritePointer (1), n);
+        juce::FloatVectorOperations::add (BL, fromTracks.getReadPointer (0), busSendIn[(size_t) bi].getReadPointer (0), n);
+        juce::FloatVectorOperations::add (BR, fromTracks.getReadPointer (1), busSendIn[(size_t) bi].getReadPointer (1), n);
         if (b.phase.load (std::memory_order_relaxed))
         {
             juce::FloatVectorOperations::negate (BL, BL, n);
             juce::FloatVectorOperations::negate (BR, BR, n);
         }
         processChain (b, n, b.processingBuffer, b.processingMidi, allowSleep);
-        b.pdc.process (BL, BR, n);
 
-        const bool soloMuted = anyBusSolo && ! busSoloed[(size_t) bi] && ! busFedBySolo[(size_t) bi];
-        const float g = (b.mute.load (std::memory_order_relaxed) || soloMuted) ? 0.0f : faderGain (b);
+        bool wantsPre = false;
+        for (auto& sd : b.sends)
+            wantsPre = wantsPre || (sd.bus.load (std::memory_order_relaxed) >= 0 && sd.preFader.load (std::memory_order_relaxed));
+        if (wantsPre)
+        {
+            b.sendTap.copyFrom (0, 0, BL, n);
+            b.sendTap.copyFrom (1, 0, BR, n);
+        }
+
+        // o fader vale tambem para os envios pos-fader; o solo so cala a saida
+        const float g = b.mute.load (std::memory_order_relaxed) ? 0.0f : faderGain (b);
         float pl, pr;
         panGains (b.pan.load (std::memory_order_relaxed), false, pl, pr);
         setGainTarget (b.smoothL, g * pl, snap);
         setGainTarget (b.smoothR, g * pr, snap);
+        setGainTarget (b.soloGate, soloMutedBus (bi) ? 0.0f : 1.0f, snap);
         for (int i = 0; i < n; ++i) { BL[i] *= b.smoothL.getNextValue(); BR[i] *= b.smoothR.getNextValue(); }
         storePeak (b.peakL, b.processingBuffer.getMagnitude (0, 0, n));
         storePeak (b.peakR, b.processingBuffer.getMagnitude (1, 0, n));
     };
-    runChannels (offlineTrackPool.get(), realtimePool.get(), multi, numBuses, processBus);
+    std::array<int, kMaxBuses> levelList {};
+    int levelCount = 0;
+    const auto processLevelBus = [&] (int k) { processBus (levelList[(size_t) k]); };
+    for (int lv = 0; lv < order.numLevels; ++lv)
+    {
+        levelCount = 0;
+        for (int i = 0; i < order.count; ++i)
+            if (order.level[(size_t) order.order[(size_t) i]] == lv) levelList[(size_t) levelCount++] = order.order[(size_t) i];
+        runChannels (offlineTrackPool.get(), realtimePool.get(), multi, levelCount, processLevelBus);
+
+        // envios bus -> bus (destinos ficam em niveis seguintes)
+        for (int k = 0; k < levelCount; ++k)
+        {
+            const int bi = levelList[(size_t) k];
+            auto& b = *buses[(size_t) bi];
+            const bool notMuted = ! b.mute.load (std::memory_order_relaxed);
+            for (auto& sd : b.sends)
+            {
+                const int d = sd.bus.load (std::memory_order_relaxed);
+                if (! order.honored (bi, d)) { sd.smooth.skip (n); continue; }
+                const bool sendOn = notMuted && (! anySolo || ! soloMutedBus (bi) || busOpen[(size_t) d]);
+                setGainTarget (sd.smooth, sendOn ? dbToGain (sd.levelDb.load (std::memory_order_relaxed)) : 0.0f, snap);
+                const auto& src = sd.preFader.load (std::memory_order_relaxed) ? b.sendTap : b.processingBuffer;
+                const float* sl = src.getReadPointer (0);
+                const float* sr2 = src.getReadPointer (1);
+                if (sd.align.getDelay() > 0)
+                {
+                    sendTemp.copyFrom (0, 0, sl, n);
+                    sendTemp.copyFrom (1, 0, sr2, n);
+                    sd.align.process (sendTemp.getWritePointer (0), sendTemp.getWritePointer (1), n);
+                    sl = sendTemp.getReadPointer (0);
+                    sr2 = sendTemp.getReadPointer (1);
+                }
+                auto& dst = busSendIn[(size_t) d];
+                auto sm = sd.smooth;
+                addWithRamp (dst.getWritePointer (0), sl, n, sm);
+                addWithRamp (dst.getWritePointer (1), sr2, n, sd.smooth);
+            }
+        }
+    }
 
     masterBuf.clear (0, n);
     for (int bi = 0; bi < numBuses; ++bi)
     {
         auto& b = *buses[(size_t) bi];
-        masterBuf.addFrom (0, 0, b.processingBuffer, 0, 0, n);
-        masterBuf.addFrom (1, 0, b.processingBuffer, 1, 0, n);
+        b.pdc.process (b.processingBuffer.getWritePointer (0), b.processingBuffer.getWritePointer (1), n);
         if (stemTaps != nullptr)
             if (auto* tap = stemTaps->buses[(size_t) bi])
             {
                 tap->copyFrom (0, 0, b.processingBuffer, 0, 0, n);
                 tap->copyFrom (1, 0, b.processingBuffer, 1, 0, n);
             }
+        if (b.soloGate.isSmoothing())
+        {
+            auto gate = b.soloGate;
+            addWithRamp (masterBuf.getWritePointer (0), b.processingBuffer.getReadPointer (0), n, gate);
+            addWithRamp (masterBuf.getWritePointer (1), b.processingBuffer.getReadPointer (1), n, b.soloGate);
+        }
+        else if (b.soloGate.getTargetValue() > 0.0f)
+        {
+            masterBuf.addFrom (0, 0, b.processingBuffer, 0, 0, n);
+            masterBuf.addFrom (1, 0, b.processingBuffer, 1, 0, n);
+        }
     }
 
     // faixas direto no master: atrasadas pela maior latencia de bus
@@ -1580,6 +1870,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     juce::FloatVectorOperations::copy (L, masterBuf.getReadPointer (0), n);
     juce::FloatVectorOperations::copy (R, masterBuf.getReadPointer (1), n);
     runInserts (master, n, scratch, midi);
+    busComp.process (L, R, n, master.comp, master.compGr);
     {
         const float g = master.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (master.gainDb.load (std::memory_order_relaxed));
         float pl, pr;
@@ -1726,9 +2017,12 @@ juce::String Engine::beginOfflineRender()
             if (s.remote != nullptr) s.remote->setOffline (true); // espera o worker no bounce
         }
         c.pdc.clear();
+        for (auto& sd : c.sends) sd.align.clear();
+        if (c.kind == ChannelKind::bus) static_cast<Bus&> (c).trackInDelay.clear();
         c.wake();
     });
     directDelay.clear();
+    busComp.reset();
     snapGains = true; // primeiro bloco ja com os ganhos do estado atual (solo/mute/automacao)
 
     // Pool so durante o bounce, nunca criado no callback. Os workers realtime
@@ -1753,9 +2047,12 @@ void Engine::endOfflineRender()
             if (s.remote != nullptr) s.remote->setOffline (false);
         }
         c.pdc.clear();
+        for (auto& sd : c.sends) sd.align.clear();
+        if (c.kind == ChannelKind::bus) static_cast<Bus&> (c).trackInDelay.clear();
         c.wake();
     });
     directDelay.clear();
+    busComp.reset();
     lastRenderEnd = -1;
     rendering = false;
 }

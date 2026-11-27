@@ -52,6 +52,24 @@ struct TrackData
 };
 
 struct VcaData { float gainDb = 0.0f; bool mute = false, shown = false; };
+
+/** Compressor de barramento do master. */
+struct CompData
+{
+    bool on = false;
+    float thresholdDb = -10.0f, makeupDb = 0.0f, mix = 1.0f;
+    int ratio = 1, attack = 2, release = 4, hpf = 0;
+    static CompData from (const BusCompParams& c)
+    {
+        return { c.enabled.load(), c.thresholdDb.load(), c.makeupDb.load(), c.mix.load(),
+                 c.ratio.load(), c.attack.load(), c.release.load(), c.sidechainHpf.load() };
+    }
+    void applyTo (BusCompParams& c) const
+    {
+        c.enabled = on; c.thresholdDb = thresholdDb; c.makeupDb = makeupDb; c.mix = mix;
+        c.ratio = ratio; c.attack = attack; c.release = release; c.sidechainHpf = hpf;
+    }
+};
 struct MarkerData { double t = 0.0; juce::String name; };
 struct RegionData { double start = 0.0, end = 0.0; juce::String name; };
 
@@ -62,7 +80,9 @@ struct ProjectData
     std::vector<RegionData> regions;
     std::vector<TrackData> tracks;
     std::vector<ChannelData> buses;
+    std::vector<std::vector<SendData>> busSends; // envios bus -> bus (mesmo indice de buses)
     ChannelData master;
+    CompData masterComp;
     bool masterMono = false;
     bool loopOn = false;
     double loopStartSec = 0.0, loopEndSec = 0.0;
@@ -74,6 +94,8 @@ constexpr const char* kProjectExtension = ".sconsole";
 ProjectData captureProject (Engine&);
 /** Copia nome, cor, parametros, modo e linhas de automacao (com o lock do motor). */
 void applyChannelBasics (Engine&, Channel&, const ChannelData&);
+/** Numero de envios e destino/nivel/pre de cada um (faixas e buses). */
+void applySends (Engine&, Channel&, const std::vector<SendData>&);
 
 bool writeProject (const ProjectData&, const juce::File&, juce::String& error);
 bool readProject (const juce::File&, ProjectData&, juce::String& error);

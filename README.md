@@ -28,19 +28,23 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Fader de -∞ a +12 dB e pan (potência constante em faixas mono, balance em estéreo).
 - Mute, solo, inversão de polaridade (Ø) e medidor de pico L/R com indicador de clip.
 - **Solo nos buses**: ouve o bus e o que chega nele (faixas roteadas para ele e envios de qualquer faixa). Ex.: solo no bus de reverb toca só o retorno do reverb.
-- Nome editável (duplo clique) e cor da faixa. **Arraste a faixa pelo nome** (no rodapé) para mudar a posição; uma linha azul mostra onde ela vai entrar.
+- Nome editável (duplo clique) e cor da faixa. **Clique e arraste a faixa ou o bus** (pelo nome no rodapé ou por uma área livre do canal) para mudar a posição; uma linha azul mostra onde ele vai entrar. Faixas trocam de lugar entre faixas e buses entre buses; o Master fica fixo. Mover um bus mantém o roteamento (saídas e envios continuam apontando para o mesmo bus).
 - **Envios por faixa** (4 por padrão, botão **+** ao lado de ENVIOS para mais; o menu do último envio remove): pós-fader, **pré-fader** ou **pré-FX** (antes dos plugins da faixa, alinhado pela compensação de latência), para buses auxiliares (reverb, delay, paralelo). Pré-FX aparece em azul, pré-fader em laranja.
+- **Envios nos buses (bus → bus auxiliar)**: cada bus tem 2 envios (botão **+** para mais), pós ou pré-fader, por exemplo um bus de bateria mandando para o bus de reverb. O menu não deixa criar um laço (A → B → A aparece desabilitado, "faria um laço"). Os buses são processados na ordem do roteamento e a compensação de latência considera os plugins de toda a cadeia de buses. Solo num bus de destino também abre os buses que mandam para ele.
 - **Grupos** (menu do nome → Grupo, 8 grupos com cor): o fader de um membro move todos na mesma quantidade de dB, e mute e solo valem para o grupo. **Alt+arrastar** move só aquela faixa. O nome mostra uma bolinha com o número do grupo.
 - **VCA** por grupo (Grupo → Mostrar VCA): uma faixa de VCA depois dos buses, com fader e mute que somam no volume de todos os membros, sem passar áudio. Esconder o VCA volta ele para 0 dB.
 - **Saída da faixa** para o Master ou para um bus (grupo, por exemplo um bus de bateria).
-- Até 16 buses auxiliares, cada um com inserts, fader, pan e mute.
-- **Master** com inserts, fader, botão **MONO** para conferir a mix e indicador de clip.
+- Até 16 buses auxiliares, cada um com inserts, envios, fader, pan e mute.
+- **Master** com inserts, **BUS COMP** (compressor de barramento com agulha de redução de ganho, veja abaixo), fader, botão **MONO** para conferir a mix e indicador de clip.
 
 **Plugins VST3**
-- Escaneamento da pasta padrão `C:\Program Files\Common Files\VST3` (ou de outras pastas). A lista fica salva; use **Plugins → Opções / Escanear...** para procurar plugins novos.
+- Escaneamento da pasta padrão `C:\Program Files\Common Files\VST3` (ou de outras pastas). **Escaneamento incremental, como no REAPER**: o programa guarda, para cada arquivo VST3, o caminho, o tamanho, a data de modificação e se ele abriu ou falhou. Só arquivos novos ou alterados (outro tamanho ou outra data, por exemplo depois de atualizar o plugin) são abertos de novo; plugins apagados saem da lista. Na primeira vez a lista já escaneada vira esse cache, sem reabrir os plugins.
+- **Ao abrir o programa**, ele procura plugins novos em segundo plano (a barra de status mostra o progresso e o arquivo atual; a mixagem não para). Desligue em **Plugins → Procurar plugins novos ao abrir o programa**.
+- **Plugins → Procurar plugins novos** examina só os novos ou atualizados. **Reescanear todos os VST3** ignora o cache e abre tudo de novo (use se a lista ficar estranha).
 - Se um plugin travar durante o escaneamento, ele é pulado na próxima vez.
 - Clique num slot vazio para escolher um plugin no menu, agrupado por fabricante.
 - Clique num slot ocupado para abrir o editor do plugin. **Shift+clique** liga o bypass. O botão direito abre o menu: bypass, substituir, mover para cima/baixo e remover.
+- **Arraste o plugin para mudar a ordem**: clique e arraste um insert para outra posição do mesmo canal (para cima ou para baixo) ou para os inserts de outro canal (faixa, bus ou master). Uma linha azul mostra onde ele vai entrar; soltar sobre um slot vazio coloca o plugin nele. Segure **Ctrl** ao soltar para **copiar** (marcador amarelo) em vez de mover. O plugin vai com o ajuste, bypass e mix dry/wet; desfazer (Ctrl+Z) volta tudo. A lista rola sozinha ao chegar perto da borda.
 - **Janela do plugin**: alguns plugins aplicam a escala do Windows duas vezes e abriam gigantes (BSA Drum Bus num monitor 4K a 250% abria com 625%). A janela detecta isso e corrige sozinha; plugins redimensionáveis que ainda não cabem são reduzidos para caber no monitor (com bordas para redimensionar). Plugins não redimensionáveis maiores que a tela ficam com barras de rolagem. No menu do insert, **Escala da janela** permite escolher por plugin: *Automática* (padrão), *Sempre corrigir escala dupla*, *Escala do monitor, sem correção* ou *Modo compatível do Windows (sem DPI)*. A escolha fica salva por plugin.
 - **Compensação automática de latência (PDC)** em faixas, buses e master: plugins com lookahead (limitadores, EQs de fase linear) não desalinham a mix.
 - **Mix dry/wet por plugin** (menu do insert → Mix dry/wet): 0% = seco, 100% = plugin. O seco é atrasado pela latência do plugin (sem eco nem filtro de pente). O slot mostra a porcentagem.
@@ -81,6 +85,14 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
   - **Áudio original**: o trecho do arquivo de cada faixa, sem processamento (mono continua mono).
   - Todos os arquivos começam no mesmo ponto (alinhados) e vão para uma **pasta nova** (nunca sobrescreve arquivos), com nomes numerados na ordem das faixas. Avisa quais faixas passaram de 0 dBFS.
 - **Projetos recentes**: o botão **Abrir** lista os últimos 10 projetos. O tamanho e a posição da janela também são lembrados.
+
+## BUS COMP no Master
+
+- Compressor de barramento no estilo dos compressores de console: feed-forward, detecção de pico estéreo ligada (os dois lados reduzem igual, a imagem não se move), joelho suave.
+- Controles: **THRESH** (-30 a +10 dB), **RATIO** 2:1 / 4:1 / 10:1, **ATTACK** 0.1 / 0.3 / 1 / 3 / 10 / 30 ms, **RELEASE** 0.1 / 0.3 / 0.6 / 1.2 s ou **AUTO** (soltura em dois estágios, rápida nos transientes e lenta no corpo), **MAKEUP** (0 a +20 dB), **MIX** (compressão paralela) e **S/C HPF** (filtro no detector: desligado, 60, 90 ou 150 Hz, para o grave não bombear a mix). O botão **IN** liga e desliga.
+- **Mostrador analógico** com agulha de 0 a 20 dB de redução de ganho, com inércia de agulha de verdade e marca de pico (clique no mostrador zera a marca).
+- Fica depois dos inserts do master e antes do fader do master. Duplo clique num botão volta ao padrão. Os ajustes são salvos no projeto e entram no desfazer.
+- Em janelas baixas o painel mostra só a agulha e o IN; com mais altura aparecem os 7 botões.
 
 ## Escaneamento isolado de VST3 (Etapa 4 - experimental)
 

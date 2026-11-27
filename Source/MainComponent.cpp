@@ -473,19 +473,33 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     pluginsButton.onClick = [this]
     {
         juce::PopupMenu menu;
+        const bool busy = backgroundScan != nullptr;
+        const bool onStart = props.getUserSettings()->getBoolValue ("scanOnStartup", true);
         menu.addItem (1, "Gerenciar plugins VST3...");
-        menu.addItem (2, "Escanear VST3 com processo isolado");
-        menu.addItem (3, "Reavaliar VST3 com falha anterior...");
-        menu.addItem (4, "Testar DSP dos VST3 em processo isolado...");
+        menu.addSeparator();
+        menu.addItem (2, busy ? juce::String::fromUTF8 ("Procurando plugins novos... (em andamento)")
+                              : juce::String::fromUTF8 ("Procurar plugins novos (s\xc3\xb3 os novos ou atualizados)"), ! busy);
+        menu.addItem (5, juce::String::fromUTF8 ("Reescanear todos os VST3 (ignora a lista j\xc3\xa1 escaneada)"), ! busy);
+        menu.addItem (3, "Reavaliar VST3 com falha anterior...", ! busy);
+        menu.addItem (4, "Testar DSP dos VST3 em processo isolado...", ! busy);
+        menu.addSeparator();
+        menu.addItem (6, "Procurar plugins novos ao abrir o programa", true, onStart);
         const juce::Component::SafePointer<MainComponent> self (this);
         menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&pluginsButton),
-                            [self] (int choice)
+                            [self, onStart] (int choice)
         {
             if (self == nullptr) return;
+            using M = PluginScanRun::Mode;
             if (choice == 1) self->showPluginManager (false);
-            else if (choice == 2) self->scanPluginsIsolated();
-            else if (choice == 3) self->scanPluginsIsolated (true);
-            else if (choice == 4) self->scanPluginsIsolated (false, true);
+            else if (choice == 2) self->scanPluginsIsolated (M::newOnly);
+            else if (choice == 5) self->scanPluginsIsolated (M::everything);
+            else if (choice == 3) self->scanPluginsIsolated (M::retryFailed);
+            else if (choice == 4) self->scanPluginsIsolated (M::probeDsp);
+            else if (choice == 6)
+            {
+                self->props.getUserSettings()->setValue ("scanOnStartup", ! onStart);
+                self->props.getUserSettings()->saveIfNeeded();
+            }
         });
     };
     audioButton.onClick = [this] { audioMenu(); };
@@ -504,6 +518,7 @@ MainComponent::MainComponent (juce::ApplicationProperties& p)
     autoTimer.startTimerHz (50);
 
     overlay.cancelButton.onClick = [this] { if (job != nullptr) job->cancel = true; };
+    addChildComponent (insertDropMarker);
     addChildComponent (overlay);
 
     // placa de som (sem entradas: o programa so mixa)
@@ -719,20 +734,17 @@ void MainComponent::timerCallback()
         }
     }
 
-    // Primeiro uso: oferece escanear os plugins (sem sobrepor outros avisos).
-    if (! scanPromptShown && tickCount > 15 && pluginHost.known.getNumTypes() == 0
-        && juce::ModalComponentManager::getInstance()->getNumModalComponents() == 0 && pluginManagerWindow == nullptr)
+    // Ao abrir: procura plugins novos em segundo plano (so os arquivos novos ou
+    // alterados abrem no scanner isolado; os ja conhecidos ficam no cache).
+    if (! startupScanChecked && tickCount > 20)
     {
-        scanPromptShown = true;
-        juce::AlertWindow::showAsync (juce::MessageBoxOptions()
-                                          .withIconType (juce::MessageBoxIconType::QuestionIcon)
-                                          .withTitle ("Plugins VST3")
-                                          .withMessage ("Nenhum plugin foi escaneado ainda.\nEscanear agora a pasta padrao de VST3?\n"
-                                                        "(A lista fica salva; depois use Plugins para procurar novos.)")
-                                          .withButton ("Escanear")
-                                          .withButton ("Depois"),
-                                      [sp = juce::Component::SafePointer<MainComponent> (this)] (int r)
-                                      { if (sp != nullptr && r == 1) sp->showPluginManager (true); });
+        startupScanChecked = true;
+        if (props.getUserSettings()->getBoolValue ("scanOnStartup", true)) startBackgroundScan();
+    }
+    if (backgroundScan != nullptr && ! backgroundScan->isThreadRunning())
+    {
+        auto finished = std::move (backgroundScan);
+        finishScan (finished->result, finished->request.mode, true);
     }
     if (engine.sampleRateChanged() || tickCount % 30 == 0) startResampleIfNeeded();
 
@@ -772,6 +784,8 @@ void MainComponent::timerCallback()
             if (rt.pluginExceptions > 0) s << "  |  PLUG ERR " << juce::String (rt.pluginExceptions);
         }
         else s = "Sem dispositivo de audio - clique em Audio";
+        if (backgroundScan != nullptr) s = scanStatusText() + "  |  " + s;
+        else if (scanNotice.isNotEmpty() && juce::Time::getMillisecondCounter() < scanNoticeUntil) s = scanNotice + "  |  " + s;
         if (s != statusText) { statusText = s; repaint (statusArea()); }
     }
 }
@@ -1004,11 +1018,19 @@ void MainComponent::rebuildStrips()
 
 void MainComponent::stripDrag (Channel& c, const juce::MouseEvent& e, int phase)
 {
+    // faixas mudam de lugar entre faixas; buses entre buses (o master fica fixo)
+    const bool isBus = c.kind == ChannelKind::bus;
     const int numTracks = (int) engine.tracks.size();
+    const int count = isBus ? (int) engine.buses.size() : numTracks;
+    const int first = isBus ? numTracks : 0; // posicao em strips
     int from = -1;
-    for (int i = 0; i < numTracks; ++i)
-        if (engine.tracks[(size_t) i].get() == &c) from = i;
-    if (from < 0 || numTracks > strips.size()) { dropMarker.setVisible (false); return; }
+    for (int i = 0; i < count; ++i)
+    {
+        const Channel* ch = isBus ? static_cast<const Channel*> (engine.buses[(size_t) i].get())
+                                  : static_cast<const Channel*> (engine.tracks[(size_t) i].get());
+        if (ch == &c) from = i;
+    }
+    if (from < 0 || c.kind == ChannelKind::master || first + count > strips.size()) { dropMarker.setVisible (false); return; }
 
     if (phase == 1)
     {
@@ -1017,8 +1039,8 @@ void MainComponent::stripDrag (Channel& c, const juce::MouseEvent& e, int phase)
     }
     const auto p = mixerContent.getLocalPoint (nullptr, e.getScreenPosition());
     int target = 0;
-    for (int i = 0; i < numTracks; ++i)
-        if (p.x > strips[i]->getBounds().getCentreX()) target = i + 1;
+    for (int i = 0; i < count; ++i)
+        if (p.x > strips[first + i]->getBounds().getCentreX()) target = i + 1;
 
     if (phase == 2)
     {
@@ -1026,15 +1048,263 @@ void MainComponent::stripDrag (Channel& c, const juce::MouseEvent& e, int phase)
         const int to = target > from ? target - 1 : target;
         if (to == from) return;
         markDirty();
-        // a faixa que recebeu o mouseUp e recriada: so depois deste evento
-        juce::MessageManager::callAsync ([sp = juce::Component::SafePointer<MainComponent> (this), from, to]
-                                         { if (sp != nullptr) sp->moveTrackUndoable (from, to); });
+        // o canal que recebeu o mouseUp e recriado: so depois deste evento
+        juce::MessageManager::callAsync ([sp = juce::Component::SafePointer<MainComponent> (this), from, to, isBus]
+        {
+            if (sp == nullptr) return;
+            if (isBus) sp->moveBusUndoable (from, to);
+            else sp->moveTrackUndoable (from, to);
+        });
         return;
     }
-    const int mx = target < numTracks ? strips[target]->getX() - 2 : strips[numTracks - 1]->getRight() + 1;
+    const int mx = target < count ? strips[first + target]->getX() - 2 : strips[first + count - 1]->getRight() + 1;
     dropMarker.setBounds (mx - 1, 0, 3, mixerContent.getHeight());
     dropMarker.setVisible (true);
     dropMarker.toFront (false);
+}
+
+void MainComponent::moveBusUndoable (int from, int to)
+{
+    // indices de bus mudam (saidas e envios acompanham): o historico antigo recomeca
+    clearUndo();
+    auto doMove = [this] (int a, int b)
+    {
+        if (! juce::isPositiveAndBelow (a, (int) engine.buses.size())) return;
+        engine.moveBus (a, b);
+        rebuildStrips();
+    };
+    doMove (from, to);
+    const auto name = juce::isPositiveAndBelow (to, (int) engine.buses.size()) ? engine.buses[(size_t) to]->name : juce::String();
+    recordUndo ("Mover bus " + name, [doMove, from, to] { doMove (from, to); }, [doMove, from, to] { doMove (to, from); });
+}
+
+void MainComponent::insertDrag (Channel& c, int slot, const juce::MouseEvent& e, int phase)
+{
+    const auto screen = e.getScreenPosition();
+    ChannelStrip* target = nullptr;
+    ChannelStrip::InsertDrop drop;
+    juce::Rectangle<int> marker;
+    if (masterStrip->getScreenBounds().contains (screen))
+    {
+        if (masterStrip->insertDropAt (screen, drop, marker)) target = masterStrip.get();
+    }
+    else if (mixerViewport.getScreenBounds().contains (screen))
+        for (auto* st : strips)
+            if (st->getScreenBounds().contains (screen) && st->insertDropAt (screen, drop, marker)) { target = st; break; }
+
+    if (phase == 1)
+    {
+        const auto v = mixerViewport.getLocalPoint (nullptr, screen);
+        if (v.y >= 0 && v.y < mixerViewport.getHeight()) mixerViewport.autoScroll (v.x, v.y, 40, 14);
+        if (target != nullptr) target->autoScrollInserts (screen);
+    }
+    bool ok = target != nullptr;
+    if (ok && target->channel.kind == ChannelKind::track && static_cast<Track&> (target->channel).isFrozen()) ok = false;
+    const bool copy = e.mods.isCtrlDown();
+    if (ok && ! copy && &target->channel == &c
+        && ((drop.into && drop.slot == slot) || (! drop.into && (drop.slot == slot || drop.slot == slot + 1))))
+        ok = false; // soltar no mesmo lugar
+
+    if (phase == 2)
+    {
+        insertDropMarker.setVisible (false);
+        if (! ok) return;
+        auto* src = &c;
+        auto* dst = &target->channel;
+        juce::MessageManager::callAsync ([sp = juce::Component::SafePointer<MainComponent> (this), src, slot, dst, drop, copy]
+        {
+            if (sp != nullptr) sp->moveInsert (*src, slot, *dst, drop, copy);
+        });
+        return;
+    }
+    if (! ok) { insertDropMarker.setVisible (false); return; }
+    insertDropMarker.into = drop.into;
+    insertDropMarker.copy = copy;
+    insertDropMarker.setBounds (getLocalArea (nullptr, marker));
+    insertDropMarker.setVisible (true);
+    insertDropMarker.toFront (false);
+    insertDropMarker.repaint();
+}
+
+void MainComponent::moveInsert (Channel& src, int from, Channel& dst, ChannelStrip::InsertDrop d, bool copy)
+{
+    if (! channelExists (&src) || ! channelExists (&dst) || ! src.hasInsert (from) || src.inserts[(size_t) from].isEmpty()) return;
+    if (dst.kind == ChannelKind::track && static_cast<Track&> (dst).isFrozen()) return;
+    const auto name = src.inserts[(size_t) from].getName();
+
+    // Tudo vira uma sequencia de trocas de slot (cada troca desfaz a si mesma):
+    // desfazer aplica as mesmas trocas na ordem inversa.
+    struct Op { Channel* a; int sa; Channel* b; int sb; };
+    auto ops = std::make_shared<std::vector<Op>>();
+    auto run = [this] (const Op& op)
+    {
+        if (! channelExists (op.a) || ! channelExists (op.b) || ! op.a->hasInsert (op.sa) || ! op.b->hasInsert (op.sb)) return;
+        closeEditor (*op.a, op.sa);
+        closeEditor (*op.b, op.sb);
+        if (op.a == op.b) engine.swapInserts (*op.a, op.sa, op.sb);
+        else engine.swapInsertsAcross (*op.a, op.sa, *op.b, op.sb);
+    };
+    auto push = [&] (Channel* a, int sa, Channel* b, int sb)
+    {
+        Op op { a, sa, b, sb };
+        run (op);
+        ops->push_back (op);
+        // a origem anda junto quando as trocas sao no mesmo canal
+        if (a == &src && sa == from) { if (b == &src) from = sb; }
+        else if (b == &src && sb == from) { if (a == &src) from = sa; }
+    };
+
+    int targetSlot = d.slot;
+    if (&dst == &src && ! copy && ! d.into)
+    {
+        // mesmo canal: tira de 'from' e entra na posicao (os outros andam um slot)
+        const int to = d.slot > from ? d.slot - 1 : d.slot;
+        while (from < to) push (&src, from, &src, from + 1);
+        while (from > to) push (&src, from, &src, from - 1);
+        targetSlot = -1;
+    }
+    else if (! d.into)
+    {
+        // abre espaco na posicao: puxa o primeiro slot vazio a partir dela (ou cria um no fim)
+        const int p = juce::jlimit (0, dst.inserts.size(), d.slot);
+        int empty = -1;
+        for (int k = p; k < dst.inserts.size() && empty < 0; ++k)
+            if (dst.inserts[(size_t) k].isEmpty() && ! (&dst == &src && k == from)) empty = k;
+        if (empty < 0)
+        {
+            if (dst.inserts.size() >= kMaxInsertsPerChannel) { alert ("Inserts", "Limite de " + juce::String (kMaxInsertsPerChannel) + " inserts."); return; }
+            engine.setInsertCount (dst, dst.inserts.size() + 1);
+            empty = dst.inserts.size() - 1;
+        }
+        for (int k = empty; k > p; --k) push (&dst, k - 1, &dst, k);
+        targetSlot = p;
+    }
+
+    if (targetSlot >= 0 && copy)
+    {
+        // copia: plugin novo com o mesmo ajuste (o original fica onde estava)
+        const auto& s = src.inserts[(size_t) from];
+        if (! s.hasDescription) { alert ("Copiar plugin", juce::String::fromUTF8 ("Este processador n\xc3\xa3o pode ser copiado.")); }
+        else
+        {
+            Engine::SlotContent content;
+            content.description = s.description;
+            content.hasDescription = true;
+            content.preferRemote = s.preferRemote;
+            content.bypassed = s.bypassed.load();
+            content.mix = s.mix.load();
+            juce::MemoryBlock state;
+            if (s.processor != nullptr) s.processor->getStateInformation (state);
+            else state = s.missingState;
+            if (s.isOffline() || s.isMissing())
+            {
+                content.offline = s.offline;
+                content.missingState = state;
+            }
+            else
+            {
+                InsertSlot tmp;
+                tmp.description = s.description;
+                tmp.hasDescription = true;
+                tmp.preferRemote = s.preferRemote;
+                tmp.missingState = state;
+                Engine::RestoredInsert r;
+                juce::String err;
+                juce::MouseCursor::showWaitCursor();
+                const bool created = createFromSlot (tmp, r, err);
+                juce::MouseCursor::hideWaitCursor();
+                if (! created)
+                {
+                    alert ("Copiar plugin", juce::String::fromUTF8 ("N\xc3\xa3o foi poss\xc3\xadvel criar a c\xc3\xb3pia: ") + err);
+                    content = {};
+                }
+                content.processor = std::move (r.local);
+                content.remote = std::move (r.remote);
+                if (! content.processor && ! content.remote) content.hasDescription = false;
+            }
+            if (content.hasDescription)
+            {
+                // a copia entra com o ajuste atual; a mesma troca tira e devolve (desfazer)
+                auto holder = std::make_shared<Engine::SlotContent> (std::move (content));
+                auto* dp = &dst;
+                const int ts = targetSlot;
+                auto swapIn = [this, dp, ts, holder]
+                {
+                    if (! channelExists (dp) || ! dp->hasInsert (ts)) return;
+                    closeEditor (*dp, ts);
+                    if (auto* p = holder->processor.get())
+                        if (p->getSampleRate() != engine.getSampleRate() || p->getBlockSize() != engine.getBlockSize())
+                            engine.prepareProcessor (*p);
+                    engine.swapSlotContent (*dp, ts, *holder);
+                };
+                swapIn();
+                auto opsCopy = ops;
+                auto undoAll = [this, opsCopy, run, swapIn]
+                {
+                    swapIn();
+                    for (auto it = opsCopy->rbegin(); it != opsCopy->rend(); ++it) run (*it);
+                    lanesChanged();
+                    rebuildStrips();
+                };
+                auto redoAll = [this, opsCopy, run, swapIn]
+                {
+                    for (auto& op : *opsCopy) run (op);
+                    swapIn();
+                    lanesChanged();
+                    rebuildStrips();
+                };
+                recordUndo ("Copiar " + name, redoAll, undoAll, 20);
+                lanesChanged();
+                rebuildStrips();
+                markDirty();
+                return;
+            }
+        }
+    }
+    else if (targetSlot >= 0)
+        push (&src, from, &dst, targetSlot);
+
+    if (ops->empty()) { rebuildStrips(); return; }
+    auto undoAll = [this, ops, run]
+    {
+        for (auto it = ops->rbegin(); it != ops->rend(); ++it) run (*it);
+        lanesChanged();
+        rebuildStrips();
+    };
+    auto redoAll = [this, ops, run]
+    {
+        for (auto& op : *ops) run (op);
+        lanesChanged();
+        rebuildStrips();
+    };
+    recordUndo ((&src == &dst ? "Mover " : "Mover para " + dst.name + " - ") + name, redoAll, undoAll, 20);
+    lanesChanged();
+    rebuildStrips(); // as linhas de insert podem ter crescido (todas as faixas alinhadas)
+    markDirty();
+}
+
+void MainComponent::compEdited (int param, float before, float after)
+{
+    if (before == after) return;
+    if (auto* st = stripFor (&engine.master)) st->refresh();
+    const auto now = juce::Time::getMillisecondCounter();
+    const int key = 3000 + param;
+    if (lastValueEdit.target == &engine.master.comp && lastValueEdit.param == key && now - lastValueEdit.time < 700
+        && lastValueEdit.after != nullptr && undoManager.canUndo())
+    {
+        *lastValueEdit.after = after;
+        lastValueEdit.time = now;
+        return;
+    }
+    auto afterValue = std::make_shared<float> (after);
+    auto setIt = [this, param] (float v)
+    {
+        engine.master.comp.set (param, v);
+        if (auto* st = stripFor (&engine.master)) st->refresh();
+        markDirty();
+    };
+    recordUndo ("Bus comp - " + BusCompParams::nameOf (param), [setIt, afterValue] { setIt (*afterValue); }, [setIt, before] { setIt (before); });
+    lastValueEdit = { &engine.master.comp, key, now, afterValue };
 }
 
 void MainComponent::refreshStrips()
@@ -1074,16 +1344,17 @@ void MainComponent::setInsertSlots (Channel& c, int count)
     }
 }
 
-void MainComponent::setSendSlots (Track& t, int count)
+void MainComponent::setSendSlots (Channel& t, int count)
 {
-    if (! channelExists (&t)) return;
+    if (! channelExists (&t) || t.kind == ChannelKind::master) return;
     if (count > kMaxSendsPerTrack)
     {
-        alert ("Envios", "Limite de " + juce::String (kMaxSendsPerTrack) + " envios por faixa.");
+        alert ("Envios", "Limite de " + juce::String (kMaxSendsPerTrack) + " envios por canal.");
         return;
     }
     if (engine.setSendCount (t, count))
     {
+        engine.routingChanged();
         resized();
         if (auto* s = stripFor (&t)) s->refresh();
         markDirty();
@@ -1225,18 +1496,29 @@ void MainComponent::channelMenu (Channel& c, juce::Component& source)
     });
 }
 
-void MainComponent::sendMenu (Track& t, int send, juce::Component& source)
+void MainComponent::sendMenu (Channel& t, int send, juce::Component& source)
 {
+    if (send >= t.sends.size()) return;
     auto& s = t.sends[(size_t) send];
+    const bool fromBus = t.kind == ChannelKind::bus;
+    const int self = fromBus ? engine.indexOfBus (static_cast<Bus*> (&t)) : -1;
     juce::PopupMenu m;
     m.addSectionHeader ("Envio " + juce::String (send + 1) + " - " + t.name);
     m.addItem (1, "Nenhum", true, s.bus.load() < 0);
     for (int i = 0; i < (int) engine.buses.size(); ++i)
-        m.addItem (10 + i, engine.buses[(size_t) i]->name, true, s.bus.load() == i);
+    {
+        if (i == self) continue; // um bus nao envia para ele mesmo
+        // bus -> bus: destinos que ja chegam neste bus fechariam um laco (realimentacao)
+        const bool loops = fromBus && s.bus.load() != i && engine.busSendWouldLoop (self, i);
+        m.addItem (10 + i, engine.buses[(size_t) i]->name + (loops ? juce::String::fromUTF8 ("  (faria um laÃ§o)") : juce::String()),
+                   ! loops, s.bus.load() == i);
+    }
     m.addItem (2, "+ Criar novo bus", (int) engine.buses.size() < kMaxBuses);
     m.addSeparator();
-    m.addItem (3, "Pre-fader (independe do volume da faixa)", s.bus.load() >= 0, s.preFader.load() && ! s.preFx.load());
-    m.addItem (5, "Pre-FX (antes dos plugins, independe do volume)", s.bus.load() >= 0, s.preFx.load());
+    m.addItem (3, fromBus ? "Pre-fader (independe do volume do bus)" : "Pre-fader (independe do volume da faixa)",
+               s.bus.load() >= 0, s.preFader.load() && ! s.preFx.load());
+    if (! fromBus)
+        m.addItem (5, "Pre-FX (antes dos plugins, independe do volume)", s.bus.load() >= 0, s.preFx.load());
     if (send == t.sends.size() - 1 && t.sends.size() > 1)
     {
         m.addSeparator();
@@ -1257,9 +1539,11 @@ void MainComponent::sendMenu (Track& t, int send, juce::Component& source)
         }
         if (r == 1) snd.bus = -1;
         else if (r == 2) { if (auto* b = createBus()) snd.bus = engine.indexOfBus (b); }
+        else if (r >= 10 && tp->kind == ChannelKind::bus && engine.busSendWouldLoop (engine.indexOfBus (static_cast<Bus*> (tp)), r - 10)) return;
         else if (r == 3) { const bool on = ! (snd.preFader.load() && ! snd.preFx.load()); snd.preFx = false; snd.preFader = on; }
         else if (r == 5) { const bool on = ! snd.preFx.load(); snd.preFx = on; snd.preFader = false; }
         else snd.bus = r - 10;
+        engine.routingChanged();
         if (r == 2) clearUndo(); // criou bus
         else
         {
@@ -1836,7 +2120,7 @@ MainComponent::SendState MainComponent::sendStateOf (const Send& s)
     return { s.bus.load(), s.levelDb.load(), s.preFader.load(), s.preFx.load() };
 }
 
-void MainComponent::applySendState (Track* t, int index, SendState st)
+void MainComponent::applySendState (Channel* t, int index, SendState st)
 {
     if (! channelExists (t) || index >= t->sends.size()) return;
     auto& s = t->sends[(size_t) index];
@@ -1844,10 +2128,11 @@ void MainComponent::applySendState (Track* t, int index, SendState st)
     s.levelDb = st.level;
     s.preFader = st.pre;
     s.preFx = st.preFx;
+    engine.routingChanged();
     refreshStrips();
 }
 
-void MainComponent::sendLevelEdited (Track& t, int index, float before, float after)
+void MainComponent::sendLevelEdited (Channel& t, int index, float before, float after)
 {
     if (before == after) return;
     auto* tp = &t;
@@ -2286,143 +2571,126 @@ void MainComponent::showPluginManager (bool startScan)
     if (startScan) scanPluginsIsolated();
 }
 
-void MainComponent::scanPluginsIsolated (bool retryFailed, bool probeDsp)
+PluginScanRun::Request MainComponent::makeScanRequest (PluginScanRun::Mode mode, juce::String& error)
+{
+    PluginScanRun::Request req;
+    req.mode = mode;
+    req.worker = juce::File::getSpecialLocation (juce::File::currentExecutableFile).getSiblingFile ("ScPluginScanWorker.exe");
+    if (! req.worker.existsAsFile())
+    {
+        error = "O auxiliar ScPluginScanWorker.exe nao esta ao lado do SilverConsole.exe. Recompile ou extraia o pacote completo.";
+        return req;
+    }
+    auto* settings = props.getUserSettings();
+    req.quarantined = PluginScanPolicy::deserialize (settings->getValue (PluginScanPolicy::settingsKey));
+    req.cache = PluginScanCache::deserialize (settings->getValue (PluginScanCache::settingsKey));
+    if (req.cache.empty() && (pluginHost.known.getNumTypes() > 0 || ! req.quarantined.isEmpty()))
+    {
+        // primeira vez com o cache: os plugins ja escaneados contam como vistos
+        PluginScanRun::seedFromKnown (req.cache, pluginHost.known, req.quarantined);
+        settings->setValue (PluginScanCache::settingsKey, req.cache.serialize());
+        settings->saveIfNeeded();
+    }
+    if (mode == PluginScanRun::Mode::retryFailed && req.quarantined.isEmpty())
+        error = "Nao existem plugins em quarentena para reavaliar.";
+    return req;
+}
+
+void MainComponent::startBackgroundScan()
+{
+    if (backgroundScan != nullptr || job != nullptr) return;
+    juce::String error;
+    auto req = makeScanRequest (PluginScanRun::Mode::newOnly, error);
+    if (error.isNotEmpty()) return; // sem o auxiliar: o menu Plugins explica
+    backgroundScan = std::make_unique<BackgroundScan>();
+    backgroundScan->request = std::move (req);
+    backgroundScan->startThread (juce::Thread::Priority::low);
+}
+
+juce::String MainComponent::scanStatusText()
+{
+    if (backgroundScan == nullptr) return {};
+    juce::String name;
+    {
+        const juce::ScopedLock sl (backgroundScan->currentLock);
+        name = backgroundScan->current;
+    }
+    juce::String t = "Procurando plugins novos " + juce::String (juce::roundToInt (backgroundScan->progress.load() * 100.0f)) + "%";
+    if (name.isNotEmpty()) t << " (" << name << ")";
+    return t;
+}
+
+void MainComponent::finishScan (const PluginScanRun::Result& result, PluginScanRun::Mode mode, bool silent)
+{
+    auto* settings = props.getUserSettings();
+    auto quarantined = PluginScanPolicy::deserialize (settings->getValue (PluginScanPolicy::settingsKey));
+    auto cache = PluginScanCache::deserialize (settings->getValue (PluginScanCache::settingsKey));
+    int added = 0, removed = 0;
+    PluginScanRun::apply (result, mode, pluginHost.known, cache, quarantined, added, removed);
+    settings->setValue (PluginScanPolicy::settingsKey, PluginScanPolicy::serialize (quarantined));
+    settings->setValue (PluginScanCache::settingsKey, cache.serialize());
+    settings->saveIfNeeded();
+    if (pluginManagerWindow != nullptr) pluginManagerWindow->repaint();
+
+    using M = PluginScanRun::Mode;
+    if (silent)
+    {
+        // scan ao abrir: so avisa na barra de status quando algo mudou
+        juce::StringArray parts;
+        if (added > 0) parts.add (juce::String (added) + (added == 1 ? " plugin novo" : " plugins novos"));
+        if (removed > 0) parts.add (juce::String (removed) + " removido(s)");
+        if (result.failed > 0) parts.add (juce::String (result.failed) + " com falha (menu Plugins)");
+        if (! parts.isEmpty())
+        {
+            scanNotice = "Plugins: " + parts.joinIntoString (", ");
+            scanNoticeUntil = juce::Time::getMillisecondCounter() + 15000;
+        }
+        return;
+    }
+
+    juce::String summary;
+    if (mode == M::probeDsp)
+        summary << juce::String (result.scanned) << " arquivo(s) testados, " << juce::String (result.failed) << " falha(s) no teste DSP (incluindo "
+                << juce::String (result.timedOut) << " timeout(s)).\n";
+    else
+    {
+        summary << juce::String::fromUTF8 ("Examinados agora: ") << juce::String (result.scanned)
+                << (mode == M::newOnly ? juce::String::fromUTF8 (" (s\xc3\xb3 os novos ou alterados)") : juce::String()) << "\n"
+                << juce::String::fromUTF8 ("Plugins novos na lista: ") << juce::String (added) << "\n";
+        if (mode == M::newOnly)
+            summary << juce::String::fromUTF8 ("J\xc3\xa1 conhecidos (n\xc3\xa3o abertos de novo): ") << juce::String (result.skippedKnown) << "\n";
+        if (removed > 0) summary << juce::String::fromUTF8 ("Removidos (o arquivo n\xc3\xa3o existe mais): ") << juce::String (removed) << "\n";
+        summary << "Falhas: " << juce::String (result.failed) << " (incluindo " << juce::String (result.timedOut) << " timeout(s))\n";
+    }
+    summary << juce::String (result.skippedFailed) << " ignorado(s) por falha anterior; "
+            << juce::String (quarantined.size()) << " na lista de quarentena.\n"
+            << juce::String::fromUTF8 ("Total na lista: ") << juce::String (pluginHost.known.getNumTypes()) << " plugin(s)."
+            << (result.cancelled ? juce::String ("\nVarredura cancelada, inclusive o processo em andamento.")
+                                 : juce::String ("\nUse Reavaliar VST3 com falha para tentar de novo os que falharam."));
+    alert (mode == M::probeDsp ? "Teste DSP isolado" : "Plugins VST3", summary, result.failed > 0);
+}
+
+void MainComponent::scanPluginsIsolated (PluginScanRun::Mode mode)
 {
     if (job != nullptr) return;
-
-    const auto worker = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
-                            .getSiblingFile ("ScPluginScanWorker.exe");
-    if (! worker.existsAsFile())
+    if (backgroundScan != nullptr)
     {
-        alert ("Scanner VST3", "O auxiliar ScPluginScanWorker.exe nao esta ao lado "
-                             "do SilverConsole.exe. Recompile ou extraia o pacote completo.");
+        alert ("Plugins VST3", scanStatusText() + juce::String::fromUTF8 (".\nEspere terminar (a barra de status mostra o andamento)."), false);
         return;
     }
+    juce::String error;
+    auto req = makeScanRequest (mode, error);
+    if (error.isNotEmpty()) { alert ("Scanner VST3", error); return; }
 
-    const auto remembered = PluginScanPolicy::deserialize (
-        props.getUserSettings()->getValue (PluginScanPolicy::settingsKey));
-    if (retryFailed && remembered.isEmpty())
-    {
-        alert ("Scanner VST3", "Nao existem plugins em quarentena para reavaliar.");
-        return;
-    }
-
-    struct Result
-    {
-        std::vector<juce::PluginDescription> types;
-        juce::StringArray successPaths, failedPaths;
-        int total = 0, scanned = 0, skipped = 0, failed = 0, timedOut = 0;
-        bool cancelled = false;
-    };
-    auto result = std::make_shared<Result>();
-    runJob (retryFailed ? "Reavaliando VST3 com falhas anteriores..."
-                        : probeDsp ? "Testando DSP VST3 em processo isolado..."
-                        : "Escaneando VST3 em processo isolado...", true,
-            [worker, result, remembered, retryFailed, probeDsp] (Job& j)
-    {
-        // Apenas a enumeracao de caminhos acontece no host. Todo carregamento
-        // de VST3 para discovery acontece em processo filho independente.
-        juce::VST3PluginFormat format;
-        auto candidates = format.searchPathsForPlugins (
-            format.getDefaultLocationsToSearch(), true, false);
-        candidates.removeDuplicates (true);
-        result->total = candidates.size();
-
-        for (int i = 0; i < candidates.size(); ++i)
-        {
-            if (j.cancel.load()) { result->cancelled = true; break; }
-            const auto& candidate = candidates.getReference (i);
-            if (! PluginScanPolicy::shouldScan (remembered, candidate, retryFailed))
-            {
-                ++result->skipped;
-                j.progress = (float) (i + 1) / (float) juce::jmax (1, candidates.size());
-                continue;
-            }
-
-            ++result->scanned;
-            const auto destination = juce::File::getSpecialLocation (juce::File::tempDirectory)
-                .getChildFile ("silverconsole-scan-" + juce::Uuid().toString() + ".xml");
-            juce::StringArray args;
-            args.add (worker.getFullPathName());
-            if (probeDsp) args.add ("--probe");
-            args.add (candidate);
-            args.add (destination.getFullPathName());
-
-            bool passed = false;
-            // Supervisor compartilhado com os testes de falha/cancelamento.
-            // Nao roda na thread realtime e mata o filho em timeout/cancel.
-            const auto scan = PluginScanSupervisor::run (args, j.cancel, 20000);
-            if (scan.status == PluginScanSupervisor::Status::cancelled)
-                result->cancelled = true;
-            if (scan.status == PluginScanSupervisor::Status::timedOut)
-                ++result->timedOut;
-
-            if (scan.ok()
-                && destination.getSize() > 0
-                && destination.getSize() <= 4 * 1024 * 1024)
-            {
-                    if (auto xml = juce::XmlDocument::parse (destination))
-                    {
-                        if (xml->hasTagName ("SILVERCONSOLE_PLUGIN_SCAN")
-                            && xml->getStringAttribute ("format") == "VST3"
-                            && xml->getIntAttribute ("schemaVersion") == 1)
-                        {
-                            for (auto* node : xml->getChildIterator())
-                            {
-                                if (! node->hasTagName ("PLUGIN")) continue;
-                                juce::PluginDescription desc;
-                                if (desc.loadFromXml (*node) && desc.pluginFormatName == "VST3"
-                                    && desc.name.isNotEmpty())
-                                {
-                                    result->types.push_back (std::move (desc));
-                                    passed = true;
-                                }
-                            }
-                        }
-                    }
-            }
-            destination.deleteFile();
-            if (result->cancelled) break;
-
-            if (passed)
-                result->successPaths.add (candidate);
-            else
-            {
-                result->failedPaths.add (candidate);
-                ++result->failed;
-            }
-            j.progress = (float) (i + 1) / (float) juce::jmax (1, candidates.size());
-        }
-    },
-            [this, result, probeDsp] (Job&)
-    {
-        auto* settings = props.getUserSettings();
-        auto failed = PluginScanPolicy::deserialize (
-            settings->getValue (PluginScanPolicy::settingsKey));
-        for (auto& path : result->successPaths)
-            PluginScanPolicy::reportResult (failed, path, true);
-        for (auto& path : result->failedPaths)
-            PluginScanPolicy::reportResult (failed, path, false);
-        settings->setValue (PluginScanPolicy::settingsKey,
-                            PluginScanPolicy::serialize (failed));
-
-        for (auto& description : result->types)
-            pluginHost.known.addType (description);
-        settings->saveIfNeeded();
-        if (pluginManagerWindow != nullptr) pluginManagerWindow->repaint();
-
-        const juce::String summary = "Reconhecidos " + juce::String ((int) result->types.size())
-            + " tipo(s) VST3 em " + juce::String (result->scanned) + " candidato(s) examinados.\n"
-            + juce::String (result->skipped) + " ignorado(s) por falha anterior.\n"
-            + juce::String (result->failed) + (probeDsp ? " falha(s) no teste DSP, incluindo "
-                                                          : " falha(s), incluindo ")
-            + juce::String (result->timedOut) + " timeout(s).\n"
-            + juce::String (failed.size()) + " candidato(s) na lista de quarentena."
-            + (result->cancelled ? "\nVarredura cancelada, inclusive o processo em andamento."
-                                 : "\nUse Reavaliar VST3 com falha para tentar novamente.");
-        alert (probeDsp ? "Teste DSP isolado" : "Scanner isolado",
-               summary, result->failed > 0);
-    });
+    using M = PluginScanRun::Mode;
+    auto request = std::make_shared<PluginScanRun::Request> (std::move (req));
+    auto result = std::make_shared<PluginScanRun::Result>();
+    runJob (mode == M::retryFailed ? "Reavaliando VST3 com falhas anteriores..."
+            : mode == M::probeDsp ? "Testando DSP VST3 em processo isolado..."
+            : mode == M::everything ? "Reescanando todos os VST3 em processo isolado..."
+            : "Procurando plugins VST3 novos...", true,
+            [request, result] (Job& j) { PluginScanRun::run (*request, *result, j.cancel, j.progress); },
+            [this, result, mode] (Job&) { finishScan (*result, mode, false); });
 }
 
 juce::Rectangle<int> MainComponent::statusArea() const
@@ -3801,14 +4069,7 @@ void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
             applyChannelBasics (engine, *t, td.ch);
             t->sourceFile = td.file;
             t->outputBus = td.output;
-            engine.setSendCount (*t, (int) td.sends.size());
-            for (int s = 0; s < (int) td.sends.size() && s < t->sends.size(); ++s)
-            {
-                t->sends[(size_t) s].bus = td.sends[(size_t) s].bus;
-                t->sends[(size_t) s].levelDb = td.sends[(size_t) s].levelDb;
-                t->sends[(size_t) s].preFader = td.sends[(size_t) s].pre;
-                t->sends[(size_t) s].preFx = td.sends[(size_t) s].preFx;
-            }
+            applySends (engine, *t, td.sends);
             auto* raw = engine.addTrack (std::move (t));
             if (d.stream != nullptr) engine.setTrackStream (*raw, d.stream);
             else if (d.audio.ok()) engine.setTrackAudio (*raw, d.audio.original, d.audio.rate, d.playback, sr);
@@ -3830,9 +4091,13 @@ void MainComponent::openFile (const juce::File& file, bool discardConfirmed)
                 }
             }
         }
+        for (size_t i = 0; i < data->busSends.size() && i < engine.buses.size(); ++i)
+            applySends (engine, *engine.buses[i], data->busSends[i]);
+        engine.routingChanged();
         applyChannelBasics (engine, engine.master, data->master);
         engine.master.name = "MASTER";
         engine.master.mono = data->masterMono;
+        data->masterComp.applyTo (engine.master.comp);
         for (int g = 0; g < kMaxGroups; ++g)
         {
             engine.vca[(size_t) g].gainDb = data->vca[(size_t) g].gainDb;
