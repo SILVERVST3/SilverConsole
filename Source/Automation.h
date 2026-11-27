@@ -26,6 +26,8 @@ struct AutoPoint
 {
     double t = 0.0; // segundos (independe da taxa de amostragem)
     float v = 0.0f; // volume: dB | pan: -1..1 | mute: 0/1 | plugin: 0..1
+    bool operator== (const AutoPoint& o) const noexcept { return t == o.t && v == o.v; }
+    bool operator!= (const AutoPoint& o) const noexcept { return ! operator== (o); }
 };
 
 /** Valor de uma lista de pontos ordenada no tempo t (vazia: 0). */

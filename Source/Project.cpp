@@ -5,7 +5,7 @@ namespace sc
 {
 namespace
 {
-    ChannelData captureChannel (Channel& c)
+    ChannelData captureChannel (Channel& c, const std::vector<std::unique_ptr<Track>>& tracks)
     {
         ChannelData d;
         d.name = c.name;
@@ -16,6 +16,7 @@ namespace
         d.solo = c.solo.load();
         d.phase = c.phase.load();
         d.numInserts = c.inserts.size();
+        d.group = c.group.load();
         for (int i = 0; i < c.inserts.size(); ++i)
         {
             auto& s = c.inserts[(size_t) i];
@@ -26,6 +27,9 @@ namespace
             in.hasDesc = s.hasDescription;
             in.isolated = s.preferRemote;
             in.offline = s.offline;
+            in.mix = s.mix.load();
+            for (size_t k = 0; k < tracks.size(); ++k)
+                if (s.sidechain != nullptr && tracks[k].get() == s.sidechain) in.sidechain = (int) k;
             in.desc = s.description;
             if (s.processor != nullptr) s.processor->getStateInformation (in.state);
             else in.state = s.missingState;
@@ -50,6 +54,7 @@ namespace
         e.setAttribute ("solo", d.solo);
         e.setAttribute ("phase", d.phase);
         e.setAttribute ("inserts", d.numInserts);
+        if (d.group >= 0) e.setAttribute ("group", d.group);
         for (auto& in : d.inserts)
         {
             auto* x = e.createNewChildElement ("INSERT");
@@ -57,6 +62,8 @@ namespace
             x->setAttribute ("bypass", in.bypass);
             x->setAttribute ("isolated", in.isolated);
             if (in.offline) x->setAttribute ("offline", true);
+            if (in.mix < 0.999f) x->setAttribute ("mix", in.mix);
+            if (in.sidechain >= 0) x->setAttribute ("sidechain", in.sidechain);
             if (auto desc = in.desc.createXml()) x->addChildElement (desc.release());
             x->createNewChildElement ("STATE")->addTextElement (in.state.toBase64Encoding());
         }
@@ -85,6 +92,8 @@ namespace
         d.mute = e.getBoolAttribute ("mute");
         d.solo = e.getBoolAttribute ("solo");
         d.phase = e.getBoolAttribute ("phase");
+        d.group = e.getIntAttribute ("group", -1);
+        if (! juce::isPositiveAndBelow (d.group, kMaxGroups)) d.group = -1;
         for (auto* x : e.getChildWithTagNameIterator ("INSERT"))
         {
             InsertData in;
@@ -92,6 +101,8 @@ namespace
             in.bypass = x->getBoolAttribute ("bypass");
             in.isolated = x->getBoolAttribute ("isolated", false);
             in.offline = x->getBoolAttribute ("offline", false);
+            in.mix = juce::jlimit (0.0f, 1.0f, (float) x->getDoubleAttribute ("mix", 1.0));
+            in.sidechain = x->getIntAttribute ("sidechain", -1);
             if (! juce::isPositiveAndBelow (in.slot, kMaxInsertsPerChannel)) continue;
             if (auto* p = x->getChildByName ("PLUGIN")) in.hasDesc = in.desc.loadFromXml (*p);
             if (auto* s = x->getChildByName ("STATE")) in.state.fromBase64Encoding (s->getAllSubText().trim());
@@ -134,18 +145,20 @@ ProjectData captureProject (Engine& engine)
     for (auto& t : engine.tracks)
     {
         TrackData td;
-        td.ch = captureChannel (*t);
+        td.ch = captureChannel (*t, engine.tracks);
         td.file = t->sourceFile;
         td.frozenFile = t->frozenFile;
         td.output = t->outputBus.load();
         td.sends.clear();
         for (auto& s : t->sends)
-            td.sends.push_back ({ s.bus.load(), s.levelDb.load(), s.preFader.load() });
+            td.sends.push_back ({ s.bus.load(), s.levelDb.load(), s.preFader.load(), s.preFx.load() });
         p.tracks.push_back (std::move (td));
     }
-    for (auto& b : engine.buses) p.buses.push_back (captureChannel (*b));
-    p.master = captureChannel (engine.master);
+    for (auto& b : engine.buses) p.buses.push_back (captureChannel (*b, engine.tracks));
+    p.master = captureChannel (engine.master, engine.tracks);
     p.masterMono = engine.master.mono.load();
+    for (int g = 0; g < kMaxGroups; ++g)
+        p.vca[(size_t) g] = { engine.vca[(size_t) g].gainDb.load(), engine.vca[(size_t) g].mute.load(), engine.vca[(size_t) g].shown };
     const double sr = engine.getSampleRate();
     p.loopOn = engine.loopOn.load();
     p.loopStartSec = (double) engine.loopStart.load() / sr;
@@ -172,6 +185,7 @@ void applyChannelBasics (Engine& engine, Channel& c, const ChannelData& d)
     c.mute = d.mute;
     c.solo = d.solo;
     c.phase = d.phase;
+    c.group = d.group;
 }
 
 bool writeProject (const ProjectData& p, const juce::File& file, juce::String& error)
@@ -206,12 +220,36 @@ bool writeProject (const ProjectData& p, const juce::File& file, juce::String& e
             x->setAttribute ("bus", s.bus);
             x->setAttribute ("levelDb", s.levelDb);
             x->setAttribute ("pre", s.pre);
+            if (s.preFx) x->setAttribute ("preFx", true);
         }
     }
     for (auto& b : p.buses) writeChannel (*root.createNewChildElement ("BUS"), b);
     auto* m = root.createNewChildElement ("MASTER");
     writeChannel (*m, p.master);
     m->setAttribute ("mono", p.masterMono);
+    for (int g = 0; g < kMaxGroups; ++g)
+    {
+        const auto& v = p.vca[(size_t) g];
+        if (v.gainDb == 0.0f && ! v.mute && ! v.shown) continue;
+        auto* x = root.createNewChildElement ("VCA");
+        x->setAttribute ("group", g);
+        x->setAttribute ("gainDb", v.gainDb);
+        x->setAttribute ("mute", v.mute);
+        x->setAttribute ("shown", v.shown);
+    }
+    for (auto& mk : p.markers)
+    {
+        auto* x = root.createNewChildElement ("MARKER");
+        x->setAttribute ("t", mk.t);
+        x->setAttribute ("name", mk.name);
+    }
+    for (auto& rg : p.regions)
+    {
+        auto* x = root.createNewChildElement ("REGION");
+        x->setAttribute ("start", rg.start);
+        x->setAttribute ("end", rg.end);
+        x->setAttribute ("name", rg.name);
+    }
 
     juce::TemporaryFile temp (file);
     if (! root.writeTo (temp.getFile()) || ! temp.overwriteTargetFileWithTemporary())
@@ -268,7 +306,7 @@ bool readProject (const juce::File& file, ProjectData& p, juce::String& error)
             if (i >= (int) t.sends.size()) t.sends.resize ((size_t) i + 1);
             t.sends[(size_t) i] = { validBus (x->getIntAttribute ("bus", -1)),
                                     juce::jlimit (kMinDb, 12.0f, (float) x->getDoubleAttribute ("levelDb", 0.0)),
-                                    x->getBoolAttribute ("pre") };
+                                    x->getBoolAttribute ("pre"), x->getBoolAttribute ("preFx", false) };
         }
         p.tracks.push_back (std::move (t));
     }
@@ -276,6 +314,20 @@ bool readProject (const juce::File& file, ProjectData& p, juce::String& error)
     {
         readChannel (*m, p.master);
         p.masterMono = m->getBoolAttribute ("mono");
+    }
+    for (auto* x : root->getChildWithTagNameIterator ("VCA"))
+    {
+        const int g = x->getIntAttribute ("group", -1);
+        if (! juce::isPositiveAndBelow (g, kMaxGroups)) continue;
+        p.vca[(size_t) g] = { juce::jlimit (kMinDb, 12.0f, (float) x->getDoubleAttribute ("gainDb", 0.0)),
+                              x->getBoolAttribute ("mute"), x->getBoolAttribute ("shown") };
+    }
+    for (auto* x : root->getChildWithTagNameIterator ("MARKER"))
+        p.markers.push_back ({ juce::jmax (0.0, x->getDoubleAttribute ("t")), x->getStringAttribute ("name") });
+    for (auto* x : root->getChildWithTagNameIterator ("REGION"))
+    {
+        RegionData r { juce::jmax (0.0, x->getDoubleAttribute ("start")), x->getDoubleAttribute ("end"), x->getStringAttribute ("name") };
+        if (r.end > r.start) p.regions.push_back (r);
     }
     p.master.name = "MASTER";
     return true;

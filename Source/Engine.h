@@ -1,4 +1,4 @@
-// SilverConsole - motor de mixagem com hospedagem de plugins VST3.
+﻿// SilverConsole - motor de mixagem com hospedagem de plugins VST3.
 // Codigo original (MIT). Depende do JUCE (AGPLv3 ou licenca comercial).
 #pragma once
 
@@ -21,6 +21,7 @@ constexpr int kDefaultSends = 4;
 constexpr int kMaxInsertsPerChannel = 64;
 constexpr int kMaxSendsPerTrack = 64;
 constexpr int kMaxBuses = 16;
+constexpr int kMaxGroups = 8;          // grupos de faders (com VCA opcional)
 constexpr int kMaxTracks = 128;
 constexpr int kMaxPluginChannels = 31; // AudioBuffer de referencia sem alocacao
 constexpr float kMinDb = -60.0f;       // fader no fim = -inf
@@ -106,6 +107,8 @@ private:
 };
 
 //==============================================================================
+struct Track;
+
 struct InsertSlot
 {
     std::unique_ptr<juce::AudioProcessor> processor;
@@ -117,6 +120,10 @@ struct InsertSlot
     std::atomic<bool> bypassed { false };
     std::atomic<bool> faulted { false }; // Falha C++ em processBlock; exibida na interface, sem locks
     bool offline = false;              // plugin descarregado de proposito (estado em missingState)
+    std::atomic<float> mix { 1.0f };   // dry/wet: 1 = so o plugin, 0 = so o sinal seco
+    float lastMix = 1.0f;              // rampa (thread de audio)
+    DelayLine dryDelay;                // seco atrasado pela latencia do plugin (alinhado ao wet)
+    Track* sidechain = nullptr;        // faixa na entrada lateral do plugin (sinal antes dos plugins); sob o lock
     int bufferChannels = 2;
     int mainOutChannels = 2;
 
@@ -143,6 +150,7 @@ struct Channel
 
     std::atomic<float> gainDb { 0.0f }, pan { 0.0f };
     std::atomic<bool> mute { false }, solo { false }, phase { false };
+    std::atomic<int> group { -1 }; // grupo de faders (0..kMaxGroups-1) ou -1
 
     SlotList<InsertSlot> inserts { kDefaultInserts };
     bool hasInsert (int slot) const noexcept { return juce::isPositiveAndBelow (slot, inserts.size()); }
@@ -160,6 +168,8 @@ struct Channel
     // prealocados fora do callback para processamento paralelo.
     juce::AudioBuffer<float> processingBuffer;
     juce::MidiBuffer processingMidi;
+    juce::AudioBuffer<float> dryBuffer; // sinal seco para o mix dry/wet dos inserts
+    juce::AudioBuffer<float> sidechainBuffer; // entrada lateral lida da faixa fonte
     juce::LinearSmoothedValue<float> smoothL, smoothR;
     DelayLine pdc;
     int chainLatency = 0;
@@ -180,6 +190,7 @@ struct Send
     std::atomic<int> bus { -1 };
     std::atomic<float> levelDb { 0.0f };
     std::atomic<bool> preFader { false };
+    std::atomic<bool> preFx { false }; // antes dos plugins (tambem independe do fader)
     juce::LinearSmoothedValue<float> smooth;
 };
 
@@ -203,6 +214,13 @@ struct Track : Channel
     // continua carregado para descongelar.
     juce::File frozenFile;
     std::shared_ptr<StreamingAudio> frozenStream;
+
+    // Envios pre-FX: sinal antes dos inserts, atrasado pela latencia das faixas (PDC).
+    juce::AudioBuffer<float> preFxBuffer;
+    DelayLine preFxPdc;
+    // solo: cala so a saida da faixa (com rampa); os envios continuam valendo
+    juce::LinearSmoothedValue<float> soloGate { 1.0f };
+    bool preFxActive = false; // thread de audio
     bool isFrozen() const noexcept { return frozenStream != nullptr; }
 };
 
@@ -235,8 +253,21 @@ public:
     std::vector<std::unique_ptr<Bus>> buses;
     Master master;
 
+    // VCA por grupo: soma dB no volume de todos os membros (sem audio proprio)
+    struct Vca
+    {
+        std::atomic<float> gainDb { 0.0f };
+        std::atomic<bool> mute { false };
+        bool shown = false; // faixa de VCA visivel no mixer (interface)
+    };
+    std::array<Vca, kMaxGroups> vca;
+    /** Ganho do fader com o VCA do grupo aplicado (0 = mudo). */
+    float faderGain (const Channel&) const noexcept;
+
     Track* addTrack (std::unique_ptr<Track>);
     std::unique_ptr<Track> removeTrack (Track*);
+    /** Recoloca uma faixa removida (desfazer) na posicao index. */
+    Track* insertTrack (int index, std::unique_ptr<Track>);
     Bus* addBus (const juce::String& name = {});
     std::unique_ptr<Bus> removeBus (Bus*);
     int indexOfBus (const Bus*) const;
@@ -252,6 +283,28 @@ public:
     std::unique_ptr<juce::AudioProcessor> setRemoteInsert (
         Channel&, int slot, std::shared_ptr<RemoteDspInsert>, const juce::PluginDescription&);
     std::unique_ptr<juce::AudioProcessor> clearInsert (Channel&, int slot);
+
+    /** Tudo o que um slot de insert guarda (plugin, estado, bypass, mix...). */
+    struct SlotContent
+    {
+        std::unique_ptr<juce::AudioProcessor> processor;
+        std::shared_ptr<RemoteDspInsert> remote;
+        juce::PluginDescription description;
+        bool hasDescription = false, preferRemote = false, offline = false, bypassed = false;
+        float mix = 1.0f;
+        Track* sidechain = nullptr;
+        juce::MemoryBlock missingState;
+    };
+    /** Troca o conteudo do slot pelo de 'other' (desfazer/refazer de inserts:
+        a mesma troca serve para os dois sentidos). O plugin que sai continua
+        vivo em 'other', com o ajuste intacto. */
+    void swapSlotContent (Channel&, int slot, SlotContent& other);
+
+    /** Sidechain: liga a faixa 'source' (sinal antes dos plugins dela) na entrada
+        lateral do plugin do slot; nullptr desliga. false = o plugin nao tem entrada
+        lateral (ou e isolado). */
+    bool setSidechain (Channel&, int slot, Track* source);
+    static bool supportsSidechain (const InsertSlot&);
     void setMissingInsert (Channel&, int slot, const juce::PluginDescription&,
                            const juce::MemoryBlock& state, bool preferRemote = false, bool offline = false);
     /** Plugin offline: guarda o estado e descarrega o plugin (sem CPU nem memoria);
@@ -404,10 +457,28 @@ public:
     /** Bounce offline (+ cauda). Roda numa thread de trabalho.
         rangeStart/rangeEnd em amostras; rangeEnd < 0 = ate o fim da musica.
         Em 16 bits aplica dither TPDF. */
+    /** Normalizacao da mix exportada (ganho unico no arquivo inteiro, sem limitador). */
+    struct Normalize
+    {
+        enum class Mode { none, peak, truePeak, lufs };
+        Mode mode = Mode::none;
+        float target = -1.0f;          // dBFS (pico), dBTP (true peak) ou LUFS integrado
+        float truePeakCeiling = -1.0f; // so LUFS: o ganho nunca passa este teto de true peak
+    };
+    /** Medicoes da mix gravada (ja com o ganho de normalizacao aplicado). */
+    struct ExportReport
+    {
+        bool measured = false;
+        float integratedLufs = -100.0f, maxShortTermLufs = -100.0f, truePeakDb = -100.0f, samplePeakDb = -100.0f;
+        float gainDb = 0.0f;
+        bool limitedByCeiling = false; // LUFS: o teto de true peak segurou o ganho
+    };
+    /** measureOnly: so renderiza e mede (nao grava nada). */
     bool exportMix (const juce::File&, int bitDepth, double tailSeconds,
                     std::atomic<float>& progress, std::atomic<bool>& cancel,
                     juce::String& error, bool& clipped,
-                    juce::int64 rangeStart = 0, juce::int64 rangeEnd = -1);
+                    juce::int64 rangeStart = 0, juce::int64 rangeEnd = -1,
+                    const Normalize& normalize = {}, ExportReport* report = nullptr, bool measureOnly = false);
     std::atomic<bool> rendering { false };
 
     /** Exportacao de faixas individuais (stems) de um trecho.
@@ -458,6 +529,10 @@ private:
     void processChain (Channel&, int n, juce::AudioBuffer<float>&, juce::MidiBuffer&, bool allowSleep);
     int sleepHoldFor (const Channel&) const;
     struct ReadSeg { juce::int64 src; int dst; int len; };
+    // trechos do bloco atual (render/congelar), para ler a fonte do sidechain
+    const ReadSeg* blockSegs = nullptr;
+    int blockNumSegs = 0;
+    bool applySidechainLayout (juce::AudioProcessor&, bool enable);
     /** Le o audio da faixa (congelado, disco ou RAM) nos trechos pedidos. */
     void readTrackSource (Track&, float* left, float* right, const ReadSeg*, int numSegs, double sr) noexcept;
     void forEachChannel (const std::function<void (Channel&)>&);

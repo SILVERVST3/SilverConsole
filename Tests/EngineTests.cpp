@@ -1369,6 +1369,257 @@ static void testFreezeTrack()
     dir.deleteRecursively();
 }
 
+// Plugin de teste com entrada lateral: a saida e o sinal da entrada lateral.
+class SidechainProbe : public juce::AudioProcessor
+{
+public:
+    SidechainProbe() : AudioProcessor (BusesProperties().withInput ("In", juce::AudioChannelSet::stereo())
+                                                        .withOutput ("Out", juce::AudioChannelSet::stereo())
+                                                        .withInput ("Sidechain", juce::AudioChannelSet::stereo(), false)) {}
+    bool isBusesLayoutSupported (const BusesLayout& l) const override
+    {
+        return l.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
+            && l.getMainInputChannelSet() == juce::AudioChannelSet::stereo()
+            && (l.inputBuses.size() < 2 || l.inputBuses[1].isDisabled() || l.inputBuses[1] == juce::AudioChannelSet::stereo());
+    }
+    const juce::String getName() const override { return "SidechainProbe"; }
+    void prepareToPlay (double, int) override {}
+    void releaseResources() override {}
+    void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+    {
+        const int n = b.getNumSamples();
+        if (getChannelCountOfBus (true, 1) == 2)
+        {
+            const int sc = getChannelIndexInProcessBlockBuffer (true, 1, 0);
+            b.copyFrom (0, 0, b, sc, 0, n);
+            b.copyFrom (1, 0, b, sc + 1, 0, n);
+        }
+        else b.clear (0, n), b.clear (1, 0, n);
+    }
+    double getTailLengthSeconds() const override { return 0; }
+    bool acceptsMidi() const override { return false; }
+    bool producesMidi() const override { return false; }
+    juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+    bool hasEditor() const override { return false; }
+    int getNumPrograms() override { return 1; }
+    int getCurrentProgram() override { return 0; }
+    void setCurrentProgram (int) override {}
+    const juce::String getProgramName (int) override { return {}; }
+    void changeProgramName (int, const juce::String&) override {}
+    void getStateInformation (juce::MemoryBlock&) override {}
+    void setStateInformation (const void*, int) override {}
+};
+
+static float maxDiff (const juce::AudioBuffer<float>& a, const juce::AudioBuffer<float>& b, int n)
+{
+    float d = 0.0f;
+    for (int ch = 0; ch < 2; ++ch)
+        for (int i = 0; i < n; ++i) d = juce::jmax (d, std::abs (a.getSample (ch, i) - b.getSample (ch, i)));
+    return d;
+}
+
+// Bloco B: solo de bus, envio pre-FX, dry/wet, VCA, sidechain, troca de slot.
+static void testMixerBlockB()
+{
+    const int n = 4096;
+    // ---- solo de bus: ouve o bus (faixas roteadas + envios); o resto fica mudo
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* a = addTrack (e, makeBuffer (2, n, [] (int, int) { return 0.1f; }), "a"); // -> bus 0
+        auto* b = addTrack (e, makeBuffer (2, n, [] (int, int) { return 0.2f; }), "b"); // -> master, envio p/ bus 1
+        auto* c = addTrack (e, makeBuffer (2, n, [] (int, int) { return 0.4f; }), "c"); // -> master
+        auto* b0 = e.addBus ("Grupo");
+        auto* b1 = e.addBus ("Reverb");
+        a->outputBus = 0;
+        b->sends[0].bus = 1; b->sends[0].levelDb = 0.0f;
+        b0->solo = true;
+        auto out = run (e, n);
+        check (near (out.getSample (0, n - 1), 0.1f, 1.0e-5f), "solo do bus 0: so a faixa roteada nele");
+        b0->solo = false; b1->solo = true;
+        out = run (e, n);
+        check (near (out.getSample (0, n - 1), 0.2f, 1.0e-5f), "solo do bus de reverb: ouve o envio (faixa seca muda) " + juce::String (out.getSample (0, n - 1)));
+        c->solo = true;
+        out = run (e, n);
+        check (near (out.getSample (0, n - 1), 0.4f + 0.2f, 1.0e-5f), "solo de faixa + solo de bus somam " + juce::String (out.getSample (0, n - 1)));
+        juce::ignoreUnused (b1);
+    }
+    // ---- envio pre-FX: antes do plugin, alinhado pela PDC
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* t = addTrack (e, makeBuffer (2, n, [] (int, int i) { return i == 1000 ? 1.0f : 0.0f; }), "imp");
+        e.addBus ("FX");
+        auto p = std::make_unique<InternalDelay> (50);
+        e.prepareProcessor (*p);
+        e.setInsert (*t, 0, std::move (p), nullptr);
+        t->gainDb = kMinDb; // fader fechado: pre-FX continua
+        t->sends[0].bus = 0; t->sends[0].preFx = true;
+        auto out = run (e, n);
+        check (peakIndex (out, 0) == 1000 + 50 && near (out.getSample (0, 1050), 1.0f, 1.0e-5f),
+               "pre-FX: independe do fader e fica alinhado com a PDC (" + juce::String (peakIndex (out, 0)) + ")");
+    }
+    // ---- dry/wet com plugin de latencia: seco alinhado, 50% = media
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* t = addTrack (e, makeBuffer (2, n, [] (int, int i) { return i == 1000 ? 1.0f : 0.0f; }), "imp");
+        auto p = std::make_unique<InternalDelay> (64);
+        e.prepareProcessor (*p);
+        e.setInsert (*t, 0, std::move (p), nullptr);
+        t->inserts[0].mix = 0.5f;
+        t->inserts[0].lastMix = 0.5f;
+        auto out = run (e, n);
+        // InternalDelay e um atraso puro: wet e dry atrasados iguais -> impulso inteiro
+        check (peakIndex (out, 0) == 1000 + 64 && near (out.getSample (0, 1064), 1.0f, 1.0e-5f),
+               "dry/wet: seco atrasado junto com o plugin (sem eco)");
+    }
+    // ---- VCA: soma dB no grupo
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* t = addTrack (e, makeBuffer (2, n, [] (int, int) { return 0.5f; }), "t");
+        t->group = 2;
+        e.vca[2].gainDb = -6.0f;
+        auto out = run (e, n);
+        check (near (out.getSample (0, n - 1), 0.5f * juce::Decibels::decibelsToGain (-6.0f), 1.0e-4f), "VCA -6 dB no membro");
+        e.vca[2].mute = true;
+        out = run (e, n, n);
+        check (out.getMagnitude (0, n - 300, 300) == 0.0f, "mute do VCA cala o grupo");
+    }
+    // ---- sidechain: a fonte entra na entrada lateral (antes dos plugins dela)
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* dst = addTrack (e, makeBuffer (2, n, [] (int, int) { return 0.3f; }), "baixo");
+        auto* src = addTrack (e, makeBuffer (2, n, [] (int, int i) { return 0.01f * (float) (i % 50); }), "bumbo");
+        src->gainDb = kMinDb; // a fonte nao precisa tocar
+        auto p = std::make_unique<SidechainProbe>();
+        e.prepareProcessor (*p);
+        e.setInsert (*dst, 0, std::move (p), nullptr);
+        check (Engine::supportsSidechain (dst->inserts[0]), "plugin com entrada lateral");
+        check (e.setSidechain (*dst, 0, src), "ligar sidechain");
+        auto out = run (e, n);
+        float d = 0.0f;
+        for (int i = 2048; i < n; ++i) d = juce::jmax (d, std::abs (out.getSample (0, i) - 0.01f * (float) (i % 50))); // depois da rampa do fader
+        check (d < 1.0e-6f, "plugin recebe o audio da faixa fonte");
+        e.removeTrack (src);
+        check (dst->inserts[0].sidechain == nullptr, "remover a fonte desliga o sidechain");
+    }
+    // ---- troca de slot (desfazer/refazer): o mesmo plugin volta com o ajuste
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* t = addTrack (e, makeBuffer (2, 512, [] (int, int) { return 0.1f; }), "t");
+        auto p = std::make_unique<CountingDelay> (32);
+        auto* raw = p.get();
+        p->stateText = "meu ajuste";
+        e.prepareProcessor (*p);
+        e.setInsert (*t, 0, std::move (p), nullptr);
+        t->inserts[0].mix = 0.7f;
+        Engine::SlotContent empty;
+        e.swapSlotContent (*t, 0, empty); // "remover"
+        check (t->inserts[0].isEmpty() && empty.processor.get() == raw && near (empty.mix, 0.7f) && e.getTotalLatency() == 0,
+               "remover guarda o plugin fora do slot");
+        e.swapSlotContent (*t, 0, empty); // "desfazer"
+        check (t->inserts[0].processor.get() == raw && near (t->inserts[0].mix.load(), 0.7f) && e.getTotalLatency() == 32
+               && raw->stateText == "meu ajuste", "desfazer devolve o mesmo plugin, ajuste e mix");
+        auto removed = e.removeTrack (t);
+        auto* back = e.insertTrack (0, std::move (removed));
+        check (back == t && e.tracks.size() == 1 && e.getTotalLatency() == 32, "faixa removida volta inteira");
+    }
+    // ---- projeto: grupo, VCA, marcadores, regioes, pre-FX, mix e sidechain
+    {
+        Engine e; e.prepare (48000, 256);
+        auto* a = addTrack (e, makeBuffer (2, 512, [] (int, int) { return 0.1f; }), "a");
+        auto* b = addTrack (e, makeBuffer (2, 512, [] (int, int) { return 0.1f; }), "b");
+        e.addBus ("FX");
+        a->group = 3;
+        e.vca[3].gainDb = -4.5f; e.vca[3].shown = true;
+        a->sends[0].bus = 0; a->sends[0].preFx = true;
+        auto p = std::make_unique<SidechainProbe>();
+        e.prepareProcessor (*p);
+        juce::PluginDescription desc; desc.name = "SC"; desc.pluginFormatName = "VST3"; desc.fileOrIdentifier = "C:/sc.vst3";
+        e.setInsert (*a, 0, std::move (p), &desc);
+        e.setSidechain (*a, 0, b);
+        a->inserts[0].mix = 0.25f;
+        auto pd = captureProject (e);
+        pd.markers.push_back ({ 1.5, "Refrao" });
+        pd.regions.push_back ({ 2.0, 6.0, "Verso 1" });
+        auto file = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_blockb.sconsole");
+        juce::String err;
+        ProjectData r;
+        check (writeProject (pd, file, err) && readProject (file, r, err), "salvar/abrir bloco B " + err);
+        check (r.tracks.size() == 2 && r.tracks[0].ch.group == 3 && near (r.vca[3].gainDb, -4.5f) && r.vca[3].shown,
+               "grupo e VCA salvos");
+        check (r.tracks.size() == 2 && r.tracks[0].sends[0].preFx && r.tracks[0].ch.inserts.size() == 1
+               && near (r.tracks[0].ch.inserts[0].mix, 0.25f) && r.tracks[0].ch.inserts[0].sidechain == 1,
+               "pre-FX, mix e sidechain salvos");
+        check (r.markers.size() == 1 && r.markers[0].name == "Refrao" && r.regions.size() == 1 && near ((float) r.regions[0].end, 6.0f)
+               && r.regions[0].name == "Verso 1", "marcadores e regioes salvos");
+        file.deleteFile();
+    }
+}
+
+// Bloco C: medicao BS.1770 (integrado com gates) e normalizacao na exportacao.
+static void testLoudnessNormalize()
+{
+    const int sr = 48000, len = sr * 10;
+    Engine e; e.prepare (sr, 256);
+    // seno de 997 Hz a -20 dBFS nos dois canais: referencia BS.1770 = -20,0 LUFS (-23 com um canal so)
+    addTrack (e, makeBuffer (2, len, [sr] (int, int i)
+              { return 0.1f * std::sin (2.0f * juce::MathConstants<float>::pi * 997.0f * (float) i / (float) sr); }), "seno");
+    std::atomic<float> progress { 0 }; std::atomic<bool> cancel { false };
+    juce::String err; bool clip = false;
+    Engine::ExportReport rep;
+    check (e.exportMix ({}, 24, 0.0, progress, cancel, err, clip, 0, -1, {}, &rep, true), "medir sem gravar " + err);
+    check (std::abs (rep.integratedLufs - (-20.0f)) < 0.05f, "seno -20 dBFS nos 2 canais = -20,0 LUFS (" + juce::String (rep.integratedLufs, 2) + ")");
+    check (std::abs (rep.samplePeakDb - (-20.0f)) < 0.05f && std::abs (rep.truePeakDb - (-20.0f)) < 0.2f,
+           "picos do seno (" + juce::String (rep.samplePeakDb, 2) + " / " + juce::String (rep.truePeakDb, 2) + ")");
+
+    // silencio antes e depois nao muda o integrado (gate absoluto de -70 LUFS)
+    {
+        Engine g; g.prepare (sr, 256);
+        addTrack (g, makeBuffer (2, len * 2, [sr, len] (int, int i)
+                  { return i < len / 2 || i >= len / 2 + len ? 0.0f
+                         : 0.1f * std::sin (2.0f * juce::MathConstants<float>::pi * 997.0f * (float) i / (float) sr); }), "s");
+        Engine::ExportReport r2;
+        g.exportMix ({}, 24, 0.0, progress, cancel, err, clip, 0, -1, {}, &r2, true);
+        check (std::abs (r2.integratedLufs - rep.integratedLufs) < 0.2f, "gate: silencio nao puxa o integrado para baixo ("
+               + juce::String (r2.integratedLufs, 2) + ")");
+    }
+
+    auto dir = juce::File::getSpecialLocation (juce::File::tempDirectory).getChildFile ("sc_norm_test");
+    dir.deleteRecursively();
+    dir.createDirectory();
+    juce::AudioFormatManager fm; registerAudioFormats (fm);
+    auto exportWith = [&] (Engine::Normalize n, const juce::String& name, int bits, Engine::ExportReport& out)
+    {
+        auto f = dir.getChildFile (name);
+        const bool ok = e.exportMix (f, bits, 0.0, progress, cancel, err, clip, 0, -1, n, &out);
+        return ok ? loadAudioFile (fm, f) : LoadedAudio {};
+    };
+    using M = Engine::Normalize::Mode;
+    Engine::ExportReport r;
+    auto a = exportWith ({ M::lufs, -14.0f, -1.0f }, "lufs.wav", 24, r);
+    float measured = -100.0f;
+    if (a.ok())
+    {
+        LoudnessAnalyzer an; an.prepare (sr);
+        an.process (a.original->getReadPointer (0), a.original->getReadPointer (1), a.original->getNumSamples());
+        measured = an.integratedLufs();
+    }
+    check (std::abs (r.integratedLufs - (-14.0f)) < 0.05f && std::abs (measured - (-14.0f)) < 0.1f && std::abs (r.gainDb - 6.0f) < 0.1f,
+           "normalizar para -14 LUFS (arquivo mede " + juce::String (measured, 2) + ", ganho " + juce::String (r.gainDb, 2) + " dB)");
+    auto b = exportWith ({ M::peak, -1.0f, -1.0f }, "peak.wav", 24, r);
+    check (b.ok() && std::abs (juce::Decibels::gainToDecibels (b.original->getMagnitude (0, b.original->getNumSamples())) - (-1.0f)) < 0.02f,
+           "normalizar pico para -1 dBFS");
+    exportWith ({ M::lufs, 0.0f, -1.0f }, "ceiling.wav", 32, r);
+    check (r.limitedByCeiling && std::abs (r.truePeakDb - (-1.0f)) < 0.05f && r.integratedLufs < -0.5f,
+           "teto de true peak segura o ganho (" + juce::String (r.truePeakDb, 2) + " dBTP)");
+    auto c = exportWith ({ M::lufs, -14.0f, -1.0f }, "lufs16.wav", 16, r);
+    check (c.ok() && c.original->getNumSamples() == len, "normalizado em 16 bits com dither");
+    cancel = true;
+    check (! e.exportMix (dir.getChildFile ("x.wav"), 24, 0.0, progress, cancel, err, clip, 0, -1, { M::lufs, -14.0f, -1.0f }) && ! e.rendering.load(),
+           "cancelar a exportacao normalizada");
+    cancel = false;
+    dir.deleteRecursively();
+}
+
 // Inserts e envios dinamicos (botao "+"), 16 buses e persistencia no projeto.
 static void testDynamicSlots()
 {
@@ -1687,6 +1938,8 @@ int main (int argc, char** argv)
     testCpuSaverSleep();
     testPluginOffline();
     testFreezeTrack();
+    testMixerBlockB();
+    testLoudnessNormalize();
     testDynamicSlots();
     testDiskStreaming();
     testStereoBalanceMuteSolo();

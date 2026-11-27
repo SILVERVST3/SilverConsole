@@ -27,9 +27,23 @@ public:
     // selecao de trecho (regua do tempo)
     virtual void timelineMenu (juce::Component&) {}
     virtual void playSelection() {}
+    // arrastar a faixa pelo nome para mudar a posicao (0 inicio, 1 arrastando, 2 soltou)
+    virtual void stripDrag (Channel&, const juce::MouseEvent&, int) {}
+    // desfazer/refazer: a interface avisa cada edicao concluida (valor antes/depois)
+    enum class Param { gain, pan, mute, solo, phase, mono };
+    virtual void valueEdited (Channel&, Param, float before, float after) { juce::ignoreUnused (before, after); }
+    /** Cada passo de um controle (inclusive durante o arraste): grupos movem juntos. */
+    virtual void liveValueChanged (Channel&, Param, float before, float after) { juce::ignoreUnused (before, after); }
+    virtual void vcaEdited (int group, bool mute, float before, float after) { juce::ignoreUnused (group, mute, before, after); }
+    virtual void vcaMenu (int group, juce::Component&) { juce::ignoreUnused (group); }
+    virtual void sendLevelEdited (Track&, int index, float before, float after) { juce::ignoreUnused (index, before, after); }
+    virtual void renamed (Channel&, const juce::String& before) { juce::ignoreUnused (before); }
+    virtual void automationEdited (Channel&, AutoTarget, int slot, int param, const std::vector<AutoPoint>& before)
+    { juce::ignoreUnused (slot, param, before); }
 };
 
 juce::Colour autoModeColour (AutoMode);
+juce::Colour groupColour (int group);
 
 //==============================================================================
 class LevelMeter : public juce::Component, public juce::SettableTooltipClient
@@ -75,6 +89,30 @@ private:
     const int index;
     StripHost& host;
     juce::Slider level;
+    bool gesture = false;
+    float gestureStart = 0.0f;
+};
+
+//==============================================================================
+/** Faixa de VCA de um grupo: fader e mute que valem para todos os membros. */
+class VcaStrip : public juce::Component
+{
+public:
+    VcaStrip (int group, StripHost&);
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void refresh();
+    void tick();
+    const int group;
+
+private:
+    StripHost& host;
+    juce::Slider fader { juce::Slider::LinearVertical, juce::Slider::NoTextBox };
+    juce::TextButton muteButton { "M" };
+    juce::Label nameLabel, gainLabel, infoLabel;
+    bool gesture = false;
+    float gestureStart = 0.0f;
 };
 
 //==============================================================================
@@ -86,6 +124,8 @@ public:
     void paintOverChildren (juce::Graphics&) override;
     void resized() override;
     void mouseDown (const juce::MouseEvent&) override;
+    void mouseDrag (const juce::MouseEvent&) override;
+    void mouseUp (const juce::MouseEvent&) override;
 
     /** Atualiza medidores (30 Hz). */
     void tick();
@@ -105,12 +145,15 @@ public:
 private:
     void updateGainLabel();
     juce::String panText() const;
-    juce::Rectangle<int> sendBlock() const; // area de envios (ou loudness/MASTER)
+    static int bottomSectionHeight (ChannelKind) noexcept; // fader, botoes e nome (fixos)
 
     static inline int layoutInsertRows = kDefaultInserts, layoutSendRows = kDefaultSends;
 
     StripHost& host;
     juce::Label nameLabel, infoLabel, gainLabel, panLabel;
+    // Inserts e envios em areas proprias com rolagem; a secao do fader fica fixa.
+    juce::Viewport insertsView, sendsView;
+    juce::Component insertsContent, sendsContent;
     juce::OwnedArray<InsertSlotComponent> slots;
     std::vector<int> lastInsertVisualState; // evita 30x repaints/s por faixa sem mudancas
     bool shownAsleep = false;               // indicador "zz" (economia de CPU)
@@ -124,6 +167,9 @@ private:
     juce::Slider fader { juce::Slider::LinearVertical, juce::Slider::NoTextBox };
     juce::Slider panKnob { juce::Slider::RotaryVerticalDrag, juce::Slider::NoTextBox };
     LevelMeter meter;
-    juce::Rectangle<int> insertsHeader, sendsHeader, faderArea;
+    juce::Rectangle<int> insertsHeader, sendsHeader, faderArea, loudnessArea;
+    bool draggingStrip = false;
+    bool faderGesture = false, panGesture = false;
+    float faderGestureStart = 0.0f, panGestureStart = 0.0f;
 };
 } // namespace sc

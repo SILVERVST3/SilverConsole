@@ -479,10 +479,15 @@ public:
         return best;
     }
 
+    std::vector<AutoPoint> pointsNow() { if (auto* l = lane()) return l->points; return {}; }
+    void recordEdit (const std::vector<AutoPoint>& before) { owner.host.automationEdited (channel, target, slot, param, before); }
+
     void deletePoint (int idx)
     {
+        const auto before = pointsNow();
         if (auto* l = lane())
             owner.engine.editAutomation ([&] { if (juce::isPositiveAndBelow (idx, (int) l->points.size())) l->points.erase (l->points.begin() + idx); });
+        recordEdit (before);
         owner.host.markDirty();
         owner.content.repaint();
     }
@@ -499,6 +504,7 @@ public:
         const int hit = hitPoint (e.position);
         if (e.mods.isPopupMenu()) { laneMenu (hit); return; }
         if (hit >= 0 && e.mods.isAltDown()) { deletePoint (hit); return; }
+        editBefore = pointsNow();
         if (hit >= 0) { dragIndex = hit; updateDragText (e.position); return; }
 
         auto* l = owner.engine.getOrCreateLane (channel, target, slot, param);
@@ -558,7 +564,11 @@ public:
 
     void mouseUp (const juce::MouseEvent&) override
     {
-        if (dragIndex >= 0 || pencil) owner.host.markDirty();
+        if (dragIndex >= 0 || pencil)
+        {
+            if (pointsNow() != editBefore) recordEdit (editBefore);
+            owner.host.markDirty();
+        }
         dragIndex = -1;
         pencil = false;
         dragText.clear();
@@ -604,10 +614,21 @@ private:
             auto& o = self->owner;
             auto* l = self->lane();
             if (r == 1) self->deletePoint (hit);
-            else if (r == 2 && l != nullptr) o.engine.editAutomation ([l] { l->points.clear(); });
+            else if (r == 2 && l != nullptr)
+            {
+                const auto before = l->points;
+                o.engine.editAutomation ([l] { l->points.clear(); });
+                self->recordEdit (before);
+            }
             else if (r == 3 && l != nullptr)
             {
+                const auto before = l->points;
+                auto& host = o.host;
+                auto& ch = self->channel;
+                const auto tg = self->target;
+                const int sl = self->slot, pr = self->param;
                 o.engine.removeLane (self->channel, l);
+                host.automationEdited (ch, tg, sl, pr, before); // desfazer recria a linha com os pontos
                 o.host.lanesChanged();
                 return; // a linha foi destruida
             }
@@ -616,6 +637,7 @@ private:
         });
     }
 
+    std::vector<AutoPoint> editBefore; // pontos antes do gesto (desfazer)
     AutomationView& owner;
     Channel& channel;
     const AutoTarget target;

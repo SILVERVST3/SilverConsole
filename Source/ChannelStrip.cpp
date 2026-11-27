@@ -138,6 +138,19 @@ void InsertSlotComponent::paint (juce::Graphics& g)
                            : s.getName() + juce::String::fromUTF8 (" - offline (sem CPU/memÃ³ria, ajuste guardado). Clique: colocar online"));
         return;
     }
+    const float mixValue = s.mix.load (std::memory_order_relaxed);
+    if (s.sidechain != nullptr && mixValue >= 0.999f && ! s.bypassed.load() && ! s.faulted.load())
+    {
+        g.setColour (colours::accent);
+        g.setFont (uiFont (9.0f, true));
+        g.drawText ("SC", r.withTrimmedRight (3.0f), juce::Justification::centredRight);
+    }
+    if (mixValue < 0.999f && ! s.bypassed.load() && ! s.faulted.load())
+    {
+        g.setColour (colours::silverBot);
+        g.setFont (uiFont (9.0f, true));
+        g.drawText (juce::String (juce::roundToInt (mixValue * 100.0f)) + "%", r.withTrimmedRight (3.0f), juce::Justification::centredRight);
+    }
     if (s.bypassed.load() || s.faulted.load())
     {
         g.setColour (s.faulted.load() ? colours::danger : colours::mute);
@@ -164,9 +177,17 @@ SendRow::SendRow (Track& t, int i, StripHost& h) : track (t), index (i), host (h
     level.setSkewFactorFromMidPoint (-12.0);
     level.setDoubleClickReturnValue (true, 0.0);
     level.setColour (juce::Slider::trackColourId, colours::busTint);
+    level.onDragStart = [this] { gesture = true; gestureStart = track.sends[(size_t) index].levelDb.load(); };
+    level.onDragEnd = [this]
+    {
+        gesture = false;
+        host.sendLevelEdited (track, index, gestureStart, track.sends[(size_t) index].levelDb.load());
+    };
     level.onValueChange = [this]
     {
+        const float before = track.sends[(size_t) index].levelDb.load();
         track.sends[(size_t) index].levelDb = (float) level.getValue();
+        if (! gesture) host.sendLevelEdited (track, index, before, (float) level.getValue());
         level.setTooltip ("Envio " + juce::String (index + 1) + ": " + dbText ((float) level.getValue()) + " dB");
         host.markDirty();
         repaint();
@@ -197,7 +218,7 @@ void SendRow::paint (juce::Graphics& g)
     g.setFont (uiFont (10.5f, true));
     if (b >= 0 && b < (int) buses.size())
     {
-        g.setColour (s.preFader.load() ? colours::mute : colours::busTint);
+        g.setColour (s.preFx.load() ? colours::accent : s.preFader.load() ? colours::mute : colours::busTint);
         g.drawFittedText (buses[(size_t) b]->name, box.reduced (2.0f, 0).toNearestInt(), juce::Justification::centred, 1, 0.6f);
     }
     else
@@ -225,13 +246,16 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     nameLabel.setEditable (false, ! isMaster, false);
     nameLabel.onTextChange = [this]
     {
+        const auto before = channel.name;
         channel.name = nameLabel.getText().trim().substring (0, 40);
         if (channel.name.isEmpty()) channel.name = "Faixa";
         nameLabel.setText (channel.name, juce::dontSendNotification);
+        if (channel.name != before) host.renamed (channel, before);
         host.markDirty();
     };
     nameLabel.addMouseListener (this, false);
-    nameLabel.setTooltip ("Duplo clique: renomear | botao direito: opcoes");
+    nameLabel.setTooltip (c.kind == ChannelKind::track ? "Arrastar: mudar a posicao | duplo clique: renomear | botao direito: opcoes"
+                                                       : "Duplo clique: renomear | botao direito: opcoes");
     addAndMakeVisible (nameLabel);
 
     setupSmallLabel (infoLabel, 10.0f, colours::textDim);
@@ -263,13 +287,25 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     panKnob.setColour (juce::Slider::trackColourId, colours::accent);
     panKnob.onValueChange = [this]
     {
+        const float before = channel.pan.load();
         channel.pan = (float) panKnob.getValue();
         panLabel.setText (panText(), juce::dontSendNotification);
+        if (! panGesture) host.valueEdited (channel, StripHost::Param::pan, before, channel.pan.load());
         host.markDirty();
     };
     panKnob.setTooltip (isTrack ? "Pan (duplo clique: centro)" : "Balance (duplo clique: centro)");
-    panKnob.onDragStart = [this] { host.automationTouch (channel, AutoTarget::pan, true); };
-    panKnob.onDragEnd = [this] { host.automationTouch (channel, AutoTarget::pan, false); };
+    panKnob.onDragStart = [this]
+    {
+        panGesture = true;
+        panGestureStart = channel.pan.load();
+        host.automationTouch (channel, AutoTarget::pan, true);
+    };
+    panKnob.onDragEnd = [this]
+    {
+        panGesture = false;
+        host.automationTouch (channel, AutoTarget::pan, false);
+        host.valueEdited (channel, StripHost::Param::pan, panGestureStart, channel.pan.load());
+    };
     addAndMakeVisible (panKnob);
     setupSmallLabel (panLabel, 10.5f, colours::lcdText);
     addAndMakeVisible (panLabel);
@@ -285,26 +321,49 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
         addAndMakeVisible (b);
     };
     setupToggle (muteButton, colours::mute, "Mute");
-    muteButton.onClick = [this] { channel.mute = muteButton.getToggleState(); host.muteToggled (channel); host.markDirty(); };
+    muteButton.onClick = [this]
+    {
+        channel.mute = muteButton.getToggleState();
+        host.muteToggled (channel);
+        host.valueEdited (channel, StripHost::Param::mute, channel.mute.load() ? 0.0f : 1.0f, channel.mute.load() ? 1.0f : 0.0f);
+        host.markDirty();
+    };
 
     autoButton.setWantsKeyboardFocus (false);
     autoButton.setTooltip (juce::String::fromUTF8 ("Automa\xc3\xa7\xc3\xa3o: OFF, READ (toca), TOUCH (grava enquanto segura), LATCH (grava at\xc3\xa9 parar), WRITE (grava tudo)"));
     autoButton.onClick = [this] { host.autoModeMenu (channel, autoButton); };
     addAndMakeVisible (autoButton);
-    if (isTrack)
+    if (! isMaster)
     {
-        setupToggle (soloButton, colours::solo, "Solo");
-        soloButton.onClick = [this] { channel.solo = soloButton.getToggleState(); host.markDirty(); };
+        setupToggle (soloButton, colours::solo, isTrack ? juce::String ("Solo")
+                                                        : juce::String::fromUTF8 ("Solo do bus: ouve o bus e o que chega nele (faixas roteadas e envios)"));
+        soloButton.onClick = [this]
+        {
+            channel.solo = soloButton.getToggleState();
+            host.valueEdited (channel, StripHost::Param::solo, channel.solo.load() ? 0.0f : 1.0f, channel.solo.load() ? 1.0f : 0.0f);
+            host.markDirty();
+        };
     }
     if (! isMaster)
     {
         setupToggle (phaseButton, colours::accentDeep, "Inverter polaridade");
-        phaseButton.onClick = [this] { channel.phase = phaseButton.getToggleState(); host.markDirty(); };
+        phaseButton.onClick = [this]
+        {
+            channel.phase = phaseButton.getToggleState();
+            host.valueEdited (channel, StripHost::Param::phase, channel.phase.load() ? 0.0f : 1.0f, channel.phase.load() ? 1.0f : 0.0f);
+            host.markDirty();
+        };
     }
     else
     {
         setupToggle (monoButton, colours::accentDeep, "Ouvir a mix em mono");
-        monoButton.onClick = [this] { host.getEngine().master.mono = monoButton.getToggleState(); host.markDirty(); };
+        monoButton.onClick = [this]
+        {
+            const bool on = monoButton.getToggleState();
+            host.getEngine().master.mono = on;
+            host.valueEdited (channel, StripHost::Param::mono, on ? 0.0f : 1.0f, on ? 1.0f : 0.0f);
+            host.markDirty();
+        };
     }
     outputButton.setWantsKeyboardFocus (false);
 
@@ -315,13 +374,26 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     fader.setVelocityModeParameters (0.4, 1, 0.05, true, juce::ModifierKeys::ctrlModifier);
     fader.onValueChange = [this]
     {
+        const float before = channel.gainDb.load();
         channel.gainDb = (float) fader.getValue();
         updateGainLabel();
+        host.liveValueChanged (channel, StripHost::Param::gain, before, channel.gainDb.load());
+        if (! faderGesture) host.valueEdited (channel, StripHost::Param::gain, before, channel.gainDb.load());
         host.markDirty();
     };
     fader.setTooltip ("Volume (duplo clique: 0 dB | Ctrl+arrastar: ajuste fino)");
-    fader.onDragStart = [this] { host.automationTouch (channel, AutoTarget::volume, true); };
-    fader.onDragEnd = [this] { host.automationTouch (channel, AutoTarget::volume, false); };
+    fader.onDragStart = [this]
+    {
+        faderGesture = true;
+        faderGestureStart = channel.gainDb.load();
+        host.automationTouch (channel, AutoTarget::volume, true);
+    };
+    fader.onDragEnd = [this]
+    {
+        faderGesture = false;
+        host.automationTouch (channel, AutoTarget::volume, false);
+        host.valueEdited (channel, StripHost::Param::gain, faderGestureStart, channel.gainDb.load());
+    };
     addAndMakeVisible (fader);
     addAndMakeVisible (meter);
     meter.setTooltip ("Pico L/R (clique: limpa o clip)");
@@ -341,6 +413,20 @@ ChannelStrip::ChannelStrip (Channel& c, StripHost& h) : channel (c), host (h)
     };
     addAndMakeVisible (gainLabel);
 
+    for (auto* v : { &insertsView, &sendsView })
+    {
+        v->setScrollBarsShown (true, false); // vertical, so quando precisa
+        v->setScrollBarThickness (6);
+        v->setWantsKeyboardFocus (false);
+    }
+    insertsView.setViewedComponent (&insertsContent, false);
+    addAndMakeVisible (insertsView);
+    if (isTrack)
+    {
+        sendsView.setViewedComponent (&sendsContent, false);
+        addAndMakeVisible (sendsView);
+    }
+
     syncSlots();
     refresh();
 }
@@ -351,7 +437,7 @@ void ChannelStrip::syncSlots()
     while (slots.size() > channel.inserts.size()) { slots.removeLast(); changed = true; }
     while (slots.size() < channel.inserts.size())
     {
-        addAndMakeVisible (slots.add (new InsertSlotComponent (channel, slots.size(), host)));
+        insertsContent.addAndMakeVisible (slots.add (new InsertSlotComponent (channel, slots.size(), host)));
         changed = true;
     }
     lastInsertVisualState.resize ((size_t) slots.size(), 0);
@@ -361,7 +447,7 @@ void ChannelStrip::syncSlots()
         while (sends.size() > t.sends.size()) { sends.removeLast(); changed = true; }
         while (sends.size() < t.sends.size())
         {
-            addAndMakeVisible (sends.add (new SendRow (t, sends.size(), host)));
+            sendsContent.addAndMakeVisible (sends.add (new SendRow (t, sends.size(), host)));
             changed = true;
         }
     }
@@ -370,19 +456,19 @@ void ChannelStrip::syncSlots()
 
 namespace
 {
-    constexpr int kSlotH = 17, kSendH = 20, kInsertsTop = 54, kMinFaderH = 200;
+    constexpr int kSlotH = 17, kSendH = 20, kHeaderH = 14, kRackTop = 24, kFaderH = 232, kNameH = 22, kLoudnessH = 60;
+}
+
+int ChannelStrip::bottomSectionHeight (ChannelKind k) noexcept
+{
+    // (saida da faixa) + pan + automacao + botoes + fader + volume + nome
+    return (k == ChannelKind::track ? 26 : 0) + 62 + 24 + 34 + kFaderH + 22 + kNameH + 8;
 }
 
 int ChannelStrip::minimumHeight() noexcept
 {
-    const int sendsHeaderY = kInsertsTop + layoutInsertRows * kSlotH + 3;
-    const int y0 = sendsHeaderY + 37 + layoutSendRows * kSendH + 4;
-    return y0 + 112 + kMinFaderH + 28;
-}
-
-juce::Rectangle<int> ChannelStrip::sendBlock() const
-{
-    return sendsHeader.withHeight (37 + layoutSendRows * kSendH);
+    // rack com pelo menos 2 linhas de insert e 2 de envio visiveis (o resto rola)
+    return kRackTop + 2 * kHeaderH + 4 + 2 * kSlotH + 2 * kSendH + 6 + bottomSectionHeight (ChannelKind::track);
 }
 
 juce::String ChannelStrip::panText() const
@@ -466,7 +552,7 @@ void ChannelStrip::tick()
         const auto label = "TP " + db + " dBTP";
         if (infoLabel.getText() != label)
             infoLabel.setText (label, juce::dontSendNotification);
-        repaint (sendBlock());
+        repaint (loudnessArea);
     }
 
 
@@ -508,29 +594,26 @@ void ChannelStrip::tick()
 
 void ChannelStrip::resized()
 {
-    const int w = getWidth();
-    nameLabel.setBounds (4, 6, w - 8, 20);
-    infoLabel.setBounds (4, 26, w - 8, 13);
-    // Layout vertical calculado: as linhas seguem o canal com mais inserts/envios,
-    // para que todos os canais fiquem alinhados.
-    insertsHeader = { 6, 41, w - 12, 12 };
-    for (int i = 0; i < slots.size(); ++i) slots[i]->setBounds (6, kInsertsTop + i * kSlotH, w - 12, kSlotH - 1);
-    addInsertButton.setBounds (w - 6 - 18, 40, 18, 13);
+    const int w = getWidth(), H = getHeight();
+    const bool isTrack = channel.kind == ChannelKind::track;
+    const bool isMaster = channel.kind == ChannelKind::master;
+    infoLabel.setBounds (4, 8, w - 8, 13);
 
-    const int sendsY = kInsertsTop + layoutInsertRows * kSlotH + 3;
-    sendsHeader = { 6, sendsY, w - 12, 12 };
-    for (int i = 0; i < sends.size(); ++i) sends[i]->setBounds (6, sendsY + 13 + i * kSendH, w - 12, kSendH - 1);
-    addSendButton.setBounds (w - 6 - 18, sendsY - 1, 18, 13);
-    outputButton.setBounds (6, sendsY + 13 + layoutSendRows * kSendH + 4, w - 12, 20);
+    // ---- secao fixa (de baixo para cima): nome, volume, fader, botoes, automacao, pan, saida
+    int y = H - 4;
+    nameLabel.setBounds (4, y - kNameH, w - 8, kNameH);
+    y -= kNameH + 4;
+    gainLabel.setBounds (10, y - 18, w - 20, 18);
+    y -= 18 + 4;
+    const int faderTop = y - kFaderH;
+    faderArea = { 0, faderTop, w, kFaderH };
+    const int meterW = isMaster ? 22 : 16;
+    meter.setBounds (w - meterW - 6, faderTop, meterW, kFaderH);
+    fader.setBounds (24, faderTop - 10, w - meterW - 34, kFaderH + 20);
 
-    const int y0 = sendsY + 37 + layoutSendRows * kSendH + 4;
-    panKnob.setBounds (w / 2 - 21, y0, 42, 42);
-    panLabel.setBounds (4, y0 + 41, w - 8, 13);
-
-    autoButton.setBounds (6, y0 + 58, w - 12, 20);
+    const int rowY = faderTop - 12 - 20;
     const int bw = (w - 16) / 3;
-    const int rowY = y0 + 82;
-    if (channel.kind == ChannelKind::master)
+    if (isMaster)
     {
         muteButton.setBounds (6, rowY, 30, 20);
         monoButton.setBounds (40, rowY, w - 46, 20);
@@ -538,17 +621,58 @@ void ChannelStrip::resized()
     else
     {
         muteButton.setBounds (6, rowY, bw, 20);
-        if (channel.kind == ChannelKind::track) soloButton.setBounds (8 + bw, rowY, bw, 20);
+        soloButton.setBounds (8 + bw, rowY, bw, 20);
         phaseButton.setBounds (10 + 2 * bw, rowY, bw, 20);
     }
+    const int autoY = rowY - 24;
+    autoButton.setBounds (6, autoY, w - 12, 20);
+    const int panY = autoY - 4 - 56;
+    panKnob.setBounds (w / 2 - 21, panY, 42, 42);
+    panLabel.setBounds (4, panY + 41, w - 8, 13);
+    int rackBottom = panY - 6;
+    if (isTrack)
+    {
+        outputButton.setBounds (6, panY - 6 - 20, w - 12, 20);
+        rackBottom = outputButton.getY() - 6;
+    }
+    if (isMaster)
+    {
+        loudnessArea = { 6, rackBottom - kLoudnessH, w - 12, kLoudnessH };
+        rackBottom = loudnessArea.getY() - 4;
+    }
 
-    const int bottom = getHeight() - 28;
-    const int faderTop = y0 + 112;
-    faderArea = { 0, faderTop, w, juce::jmax (80, bottom - faderTop) };
-    const int meterW = channel.kind == ChannelKind::master ? 22 : 16;
-    meter.setBounds (w - meterW - 6, faderArea.getY(), meterW, faderArea.getHeight());
-    fader.setBounds (24, faderArea.getY() - 10, w - meterW - 34, faderArea.getHeight() + 20);
-    gainLabel.setBounds (10, getHeight() - 24, w - 20, 18);
+    // ---- rack: inserts (e envios) com rolagem. Divisao igual em todas as faixas,
+    // pelo canal que tem mais linhas, para os cabecalhos ficarem alinhados.
+    insertsHeader = { 6, kRackTop, w - 12, 12 };
+    addInsertButton.setBounds (w - 6 - 18, kRackTop - 1, 18, 13);
+    const int avail = juce::jmax (0, rackBottom - kRackTop - kHeaderH - (isTrack ? kHeaderH + 4 : 0));
+    int insH = avail, sendH = 0;
+    if (isTrack)
+    {
+        const int needI = layoutInsertRows * kSlotH, needS = layoutSendRows * kSendH;
+        if (needI + needS <= avail)          { sendH = needS; insH = avail - needS; }
+        else if (needI <= avail * 55 / 100)  { insH = needI; sendH = avail - needI; }
+        else if (needS <= avail * 45 / 100)  { sendH = needS; insH = avail - needS; }
+        else                                 { insH = avail * 55 / 100; sendH = avail - insH; }
+    }
+    insertsView.setBounds (6, kRackTop + kHeaderH, w - 12, insH);
+    {
+        const int contentH = slots.size() * kSlotH;
+        const int cw = insertsView.getWidth() - (contentH > insH ? 7 : 0);
+        insertsContent.setSize (cw, contentH);
+        for (int i = 0; i < slots.size(); ++i) slots[i]->setBounds (0, i * kSlotH, cw, kSlotH - 1);
+    }
+    if (isTrack)
+    {
+        const int sy = kRackTop + kHeaderH + insH + 4;
+        sendsHeader = { 6, sy, w - 12, 12 };
+        addSendButton.setBounds (w - 6 - 18, sy - 1, 18, 13);
+        sendsView.setBounds (6, sy + kHeaderH, w - 12, sendH);
+        const int contentH = sends.size() * kSendH;
+        const int cw = sendsView.getWidth() - (contentH > sendH ? 7 : 0);
+        sendsContent.setSize (cw, contentH);
+        for (int i = 0; i < sends.size(); ++i) sends[i]->setBounds (0, i * kSendH, cw, kSendH - 1);
+    }
 }
 
 void ChannelStrip::paint (juce::Graphics& g)
@@ -585,31 +709,46 @@ void ChannelStrip::paint (juce::Graphics& g)
         g.drawText ("zz", insertsHeader.withTrimmedLeft (46), juce::Justification::centredLeft);
     }
     if (channel.kind == ChannelKind::track) header (sendsHeader, "ENVIOS");
-    else
+    if (isMaster)
     {
+        const auto& m = static_cast<const Master&> (channel);
         g.setColour (juce::Colours::black.withAlpha (0.35f));
-        g.fillRoundedRectangle (sendBlock().toFloat(), 3.0f);
+        g.fillRoundedRectangle (loudnessArea.toFloat(), 3.0f);
         g.setColour (colours::textDim);
-        g.setFont (uiFont (10.0f, true));
-        if (isMaster)
+        g.setFont (uiFont (9.5f, true));
+        g.drawText ("LOUDNESS (M)", loudnessArea.withHeight (16), juce::Justification::centred);
+        g.setFont (uiFont (16.0f, true));
+        g.setColour (colours::lcdText);
+        const auto loudness = m.momentaryLufs.load (std::memory_order_relaxed);
+        g.drawText (loudness <= -110.0f ? juce::String ("-inf LUFS") : juce::String (loudness, 1) + " LUFS",
+                    loudnessArea.withTrimmedTop (14).withHeight (28), juce::Justification::centred);
+        g.setColour (colours::textDim);
+        g.setFont (uiFont (8.5f));
+        g.drawText ("Momentary / 400ms", loudnessArea.withTrimmedTop (42).withHeight (14), juce::Justification::centred);
+    }
+
+    // nome no rodape (como no REAPER): caixa com a cor do canal
+    {
+        auto nb = nameLabel.getBounds().toFloat();
+        g.setColour (colours::lcd);
+        g.fillRoundedRectangle (nb, 3.0f);
+        g.setColour (channel.colour.withAlpha (0.28f));
+        g.fillRoundedRectangle (nb, 3.0f);
+        g.setColour (channel.colour);
+        g.fillRoundedRectangle (nb.withHeight (2.5f), 1.0f);
+        g.setColour (juce::Colours::black.withAlpha (0.8f));
+        g.drawRoundedRectangle (nb, 3.0f, 1.0f);
+        const int grp = channel.group.load();
+        if (juce::isPositiveAndBelow (grp, kMaxGroups))
         {
-            const auto& m = static_cast<const Master&> (channel);
-            g.drawText ("LOUDNESS (M)", sendsHeader.withHeight (32), juce::Justification::centred);
-            g.setFont (uiFont (16.0f, true));
-            g.setColour (colours::lcdText);
-            const auto loudness = m.momentaryLufs.load (std::memory_order_relaxed);
-            const auto value = loudness <= -110.0f
-                                   ? juce::String ("-inf LUFS")
-                                   : juce::String (loudness, 1) + " LUFS";
-            g.drawText (value, sendsHeader.withTrimmedTop (31).withHeight (57),
-                        juce::Justification::centred);
-            g.setFont (uiFont (8.5f));
-            g.drawText ("Momentary / 400ms", sendsHeader.withTrimmedTop (82).withHeight (30),
-                        juce::Justification::centred);
+            // grupo: bolinha colorida com o numero, no canto do nome
+            auto dot = juce::Rectangle<float> (nb.getX() + 3.0f, nb.getCentreY() - 6.5f, 13.0f, 13.0f);
+            g.setColour (groupColour (grp));
+            g.fillEllipse (dot);
+            g.setColour (colours::ink);
+            g.setFont (uiFont (9.5f, true));
+            g.drawText (juce::String (grp + 1), dot, juce::Justification::centred);
         }
-        else
-            g.drawText (juce::String ("MASTER"),
-                        sendBlock(), juce::Justification::centred);
     }
 
     // escala do fader
@@ -624,6 +763,120 @@ void ChannelStrip::paint (juce::Graphics& g)
     }
 }
 
+juce::Colour groupColour (int group)
+{
+    static const juce::uint32 c[] { 0xff8cc4ff, 0xffffb74d, 0xff7be08f, 0xffff7a8a, 0xffb48cff, 0xff4dd9c9, 0xfff2e05a, 0xffff9de2 };
+    return juce::Colour (c[(size_t) juce::jlimit (0, 7, group)]);
+}
+
+//==============================================================================
+VcaStrip::VcaStrip (int g, StripHost& h) : group (g), host (h)
+{
+    auto& v = host.getEngine().vca[(size_t) group];
+    nameLabel.setText ("VCA " + juce::String (group + 1), juce::dontSendNotification);
+    nameLabel.setFont (uiFont (13.0f, true));
+    nameLabel.setJustificationType (juce::Justification::centred);
+    nameLabel.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (nameLabel);
+    infoLabel.setFont (uiFont (10.0f, true));
+    infoLabel.setJustificationType (juce::Justification::centred);
+    infoLabel.setColour (juce::Label::textColourId, colours::textDim);
+    infoLabel.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (infoLabel);
+
+    fader.setRange (kMinDb, 12.0, 0.1);
+    fader.setSkewFactorFromMidPoint (-12.0);
+    fader.setDoubleClickReturnValue (true, 0.0);
+    fader.setMouseDragSensitivity (300);
+    fader.setTooltip ("VCA: soma no volume de todas as faixas do grupo (duplo clique: 0 dB)");
+    fader.setValue (v.gainDb.load(), juce::dontSendNotification);
+    fader.onDragStart = [this] { gesture = true; gestureStart = host.getEngine().vca[(size_t) group].gainDb.load(); };
+    fader.onDragEnd = [this] { gesture = false; host.vcaEdited (group, false, gestureStart, (float) fader.getValue()); };
+    fader.onValueChange = [this]
+    {
+        auto& vv = host.getEngine().vca[(size_t) group];
+        const float before = vv.gainDb.load();
+        vv.gainDb = (float) fader.getValue();
+        if (! gesture) host.vcaEdited (group, false, before, (float) fader.getValue());
+        refresh();
+        host.markDirty();
+    };
+    addAndMakeVisible (fader);
+    muteButton.setClickingTogglesState (true);
+    muteButton.setColour (juce::TextButton::buttonOnColourId, colours::mute);
+    muteButton.setColour (juce::TextButton::textColourOnId, colours::ink);
+    muteButton.setColour (juce::TextButton::buttonColourId, colours::gun);
+    muteButton.setTooltip ("Mute do grupo inteiro");
+    muteButton.onClick = [this]
+    {
+        const bool on = muteButton.getToggleState();
+        host.getEngine().vca[(size_t) group].mute = on;
+        host.vcaEdited (group, true, on ? 0.0f : 1.0f, on ? 1.0f : 0.0f);
+        host.markDirty();
+    };
+    addAndMakeVisible (muteButton);
+    gainLabel.setFont (uiFont (12.0f, true));
+    gainLabel.setJustificationType (juce::Justification::centred);
+    gainLabel.setColour (juce::Label::textColourId, colours::lcdText);
+    gainLabel.setColour (juce::Label::backgroundColourId, colours::lcd);
+    gainLabel.setInterceptsMouseClicks (false, false);
+    addAndMakeVisible (gainLabel);
+    refresh();
+}
+
+void VcaStrip::refresh()
+{
+    auto& e = host.getEngine();
+    auto& v = e.vca[(size_t) group];
+    if (! fader.isMouseButtonDown()) fader.setValue (v.gainDb.load(), juce::dontSendNotification);
+    muteButton.setToggleState (v.mute.load(), juce::dontSendNotification);
+    const float db = v.gainDb.load();
+    gainLabel.setText (db <= kMinDb ? juce::String ("-inf") : (db > 0 ? "+" : "") + juce::String (db, 1), juce::dontSendNotification);
+    int members = 0;
+    for (auto& t : e.tracks) members += t->group.load() == group ? 1 : 0;
+    for (auto& b : e.buses) members += b->group.load() == group ? 1 : 0;
+    infoLabel.setText (juce::String (members) + (members == 1 ? " membro" : " membros"), juce::dontSendNotification);
+}
+
+void VcaStrip::tick() { refresh(); }
+
+void VcaStrip::resized()
+{
+    const int w = getWidth(), H = getHeight();
+    infoLabel.setBounds (4, 8, w - 8, 13);
+    nameLabel.setBounds (4, H - 26, w - 8, 22);
+    gainLabel.setBounds (10, H - 48, w - 20, 18);
+    const int faderH = 232, faderTop = H - 52 - faderH;
+    fader.setBounds (14, faderTop - 10, w - 28, faderH + 20);
+    muteButton.setBounds (6, faderTop - 32, w - 12, 20);
+}
+
+void VcaStrip::paint (juce::Graphics& g)
+{
+    auto r = getLocalBounds().toFloat().reduced (1.5f, 0.0f);
+    SilverLookAndFeel::drawPlate (g, r, colours::gunHi.darker (0.4f), colours::gunLo.darker (0.45f), group * 31 + 7);
+    const auto col = groupColour (group);
+    g.setColour (col);
+    g.fillRoundedRectangle (r.getX() + 4, 2.0f, r.getWidth() - 8, 4.0f, 1.5f);
+    g.setColour (col.withAlpha (0.45f));
+    g.drawRoundedRectangle (r.reduced (1.0f), 4.0f, 1.5f);
+    auto nb = nameLabel.getBounds().toFloat();
+    g.setColour (colours::lcd);
+    g.fillRoundedRectangle (nb, 3.0f);
+    g.setColour (col.withAlpha (0.3f));
+    g.fillRoundedRectangle (nb, 3.0f);
+    g.setColour (colours::textDim);
+    g.setFont (uiFont (9.5f, true));
+    g.drawFittedText (juce::String::fromUTF8 ("Soma no volume das faixas do grupo ")
+                      + juce::String (group + 1) + ".", getLocalBounds().withTrimmedTop (30).withHeight (60).reduced (8, 0),
+                      juce::Justification::centredTop, 4);
+}
+
+void VcaStrip::mouseDown (const juce::MouseEvent& e)
+{
+    if (e.mods.isPopupMenu()) host.vcaMenu (group, *this);
+}
+
 void ChannelStrip::paintOverChildren (juce::Graphics& g)
 {
     if (channel.kind == ChannelKind::track && channel.mute.load())
@@ -633,10 +886,26 @@ void ChannelStrip::paintOverChildren (juce::Graphics& g)
     }
 }
 
+void ChannelStrip::mouseDrag (const juce::MouseEvent& e)
+{
+    // arrastar pelo nome muda a posicao da faixa
+    if (e.eventComponent != &nameLabel || channel.kind != ChannelKind::track || e.mods.isPopupMenu()) return;
+    if (! draggingStrip && e.getDistanceFromDragStart() < 6) return;
+    if (! draggingStrip) { draggingStrip = true; host.stripDrag (channel, e, 0); }
+    host.stripDrag (channel, e, 1);
+}
+
+void ChannelStrip::mouseUp (const juce::MouseEvent& e)
+{
+    if (! draggingStrip) return;
+    draggingStrip = false;
+    host.stripDrag (channel, e, 2);
+}
+
 void ChannelStrip::mouseDown (const juce::MouseEvent& e)
 {
     const bool onName = e.eventComponent == &nameLabel;
-    const bool onTop = e.eventComponent == this && e.y < 40;
+    const bool onTop = e.eventComponent == this && e.y < 22;
     if ((onName && e.mods.isPopupMenu()) || onTop)
         host.channelMenu (channel, nameLabel);
 }

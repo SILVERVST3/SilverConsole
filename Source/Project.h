@@ -12,6 +12,8 @@ struct InsertData
     bool hasDesc = false;
     bool isolated = false; // opcional, compativel com projetos anteriores
     bool offline = false;  // plugin descarregado de proposito (so o estado fica)
+    float mix = 1.0f;      // dry/wet do insert
+    int sidechain = -1;    // indice da faixa na entrada lateral
     juce::PluginDescription desc;
     juce::MemoryBlock state;
 };
@@ -34,9 +36,10 @@ struct ChannelData
     AutoMode autoMode = AutoMode::read;
     std::vector<LaneData> lanes;
     int numInserts = kDefaultInserts; // slots visiveis (inclui vazios adicionados com "+")
+    int group = -1;
 };
 
-struct SendData { int bus = -1; float levelDb = 0.0f; bool pre = false; };
+struct SendData { int bus = -1; float levelDb = 0.0f; bool pre = false; bool preFx = false; };
 
 struct TrackData
 {
@@ -48,8 +51,15 @@ struct TrackData
     LoadedAudio audio; // preenchido ao carregar
 };
 
+struct VcaData { float gainDb = 0.0f; bool mute = false, shown = false; };
+struct MarkerData { double t = 0.0; juce::String name; };
+struct RegionData { double start = 0.0, end = 0.0; juce::String name; };
+
 struct ProjectData
 {
+    std::array<VcaData, kMaxGroups> vca {};
+    std::vector<MarkerData> markers;
+    std::vector<RegionData> regions;
     std::vector<TrackData> tracks;
     std::vector<ChannelData> buses;
     ChannelData master;

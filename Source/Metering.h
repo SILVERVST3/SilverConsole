@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
+#include <vector>
 
 namespace sc
 {
@@ -97,30 +99,21 @@ public:
         constexpr double pi = 3.14159265358979323846;
         const double sr = std::max (8000.0, rate);
         segmentSamples = std::max (1, (int) std::round (sr * 0.1));
-        // K-weight: shelf de alta frequencia seguida de HP RLB.
-        const double gain = std::pow (10.0, 3.999843853973347 / 40.0);
-        const double w1 = 2.0 * pi * 1681.974450955533 / sr;
-        const double a1 = std::sin (w1) / (2.0 * 0.7071752369554196);
-        const double co1 = std::cos (w1);
-        const double root = std::sqrt (gain);
-        const double b0 = gain * ((gain + 1.0) + (gain - 1.0) * co1 + 2.0 * root * a1);
-        const double b1 = -2.0 * gain * ((gain - 1.0) + (gain + 1.0) * co1);
-        const double b2 = gain * ((gain + 1.0) + (gain - 1.0) * co1 - 2.0 * root * a1);
-        const double a0 = (gain + 1.0) - (gain - 1.0) * co1 + 2.0 * root * a1;
-        const double a1s = 2.0 * ((gain - 1.0) - (gain + 1.0) * co1);
-        const double a2 = (gain + 1.0) - (gain - 1.0) * co1 - 2.0 * root * a1;
-
-        const double w2 = 2.0 * pi * 38.13547087602444 / sr;
-        const double alpha = std::sin (w2) / (2.0 * 0.5003270373238773);
-        const double co2 = std::cos (w2);
-        const double hb0 = (1.0 + co2) * 0.5;
-        const double hb1 = -(1.0 + co2);
-        const double hb2 = hb0;
-        const double ha0 = 1.0 + alpha;
-        const double ha1 = -2.0 * co2;
-        const double ha2 = 1.0 - alpha;
-        for (auto& filter : shelf) filter.setup (b0, b1, b2, a0, a1s, a2);
-        for (auto& filter : highpass) filter.setup (hb0, hb1, hb2, ha0, ha1, ha2);
+        // Coeficientes exatos do pre-filtro BS.1770 (derivacao bilinear de referencia;
+        // a 48 kHz da b = 1.53512486, -2.69169619, 1.19839281 / a = -1.69065929, 0.73248077).
+        double K = std::tan (pi * 1681.974450955533 / sr);
+        const double Q1 = 0.7071752369554196;
+        const double Vh = std::pow (10.0, 3.999843853973347 / 20.0);
+        const double Vb = std::pow (Vh, 0.4996667741545416);
+        const double d1 = 1.0 + K / Q1 + K * K;
+        const double sb0 = (Vh + Vb * K / Q1 + K * K) / d1, sb1 = 2.0 * (K * K - Vh) / d1, sb2 = (Vh - Vb * K / Q1 + K * K) / d1;
+        const double sa1 = 2.0 * (K * K - 1.0) / d1, sa2 = (1.0 - K / Q1 + K * K) / d1;
+        K = std::tan (pi * 38.13547087602444 / sr);
+        const double Q2 = 0.5003270373238773;
+        const double d2 = 1.0 + K / Q2 + K * K;
+        const double ha1 = 2.0 * (K * K - 1.0) / d2, ha2 = (1.0 - K / Q2 + K * K) / d2;
+        for (auto& filter : shelf) filter.setup (sb0, sb1, sb2, 1.0, sa1, sa2);
+        for (auto& filter : highpass) filter.setup (1.0, -2.0, 1.0, 1.0, ha1, ha2);
         reset();
     }
 
@@ -189,6 +182,144 @@ private:
     int segmentSamples = 4800;
     int cursor = 0, index = 0, populated = 0;
     float latest = -120.0f;
+};
+
+/** Filtro K (BS.1770): shelf de agudos + passa-altas RLB, um canal. */
+class KWeighting
+{
+public:
+    void prepare (double rate) noexcept
+    {
+        constexpr double pi = 3.14159265358979323846;
+        const double sr = std::max (8000.0, rate);
+        // Coeficientes exatos do pre-filtro BS.1770 (derivacao bilinear de referencia;
+        // a 48 kHz da b = 1.53512486, -2.69169619, 1.19839281 / a = -1.69065929, 0.73248077).
+        double K = std::tan (pi * 1681.974450955533 / sr);
+        const double Q1 = 0.7071752369554196;
+        const double Vh = std::pow (10.0, 3.999843853973347 / 20.0);
+        const double Vb = std::pow (Vh, 0.4996667741545416);
+        const double d1 = 1.0 + K / Q1 + K * K;
+        const double sb0 = (Vh + Vb * K / Q1 + K * K) / d1, sb1 = 2.0 * (K * K - Vh) / d1, sb2 = (Vh - Vb * K / Q1 + K * K) / d1;
+        const double sa1 = 2.0 * (K * K - 1.0) / d1, sa2 = (1.0 - K / Q1 + K * K) / d1;
+        K = std::tan (pi * 38.13547087602444 / sr);
+        const double Q2 = 0.5003270373238773;
+        const double d2 = 1.0 + K / Q2 + K * K;
+        const double ha1 = 2.0 * (K * K - 1.0) / d2, ha2 = (1.0 - K / Q2 + K * K) / d2;
+        shelf.setup (sb0, sb1, sb2, 1.0, sa1, sa2);
+        highpass.setup (1.0, -2.0, 1.0, 1.0, ha1, ha2);
+    }
+    double process (double x) noexcept { return highpass.process (shelf.process (x)); }
+
+private:
+    struct Biquad
+    {
+        double b0 = 1.0, b1 = 0.0, b2 = 0.0, a1 = 0.0, a2 = 0.0, z1 = 0.0, z2 = 0.0;
+        void setup (double bb0, double bb1, double bb2, double aa0, double aa1, double aa2) noexcept
+        {
+            b0 = bb0 / aa0; b1 = bb1 / aa0; b2 = bb2 / aa0; a1 = aa1 / aa0; a2 = aa2 / aa0; z1 = z2 = 0.0;
+        }
+        double process (double x) noexcept
+        {
+            const double y = b0 * x + z1;
+            z1 = b1 * x - a1 * y + z2;
+            z2 = b2 * x - a2 * y;
+            return y;
+        }
+    };
+    Biquad shelf, highpass;
+};
+
+/** Medicao offline para exportacao (BS.1770-4 / EBU R128): loudness integrado
+    com gate absoluto (-70 LUFS) e relativo (-10 LU), maximo de curto prazo
+    (janela de 3 s), true peak (4x) e pico de amostra. Aloca: so fora do audio. */
+class LoudnessAnalyzer
+{
+public:
+    void prepare (double rate)
+    {
+        for (auto& k : kw) k.prepare (rate);
+        segmentSamples = std::max (1, (int) std::round (std::max (8000.0, rate) * 0.1));
+        segments.clear();
+        accumulated = 0.0;
+        cursor = 0;
+        samplePeak = truePeak = 0.0f;
+        peakMeter.reset();
+    }
+
+    void process (const float* l, const float* r, int n)
+    {
+        if (l == nullptr || r == nullptr || n <= 0) return;
+        for (int i = 0; i < n; ++i)
+        {
+            samplePeak = std::max (samplePeak, std::max (std::abs (l[i]), std::abs (r[i])));
+            const double kl = kw[0].process (l[i]), kr = kw[1].process (r[i]);
+            accumulated += kl * kl + kr * kr;
+            if (++cursor == segmentSamples)
+            {
+                segments.push_back (accumulated / (double) segmentSamples);
+                accumulated = 0.0;
+                cursor = 0;
+            }
+        }
+        const auto p = peakMeter.process (l, r, n);
+        truePeak = std::max (truePeak, std::max (p.left, p.right));
+    }
+
+    static float toLufs (double meanSquare) noexcept
+    {
+        return meanSquare > 1.0e-20 ? (float) (-0.691 + 10.0 * std::log10 (meanSquare)) : -std::numeric_limits<float>::infinity();
+    }
+
+    /** -inf se for silencio (todos os blocos abaixo de -70 LUFS). */
+    float integratedLufs() const
+    {
+        std::vector<double> blocks; // 400 ms com passo de 100 ms (75% de sobreposicao)
+        if (segments.size() < 4)
+        {
+            double sum = 0.0;
+            for (double e : segments) sum += e;
+            if (! segments.empty()) blocks.push_back (sum / (double) segments.size());
+        }
+        else
+            for (size_t k = 3; k < segments.size(); ++k)
+                blocks.push_back ((segments[k - 3] + segments[k - 2] + segments[k - 1] + segments[k]) * 0.25);
+        const double absGate = std::pow (10.0, (-70.0 + 0.691) / 10.0);
+        double sum = 0.0;
+        int count = 0;
+        for (double e : blocks) if (e > absGate) { sum += e; ++count; }
+        if (count == 0) return -std::numeric_limits<float>::infinity();
+        const double relGate = std::max (absGate, (sum / count) * 0.1); // -10 LU
+        sum = 0.0;
+        count = 0;
+        for (double e : blocks) if (e > relGate) { sum += e; ++count; }
+        return count > 0 ? toLufs (sum / count) : -std::numeric_limits<float>::infinity();
+    }
+
+    float maxShortTermLufs() const
+    {
+        if (segments.empty()) return -std::numeric_limits<float>::infinity();
+        const size_t w = std::min<size_t> (30, segments.size());
+        double run = 0.0, best = 0.0;
+        for (size_t k = 0; k < segments.size(); ++k)
+        {
+            run += segments[k];
+            if (k >= w) run -= segments[k - w];
+            if (k + 1 >= w) best = std::max (best, run / (double) w);
+        }
+        return toLufs (best);
+    }
+
+    static float toDb (float g) noexcept { return g > 1.0e-9f ? 20.0f * std::log10 (g) : -std::numeric_limits<float>::infinity(); }
+    float samplePeakDb() const noexcept { return toDb (samplePeak); }
+    float truePeakDb() const noexcept { return toDb (truePeak); }
+
+private:
+    KWeighting kw[2];
+    TruePeak4x peakMeter;
+    std::vector<double> segments; // energia media K-ponderada (L+R) a cada 100 ms
+    double accumulated = 0.0;
+    int segmentSamples = 4800, cursor = 0;
+    float samplePeak = 0.0f, truePeak = 0.0f;
 };
 
 } // namespace sc

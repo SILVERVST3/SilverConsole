@@ -23,11 +23,15 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Arquivos grandes (32 MB ou mais) tocam **direto do disco** (streaming), inclusive em outra taxa de amostragem: a conversão é feita trecho a trecho e o arquivo não vai inteiro para a RAM.
 
 **Canais (estilo console)**
+- Layout como no REAPER: a parte de baixo (pan, automação, M/S/Ø, fader, volume e **nome no rodapé**) é fixa; **inserts e envios ficam em áreas próprias com barra de rolagem**, que crescem quando a janela é mais alta.
 - Inserts VST3 em todos os canais (faixas, buses e master): 4 por padrão; o botão **+** ao lado de INSERTS adiciona mais (até 64). Botão direito no último slot vazio: remover.
 - Fader de -∞ a +12 dB e pan (potência constante em faixas mono, balance em estéreo).
 - Mute, solo, inversão de polaridade (Ø) e medidor de pico L/R com indicador de clip.
-- Nome editável (duplo clique) e cor da faixa.
-- **Envios por faixa** (4 por padrão, botão **+** ao lado de ENVIOS para mais; o menu do último envio remove), pré ou pós-fader, para buses auxiliares (reverb, delay, paralelo).
+- **Solo nos buses**: ouve o bus e o que chega nele (faixas roteadas para ele e envios de qualquer faixa). Ex.: solo no bus de reverb toca só o retorno do reverb.
+- Nome editável (duplo clique) e cor da faixa. **Arraste a faixa pelo nome** (no rodapé) para mudar a posição; uma linha azul mostra onde ela vai entrar.
+- **Envios por faixa** (4 por padrão, botão **+** ao lado de ENVIOS para mais; o menu do último envio remove): pós-fader, **pré-fader** ou **pré-FX** (antes dos plugins da faixa, alinhado pela compensação de latência), para buses auxiliares (reverb, delay, paralelo). Pré-FX aparece em azul, pré-fader em laranja.
+- **Grupos** (menu do nome → Grupo, 8 grupos com cor): o fader de um membro move todos na mesma quantidade de dB, e mute e solo valem para o grupo. **Alt+arrastar** move só aquela faixa. O nome mostra uma bolinha com o número do grupo.
+- **VCA** por grupo (Grupo → Mostrar VCA): uma faixa de VCA depois dos buses, com fader e mute que somam no volume de todos os membros, sem passar áudio. Esconder o VCA volta ele para 0 dB.
 - **Saída da faixa** para o Master ou para um bus (grupo, por exemplo um bus de bateria).
 - Até 16 buses auxiliares, cada um com inserts, fader, pan e mute.
 - **Master** com inserts, fader, botão **MONO** para conferir a mix e indicador de clip.
@@ -39,6 +43,8 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Clique num slot ocupado para abrir o editor do plugin. **Shift+clique** liga o bypass. O botão direito abre o menu: bypass, substituir, mover para cima/baixo e remover.
 - **Janela do plugin**: alguns plugins aplicam a escala do Windows duas vezes e abriam gigantes (BSA Drum Bus num monitor 4K a 250% abria com 625%). A janela detecta isso e corrige sozinha; plugins redimensionáveis que ainda não cabem são reduzidos para caber no monitor (com bordas para redimensionar). Plugins não redimensionáveis maiores que a tela ficam com barras de rolagem. No menu do insert, **Escala da janela** permite escolher por plugin: *Automática* (padrão), *Sempre corrigir escala dupla*, *Escala do monitor, sem correção* ou *Modo compatível do Windows (sem DPI)*. A escolha fica salva por plugin.
 - **Compensação automática de latência (PDC)** em faixas, buses e master: plugins com lookahead (limitadores, EQs de fase linear) não desalinham a mix.
+- **Mix dry/wet por plugin** (menu do insert → Mix dry/wet): 0% = seco, 100% = plugin. O seco é atrasado pela latência do plugin (sem eco nem filtro de pente). O slot mostra a porcentagem.
+- **Sidechain** (menu do insert → Sidechain): liga uma faixa na entrada lateral de plugins que têm essa entrada (compressores, gates). O sinal é o áudio da faixa antes dos plugins dela, independente do fader (a faixa fonte pode até ficar muda). O slot mostra **SC**. Plugins sem entrada lateral e plugins isolados não oferecem a opção.
 - O estado de todos os plugins é salvo no projeto. Se um plugin não estiver instalado ao abrir, o slot fica **vermelho** e o estado é preservado; ao salvar, nada se perde.
 - **Plugin offline**: no menu do insert (botão direito), **Colocar offline** descarrega o plugin (não usa CPU nem memória) e guarda o ajuste; o slot fica apagado com **OFF**. **Colocar online** recarrega com o mesmo ajuste. O menu do nome da faixa/bus tem **Todos os plugins offline/online**. Fica salvo no projeto (o plugin nem é carregado ao abrir).
 - **Congelar faixa** (menu do nome da faixa): grava a faixa com os plugins (inversão de fase, inserts, automação dos plugins e a cauda de reverb/delay) num WAV ao lado do projeto (pasta "<projeto> - congeladas") e descarrega os plugins. A faixa mostra **CONGELADA** e toca o arquivo, lido do disco. Volume, pan, envios, mute e a automação de volume/pan continuam funcionando. **Descongelar** recarrega os plugins com o ajuste e manda o arquivo congelado para a lixeira.
@@ -67,6 +73,9 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 - Projetos `.sconsole` em XML. O projeto guarda o caminho dos áudios, relativo à pasta do projeto, e não copia os arquivos.
 - **Exportar mix** para WAV de 16, 24 ou 32 bits float, renderizada offline (mais rápido que tempo real e sem falhas). Inclui 3 s de cauda e já descontada a latência dos plugins. Avisa se a mix passou de 0 dBFS. Em 16 bits aplica **dither TPDF**.
 - **Exportar a mix só do trecho selecionado**: com um trecho selecionado, o botão **Exportar** (e o menu da régua) oferece a mix só da seleção.
+- **Normalização** (Exportar → Normalização), vale para a mix, a seleção, as regiões e a fila: sem normalização, pico de amostra (-1,0 ou -0,1 dBFS), true peak -1,0 dBTP, **-14 LUFS** (Spotify/YouTube), **-16 LUFS** (Apple Music/podcast), **-23 LUFS** (EBU R128) ou personalizado. É um ganho único no arquivo inteiro, sem limitador: a mix é renderizada uma vez, medida e gravada com o ganho (e dither em 16 bits). Em LUFS, o ganho nunca passa o teto de true peak (padrão -1 dBTP); se o teto segurar, o aviso sugere um limitador no master. A escolha fica salva.
+- **Medição de loudness** (Exportar → Medir loudness, da música ou da seleção): renderiza sem gravar e mostra loudness integrado (BS.1770-4 / EBU R128, com gates de -70 LUFS e -10 LU), máximo de curto prazo (3 s), true peak e pico de amostra. Toda exportação de mix também mostra essas medidas do arquivo gravado.
+- **Fila de exportação** (Exportar → Adicionar à fila / Fila de exportação): junte vários pedidos (mix da música, da seleção, cada região, faixas individuais pelo botão "Adicionar à fila" do painel de stems) e grave tudo de uma vez numa pasta nova, com um resumo no fim (OK/FALHA e as medidas de cada mix). A fila vale para a sessão aberta.
 - **Exportar faixas individuais (stems)**, da música inteira ou só da seleção. Escolha as faixas, o formato e o conteúdo:
   - **Com processamento**: cada faixa sai como soa na mix (inserts, volume, pan, automação, compensação de latência), sem buses e sem master. Solo é ignorado; faixas em mute saem em silêncio. Opcional: 3 s de cauda e os **buses** (cada bus com tudo o que chega nele). É uma passada só de render, em vários núcleos.
   - **Áudio original**: o trecho do arquivo de cada faixa, sem processamento (mono continua mono).
@@ -101,9 +110,20 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 | Ctrl+I | Importar áudio |
 | Ctrl+E | Exportar (mix, trecho ou faixas individuais) |
 | Tab | Alterna entre mixer e editor de automação |
+| Ctrl+Z / Ctrl+Y (ou Ctrl+Shift+Z) | Desfazer / refazer (também nos botões ↶ ↷) |
+| M | Adicionar marcador no cursor |
+| R | Criar região com a seleção |
+| [ / ] | Marcador anterior / próximo |
 | Duplo clique no fader/pan | 0 dB / centro |
 | Ctrl+arrastar o fader | Ajuste fino |
 | Duplo clique no valor em dB | Digitar o volume |
+
+## Desfazer, marcadores e regiões
+
+- **Desfazer/refazer** (Ctrl+Z / Ctrl+Y, botões ↶ ↷ ao lado de Salvar; a dica do botão diz o que vai ser desfeito): volume, pan, mute, solo, fase, mono, envios (nível, destino, pré/pós), saída da faixa, inserir/substituir/remover/mover plugins, bypass, mix dry/wet, sidechain, mover/remover/importar faixas, nome, cor, grupo, VCA, pontos de automação editados, marcadores e regiões. Plugins e faixas removidos ficam guardados no histórico: desfazer devolve o mesmo plugin com o mesmo ajuste. Mexer nos parâmetros dentro da janela do plugin não entra no histórico. O histórico recomeça ao abrir/criar projeto, criar ou remover bus, congelar/descongelar e mostrar/esconder VCA (operações que mudam a estrutura).
+- **Marcadores**: tecla **M** (ou menu da régua) cria um marcador laranja no cursor. Clique na bandeira para ir até ele; botão direito: renomear, mover para o cursor, apagar. **[** e **]** pulam entre marcadores.
+- **Regiões com nome**: selecione um trecho e tecle **R** (ou menu da régua). A região aparece como uma faixa azul na régua: clique seleciona, duplo clique toca, botão direito renomeia, ajusta pela seleção ou apaga. **Exportar → Cada região como um arquivo** grava a mix de cada região numa pasta nova ("NN - nome.wav").
+- Tudo é salvo no projeto.
 
 ## Recuperacao de projetos (Etapa 3 - experimental)
 
@@ -116,9 +136,10 @@ O workflow compila o programa e roda os testes automáticos. Os testes cobrem a 
 ## Medidores Master (Etapa 3 - em validacao)
 
 - O MASTER mostra **TP dBTP**, uma estimativa de true peak por sobreamostragem FIR **4x** com historico entre callbacks; ela detecta picos que ocorrem entre amostras de audio.
-- O painel de saida do MASTER mostra **Momentary LUFS (M)** em uma janela de aproximadamente **400 ms**, usando ponderacao K (high-shelf + RLB high-pass) e atualizacao em sub-janelas de 100 ms.
+- O painel de saida do MASTER mostra **Momentary LUFS (M)** em uma janela de aproximadamente **400 ms**, usando a ponderacao K exata da BS.1770 (coeficientes de referencia; a versao anterior aproximava o filtro e lia cerca de 0,26 dB a menos) e atualizacao em sub-janelas de 100 ms.
 - Ambos sao somente medidores; nao alteram o sinal nem aplicam limitacao. Os testes verificam pico entre amostras, continuidade de estado, sonoridade em 48/96 kHz, silencio e reducao de 20 dB.
-- **Limite:** a leitura LUFS-M ainda nao implementa medicao integrada com gate EBU R128, loudness range, short-term (3s) ou certificacao normativa. A leitura true peak FIR 4x e aproximada e exige comparacao com medidores de referencia.
+- O loudness integrado com gates (EBU R128) e o maximo de curto prazo sao medidos na exportacao e em Exportar → Medir loudness (nao ao vivo). Teste: seno de 997 Hz a -20 dBFS nos dois canais mede -20,00 LUFS.
+- **Limite:** sem loudness range (LRA) nem certificacao normativa. A leitura true peak FIR 4x e aproximada e exige comparacao com medidores de referencia.
 
 ## ASIO opcional (Windows, em validacao)
 

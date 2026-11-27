@@ -365,6 +365,7 @@ void Engine::prepareSlot (InsertSlot& s)
     {
         p->releaseResources();
         prepareProcessor (*p);
+        if (s.sidechain != nullptr && ! applySidechainLayout (*p, true)) s.sidechain = nullptr;
         s.bufferChannels = juce::jlimit (2, kMaxPluginChannels,
                                          juce::jmax (p->getTotalNumInputChannels(), p->getTotalNumOutputChannels()));
         s.mainOutChannels = p->getMainBusNumOutputChannels();
@@ -384,6 +385,18 @@ void Engine::prepareChannel (Channel& c)
     {
         c.processingBuffer.setSize (kMaxPluginChannels + 1, blockSize);
         c.processingMidi.ensureSize (4096);
+    }
+    c.dryBuffer.setSize (2, blockSize);
+    c.sidechainBuffer.setSize (2, blockSize);
+    if (c.kind == ChannelKind::track)
+    {
+        auto& tr = static_cast<Track&> (c);
+        tr.preFxBuffer.setSize (2, blockSize);
+        const float gate = tr.soloGate.getTargetValue();
+        tr.soloGate.reset (sr, 0.02);
+        tr.soloGate.setCurrentAndTargetValue (gate);
+        tr.preFxPdc.clear();
+        tr.preFxActive = false;
     }
     if (c.kind == ChannelKind::track)
     {
@@ -443,6 +456,8 @@ std::unique_ptr<Track> Engine::removeTrack (Track* t)
         const juce::ScopedLock sl (lock);
         for (auto it = tracks.begin(); it != tracks.end(); ++it)
             if (it->get() == t) { out = std::move (*it); tracks.erase (it); break; }
+        // sidechains que liam esta faixa ficam desligados
+        forEachChannelNoAlloc ([t] (Channel& c) { for (auto& s : c.inserts) if (s.sidechain == t) s.sidechain = nullptr; });
         updateLatency();
     }
     if (out != nullptr)
@@ -450,6 +465,130 @@ std::unique_ptr<Track> Engine::removeTrack (Track* t)
             if (s.processor != nullptr) s.processor->removeListener (this);
     updateLength();
     return out;
+}
+
+Track* Engine::insertTrack (int index, std::unique_ptr<Track> t)
+{
+    if (t == nullptr) return nullptr;
+    prepareChannel (*t); // a taxa/buffer podem ter mudado enquanto estava fora
+    for (auto& s : t->inserts)
+        if (s.processor != nullptr) s.processor->addListener (this);
+    auto* raw = t.get();
+    {
+        const juce::ScopedLock sl (lock);
+        index = juce::jlimit (0, (int) tracks.size(), index);
+        tracks.insert (tracks.begin() + index, std::move (t));
+        updateLatency();
+    }
+    updateLength();
+    return raw;
+}
+
+void Engine::swapSlotContent (Channel& c, int slot, SlotContent& o)
+{
+    if (! juce::isPositiveAndBelow (slot, kMaxInsertsPerChannel)) return;
+    if (slot >= c.inserts.size()) setInsertCount (c, slot + 1);
+    auto& s = c.inserts[(size_t) slot];
+    if (o.processor != nullptr) o.processor->addListener (this);
+    {
+        const juce::ScopedLock sl (lock);
+        std::swap (s.processor, o.processor);
+        std::swap (s.remote, o.remote);
+        std::swap (s.description, o.description);
+        std::swap (s.hasDescription, o.hasDescription);
+        std::swap (s.preferRemote, o.preferRemote);
+        std::swap (s.offline, o.offline);
+        std::swap (s.missingState, o.missingState);
+        std::swap (s.sidechain, o.sidechain);
+        const bool b = s.bypassed.load();
+        s.bypassed = o.bypassed;
+        o.bypassed = b;
+        const float m = s.mix.load();
+        s.mix = o.mix;
+        o.mix = m;
+        s.faulted.store (false, std::memory_order_relaxed);
+        s.lastMix = s.mix.load();
+        if (auto* p = s.processor.get())
+        {
+            s.bufferChannels = juce::jlimit (2, kMaxPluginChannels, juce::jmax (p->getTotalNumInputChannels(), p->getTotalNumOutputChannels()));
+            s.mainOutChannels = p->getMainBusNumOutputChannels();
+        }
+        else
+        {
+            s.bufferChannels = 2;
+            s.mainOutChannels = 2;
+        }
+        c.wake();
+        updateLatency();
+    }
+    if (o.processor != nullptr) o.processor->removeListener (this);
+}
+
+float Engine::faderGain (const Channel& c) const noexcept
+{
+    const float db = c.gainDb.load (std::memory_order_relaxed);
+    if (db <= kMinDb) return 0.0f;
+    const int g = c.group.load (std::memory_order_relaxed);
+    if (juce::isPositiveAndBelow (g, kMaxGroups))
+    {
+        const auto& v = vca[(size_t) g];
+        const float vdb = v.gainDb.load (std::memory_order_relaxed);
+        if (v.mute.load (std::memory_order_relaxed) || vdb <= kMinDb) return 0.0f;
+        return juce::Decibels::decibelsToGain (db + vdb);
+    }
+    return juce::Decibels::decibelsToGain (db);
+}
+
+bool Engine::supportsSidechain (const InsertSlot& s)
+{
+    return s.processor != nullptr && s.remote == nullptr && s.processor->getBusCount (true) >= 2;
+}
+
+bool Engine::applySidechainLayout (juce::AudioProcessor& p, bool enable)
+{
+    if (! enable) return true; // prepareProcessor/configureStereo ja desliga as entradas extras
+    auto layout = p.getBusesLayout();
+    if (layout.inputBuses.size() < 2) return false;
+    // VST3: os barramentos so podem mudar com o plugin desativado (setBusArrangements/activateBus
+    // com o plugin ativo sao recusados - o wrapper JUCE devolve kResultFalse). Quem chama acabou
+    // de rodar prepareProcessor, entao desativa antes de testar/aplicar e prepara de novo depois.
+    p.releaseResources();
+    const double sr = sampleRate.load();
+    bool ok = false;
+    for (auto set : { juce::AudioChannelSet::stereo(), juce::AudioChannelSet::mono() })
+    {
+        auto tryLayout = layout;
+        tryLayout.inputBuses.getReference (1) = set;
+        if (p.checkBusesLayoutSupported (tryLayout) && p.setBusesLayout (tryLayout)) { ok = true; break; }
+    }
+    if (! ok) p.setBusesLayout (layout); // volta ao layout sem entrada lateral
+    p.setRateAndBufferSizeDetails (sr, blockSize);
+    p.prepareToPlay (sr, blockSize);
+    return ok;
+}
+
+bool Engine::setSidechain (Channel& c, int slot, Track* source)
+{
+    if (! c.hasInsert (slot)) return false;
+    auto& s = c.inserts[(size_t) slot];
+    if (! supportsSidechain (s)) return source == nullptr;
+    if (source == &c) return false;
+    auto* p = s.processor.get();
+    const juce::ScopedLock sl (lock); // o audio nao processa este plugin durante a troca
+    p->releaseResources();
+    prepareProcessor (*p); // layout padrao (sem entrada lateral)
+    bool ok = true;
+    if (source != nullptr && ! applySidechainLayout (*p, true))
+    {
+        prepareProcessor (*p);
+        ok = false;
+    }
+    s.sidechain = ok ? source : nullptr;
+    s.bufferChannels = juce::jlimit (2, kMaxPluginChannels, juce::jmax (p->getTotalNumInputChannels(), p->getTotalNumOutputChannels()));
+    s.mainOutChannels = p->getMainBusNumOutputChannels();
+    c.wake();
+    updateLatency();
+    return ok;
 }
 
 void Engine::moveTrack (int from, int to)
@@ -530,6 +669,8 @@ std::unique_ptr<juce::AudioProcessor> Engine::setInsert (Channel& c, int slot, s
         s.missingState.reset();
         s.bypassed = false;
         s.offline = false;
+        s.mix = 1.0f;
+        s.sidechain = nullptr;
         s.faulted.store (false, std::memory_order_relaxed);
         c.wake();
         if (auto* np = s.processor.get())
@@ -567,6 +708,7 @@ std::unique_ptr<juce::AudioProcessor> Engine::setRemoteInsert (
         entry.bypassed.store (false, std::memory_order_relaxed);
         entry.faulted.store (false, std::memory_order_relaxed);
         entry.offline = false;
+        entry.mix = 1.0f;
         c.wake();
         entry.bufferChannels = 2;
         entry.mainOutChannels = 2;
@@ -612,6 +754,7 @@ std::unique_ptr<juce::AudioProcessor> Engine::takeInsertOffline (Channel& c, int
         retiredRemote = std::move (s.remote);
         s.missingState = std::move (state);
         s.offline = true;
+        s.sidechain = nullptr;
         s.faulted.store (false, std::memory_order_relaxed);
         c.wake();
         updateLatency();
@@ -640,6 +783,10 @@ void Engine::swapInserts (Channel& c, int a, int b)
     std::swap (x.preferRemote, y.preferRemote);
     std::swap (x.missingState, y.missingState);
     std::swap (x.offline, y.offline);
+    std::swap (x.sidechain, y.sidechain);
+    const float mx = x.mix.load();
+    x.mix = y.mix.load();
+    y.mix = mx;
     std::swap (x.bufferChannels, y.bufferChannels);
     std::swap (x.mainOutChannels, y.mainOutChannels);
     const bool bx = x.bypassed.load();
@@ -755,6 +902,7 @@ void Engine::clearSession (std::vector<std::unique_ptr<juce::AudioProcessor>>& t
             s.offline = false;
         }
         master.gainDb = 0.0f; master.pan = 0.0f; master.mute = false; master.mono = false;
+        for (auto& v : vca) { v.gainDb = 0.0f; v.mute = false; v.shown = false; }
         updateLatency();
     }
     for (auto& p : toDelete) p->removeListener (this);
@@ -931,6 +1079,18 @@ void Engine::updateLatency()
     totalLatency = trackMax + busMax + master.chainLatency;
     for (auto& t : tracks) t->sleepHoldSamples = sleepHoldFor (*t);
     for (auto& b : buses)  b->sleepHoldSamples = sleepHoldFor (*b);
+    // pre-FX: sem os inserts, atrasa ate o ponto em que as faixas ficam alinhadas
+    for (auto& t : tracks) if (t->preFxPdc.getDelay() != trackMax) t->preFxPdc.setDelay (trackMax);
+    // dry/wet: o seco atrasa a latencia do proprio plugin
+    forEachChannelNoAlloc ([] (Channel& c)
+    {
+        for (auto& s : c.inserts)
+        {
+            const int lat = s.remote != nullptr ? s.remote->getLatencySamples()
+                          : s.processor != nullptr ? juce::jmax (0, s.processor->getLatencySamples()) : 0;
+            if (s.dryDelay.getDelay() != lat) s.dryDelay.setDelay (lat);
+        }
+    });
 }
 
 int Engine::sleepHoldFor (const Channel& c) const
@@ -990,49 +1150,108 @@ void Engine::runInserts (Channel& c, int n,
 {
     for (auto& s : c.inserts)
     {
-        if (s.remote != nullptr)
+        const bool isRemote = s.remote != nullptr;
+        auto* p = s.processor.get();
+        if (! isRemote && (p == nullptr || s.bypassed.load (std::memory_order_relaxed))) continue;
+
+        // Mix dry/wet: guarda o seco (atrasado pela latencia do plugin) antes de processar.
+        const float mixTarget = juce::jlimit (0.0f, 1.0f, s.mix.load (std::memory_order_relaxed));
+        const bool blend = mixTarget < 0.999f || s.lastMix < 0.999f;
+        if (blend)
+        {
+            if (s.lastMix >= 0.999f) s.dryDelay.clear(); // comecou a misturar: sem restos antigos
+            c.dryBuffer.copyFrom (0, 0, work, 0, 0, n);
+            c.dryBuffer.copyFrom (1, 0, work, 1, 0, n);
+            s.dryDelay.process (c.dryBuffer.getWritePointer (0), c.dryBuffer.getWritePointer (1), n);
+        }
+
+        bool failed = false;
+        if (isRemote)
         {
             s.remote->process (work.getWritePointer (0), work.getWritePointer (1),
                                n, s.bypassed.load (std::memory_order_relaxed));
             if (s.remote->isFaulted())
                 s.faulted.store (true, std::memory_order_relaxed);
-            continue;
         }
-        auto* p = s.processor.get();
-        if (p == nullptr || s.bypassed.load(std::memory_order_relaxed)) continue;
+        else
+        {
+            const int ch = s.bufferChannels;
+            for (int i = 2; i < ch; ++i) work.clear (i, 0, n);
+            if (auto* src = s.sidechain)
+            {
+                // entrada lateral: audio da faixa fonte no mesmo trecho, antes dos plugins dela
+                const int scStart = p->getChannelIndexInProcessBlockBuffer (true, 1, 0);
+                const int scCount = p->getChannelCountOfBus (true, 1);
+                if (scCount > 0 && scStart >= 1 && scStart + scCount <= ch)
+                {
+                    auto* L = c.sidechainBuffer.getWritePointer (0);
+                    auto* R = c.sidechainBuffer.getWritePointer (1);
+                    juce::FloatVectorOperations::clear (L, n);
+                    juce::FloatVectorOperations::clear (R, n);
+                    if (blockSegs != nullptr) readTrackSource (*src, L, R, blockSegs, blockNumSegs, sampleRate.load (std::memory_order_relaxed));
+                    if (src->phase.load (std::memory_order_relaxed) && ! src->isFrozen())
+                    {
+                        juce::FloatVectorOperations::negate (L, L, n);
+                        juce::FloatVectorOperations::negate (R, R, n);
+                    }
+                    if (scCount == 1)
+                        for (int i = 0; i < n; ++i) work.getWritePointer (scStart)[i] = 0.5f * (L[i] + R[i]);
+                    else
+                    {
+                        work.copyFrom (scStart, 0, L, n);
+                        work.copyFrom (scStart + 1, 0, R, n);
+                    }
+                }
+            }
+            juce::AudioBuffer<float> view (work.getArrayOfWritePointers(), ch, n);
+            eventMidi.clear();
+            bool suspended = false;
+            {
+                const juce::ScopedLock pl (p->getCallbackLock());
+                if (p->isSuspended()) suspended = true;
+                // Uma excecao C++ de plugin nao pode atravessar o callback da
+                // interface de audio. Falhas de processo (SEH/access violation),
+                // deadlocks e loops infinitos AINDA exigem DSP fora do processo.
+                else
+                {
+                    try
+                    {
+                        p->processBlock (view, eventMidi);
+                    }
+                    catch (...)
+                    {
+                        failed = true;
+                    }
+                }
+            }
+            if (suspended) continue;
+            if (failed)
+            {
+                // Silencia somente o bloco afetado; nos callbacks seguintes o
+                // insert com falha fica automaticamente em bypass.
+                s.faulted.store (true, std::memory_order_relaxed);
+                s.bypassed.store (true, std::memory_order_relaxed);
+                latencyDirty.store (true, std::memory_order_relaxed); // PDC refeito pela thread de controle
+                pluginExceptions.fetch_add (1, std::memory_order_relaxed);
+                work.clear (0, n);
+                s.lastMix = 1.0f;
+                continue;
+            }
+            if (s.mainOutChannels == 1) work.copyFrom (1, 0, work, 0, 0, n);
+        }
 
-        const int ch = s.bufferChannels;
-        for (int i = 2; i < ch; ++i) work.clear (i, 0, n);
-        juce::AudioBuffer<float> view (work.getArrayOfWritePointers(), ch, n);
-        eventMidi.clear();
-        bool failed = false;
+        if (blend)
         {
-            const juce::ScopedLock pl (p->getCallbackLock());
-            if (p->isSuspended()) continue;
-            // Uma excecao C++ de plugin nao pode atravessar o callback da
-            // interface de audio. Falhas de processo (SEH/access violation),
-            // deadlocks e loops infinitos AINDA exigem DSP fora do processo.
-            try
+            const float m0 = s.lastMix, step = (mixTarget - m0) / (float) juce::jmax (1, n);
+            for (int ch = 0; ch < 2; ++ch)
             {
-                p->processBlock (view, eventMidi);
-            }
-            catch (...)
-            {
-                failed = true;
+                auto* w = work.getWritePointer (ch);
+                const auto* d = c.dryBuffer.getReadPointer (ch);
+                float m = m0;
+                for (int i = 0; i < n; ++i, m += step) w[i] = w[i] * m + d[i] * (1.0f - m);
             }
         }
-        if (failed)
-        {
-            // Silencia somente o bloco afetado; nos callbacks seguintes o
-            // insert com falha fica automaticamente em bypass.
-            s.faulted.store (true, std::memory_order_relaxed);
-            s.bypassed.store (true, std::memory_order_relaxed);
-            latencyDirty.store (true, std::memory_order_relaxed); // PDC refeito pela thread de controle
-            pluginExceptions.fetch_add (1, std::memory_order_relaxed);
-            work.clear (0, n);
-            continue;
-        }
-        if (s.mainOutChannels == 1) work.copyFrom (1, 0, work, 0, 0, n);
+        s.lastMix = mixTarget;
     }
 }
 
@@ -1152,9 +1371,32 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
     for (int b = 0; b < numBuses; ++b) busIn[(size_t) b].clear (0, n);
     direct.clear (0, n);
 
-    bool anySolo = false;
-    for (auto& t : tracks) anySolo = anySolo || t->solo.load (std::memory_order_relaxed);
-    if (stemTaps != nullptr) anySolo = false; // stems: cada faixa sai mesmo sem solo
+    // Solo: faixas e buses. Bus em solo = ouve o bus e o que chega nele (faixas
+    // roteadas para ele e envios de qualquer faixa); faixas direto no master e
+    // outros buses ficam mudos, exceto buses que recebem uma faixa em solo.
+    bool anyTrackSolo = false, anyBusSolo = false;
+    for (auto& t : tracks) anyTrackSolo = anyTrackSolo || t->solo.load (std::memory_order_relaxed);
+    std::array<bool, kMaxBuses> busSoloed {}, busFedBySolo {};
+    for (int b = 0; b < numBuses; ++b)
+    {
+        busSoloed[(size_t) b] = buses[(size_t) b]->solo.load (std::memory_order_relaxed);
+        anyBusSolo = anyBusSolo || busSoloed[(size_t) b];
+    }
+    if (stemTaps != nullptr) anyTrackSolo = anyBusSolo = false; // stems: cada faixa sai mesmo sem solo
+    if (stemTaps != nullptr) busSoloed.fill (false);
+    const bool anySolo = anyTrackSolo || anyBusSolo;
+    if (anyBusSolo && anyTrackSolo)
+        for (auto& t : tracks)
+        {
+            if (! t->solo.load (std::memory_order_relaxed)) continue;
+            const int ob = t->outputBus.load (std::memory_order_relaxed);
+            if (ob >= 0 && ob < numBuses) busFedBySolo[(size_t) ob] = true;
+            for (auto& sd : t->sends)
+            {
+                const int sb = sd.bus.load (std::memory_order_relaxed);
+                if (sb >= 0 && sb < numBuses) busFedBySolo[(size_t) sb] = true;
+            }
+        }
 
     auto* L = scratch.getWritePointer (0);
     auto* R = scratch.getWritePointer (1);
@@ -1181,11 +1423,26 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
             juce::FloatVectorOperations::negate (TR, TR, n);
         }
 
+        // envios pre-FX: copia antes dos inserts (alinhada pela PDC das faixas)
+        bool wantsPreFx = false;
+        for (auto& sd : t.sends)
+            wantsPreFx = wantsPreFx || (sd.preFx.load (std::memory_order_relaxed) && sd.bus.load (std::memory_order_relaxed) >= 0);
+        if (wantsPreFx)
+        {
+            if (! t.preFxActive) t.preFxPdc.clear();
+            t.preFxBuffer.copyFrom (0, 0, TL, n);
+            t.preFxBuffer.copyFrom (1, 0, TR, n);
+            t.preFxPdc.process (t.preFxBuffer.getWritePointer (0), t.preFxBuffer.getWritePointer (1), n);
+        }
+        t.preFxActive = wantsPreFx;
+
         processChain (t, n, t.processingBuffer, t.processingMidi, allowSleep);
         t.pdc.process (TL, TR, n);
 
     };
     const bool multi = multiCore.load (std::memory_order_relaxed);
+    blockSegs = play ? segs : nullptr; // fontes de sidechain leem os mesmos trechos
+    blockNumSegs = play ? numSegs : 0;
     runChannels (offlineTrackPool.get(), realtimePool.get(), multi, (int) tracks.size(), processTrack);
 
     // Somatoria deterministica: envios, faders e buses na ordem original.
@@ -1194,8 +1451,14 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         auto& t = *tracks[ti];
         auto* TL = t.processingBuffer.getWritePointer (0);
         auto* TR = t.processingBuffer.getWritePointer (1);
-        const bool audible = ! t.mute.load (std::memory_order_relaxed) && (! anySolo || t.solo.load (std::memory_order_relaxed));
-        const float g = audible ? dbToGain (t.gainDb.load (std::memory_order_relaxed)) : 0.0f;
+        const int outBus = t.outputBus.load (std::memory_order_relaxed);
+        const bool trackSolo = t.solo.load (std::memory_order_relaxed)
+                               || (outBus >= 0 && outBus < numBuses && busSoloed[(size_t) outBus]);
+        const bool notMuted = ! t.mute.load (std::memory_order_relaxed);
+        const bool audible = notMuted && (! anySolo || trackSolo);
+        // o fader vale tambem para os envios pos-fader; o solo so cala a saida
+        const float g = notMuted ? faderGain (t) : 0.0f;
+        setGainTarget (t.soloGate, audible ? 1.0f : 0.0f, snap);
         float pl, pr;
         panGains (t.pan.load (std::memory_order_relaxed), t.sourceChannels == 1, pl, pr);
         setGainTarget (t.smoothL, g * pl, snap);
@@ -1206,13 +1469,17 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         {
             const int b = s.bus.load (std::memory_order_relaxed);
             const bool valid = b >= 0 && b < numBuses;
-            setGainTarget (s.smooth, valid && audible ? dbToGain (s.levelDb.load (std::memory_order_relaxed)) : 0.0f, snap);
+            const bool sendOn = valid && notMuted && (! anySolo || trackSolo || busSoloed[(size_t) b]);
+            setGainTarget (s.smooth, sendOn ? dbToGain (s.levelDb.load (std::memory_order_relaxed)) : 0.0f, snap);
             if (! valid) { s.smooth.skip (n); continue; }
-            if (! s.preFader.load (std::memory_order_relaxed)) continue;
+            const bool preFx = s.preFx.load (std::memory_order_relaxed);
+            if (! preFx && ! s.preFader.load (std::memory_order_relaxed)) continue;
             auto& dst = busIn[(size_t) b];
+            const float* srcL = preFx ? t.preFxBuffer.getReadPointer (0) : TL;
+            const float* srcR = preFx ? t.preFxBuffer.getReadPointer (1) : TR;
             auto sm = s.smooth; // mesma rampa para TL e TR
-            addWithRamp (dst.getWritePointer (0), TL, n, sm);
-            addWithRamp (dst.getWritePointer (1), TR, n, s.smooth);
+            addWithRamp (dst.getWritePointer (0), srcL, n, sm);
+            addWithRamp (dst.getWritePointer (1), srcR, n, s.smooth);
         }
 
         // fader + pan
@@ -1228,7 +1495,7 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         for (auto& s : t.sends)
         {
             const int b = s.bus.load (std::memory_order_relaxed);
-            if (b < 0 || b >= numBuses || s.preFader.load (std::memory_order_relaxed)) continue;
+            if (b < 0 || b >= numBuses || s.preFader.load (std::memory_order_relaxed) || s.preFx.load (std::memory_order_relaxed)) continue;
             auto& dst = busIn[(size_t) b];
             auto sm = s.smooth;
             addWithRamp (dst.getWritePointer (0), TL, n, sm);
@@ -1244,8 +1511,17 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
 
         const int ob = t.outputBus.load (std::memory_order_relaxed);
         auto& out = (ob >= 0 && ob < numBuses) ? busIn[(size_t) ob] : direct;
-        out.addFrom (0, 0, TL, n);
-        out.addFrom (1, 0, TR, n);
+        if (t.soloGate.isSmoothing())
+        {
+            auto gate = t.soloGate; // mesma rampa para L e R
+            addWithRamp (out.getWritePointer (0), TL, n, gate);
+            addWithRamp (out.getWritePointer (1), TR, n, t.soloGate);
+        }
+        else if (t.soloGate.getTargetValue() > 0.0f)
+        {
+            out.addFrom (0, 0, TL, n);
+            out.addFrom (1, 0, TR, n);
+        }
 
         storePeak (t.peakL, t.processingBuffer.getMagnitude (0, 0, n));
         storePeak (t.peakR, t.processingBuffer.getMagnitude (1, 0, n));
@@ -1269,7 +1545,8 @@ juce::int64 Engine::render (float* outL, float* outR, int n, juce::int64 pos, bo
         processChain (b, n, b.processingBuffer, b.processingMidi, allowSleep);
         b.pdc.process (BL, BR, n);
 
-        const float g = b.mute.load (std::memory_order_relaxed) ? 0.0f : dbToGain (b.gainDb.load (std::memory_order_relaxed));
+        const bool soloMuted = anyBusSolo && ! busSoloed[(size_t) bi] && ! busFedBySolo[(size_t) bi];
+        const float g = (b.mute.load (std::memory_order_relaxed) || soloMuted) ? 0.0f : faderGain (b);
         float pl, pr;
         panGains (b.pan.load (std::memory_order_relaxed), false, pl, pr);
         setGainTarget (b.smoothL, g * pl, snap);
@@ -1524,7 +1801,8 @@ namespace
 bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds,
                         std::atomic<float>& progress, std::atomic<bool>& cancel,
                         juce::String& error, bool& clipped,
-                        juce::int64 rangeStart, juce::int64 rangeEnd)
+                        juce::int64 rangeStart, juce::int64 rangeEnd,
+                        const Normalize& normalize, ExportReport* report, bool measureOnly)
 {
     const juce::ScopedLock sl (lock);
     clipped = false;
@@ -1537,18 +1815,30 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
     const juce::int64 total = length + (juce::int64) (tailSeconds * sr);
     if (length <= 0 || total <= 0) { error = "Nada para exportar (trecho vazio)."; return false; }
 
-    juce::TemporaryFile temp (file);
-    auto writer = createWavWriter (temp, sr, 2, bitDepth, error);
-    if (writer == nullptr) return false;
+    // Normalizar exige medir tudo antes de gravar: render em WAV float temporario,
+    // depois ganho + dither no arquivo final. Sem normalizar: grava direto.
+    const bool twoPass = normalize.mode != Normalize::Mode::none && ! measureOnly;
+    std::unique_ptr<juce::TemporaryFile> finalTemp, renderTemp;
+    std::unique_ptr<juce::AudioFormatWriter> writer;
+    if (! measureOnly)
+    {
+        finalTemp = std::make_unique<juce::TemporaryFile> (file);
+        if (twoPass) renderTemp = std::make_unique<juce::TemporaryFile> (file.withFileExtension (".render.wav"));
+        writer = createWavWriter (twoPass ? *renderTemp : *finalTemp, sr, 2, twoPass ? 32 : bitDepth, error);
+        if (writer == nullptr) return false;
+    }
 
     error = beginOfflineRender();
     if (error.isNotEmpty()) return false;
     auto fail = [&] (const juce::String& message) { endOfflineRender(); writer.reset(); error = message; return false; };
 
+    LoudnessAnalyzer meter;
+    meter.prepare (sr);
     const int latency = totalLatency.load();
     const juce::int64 toProduce = total + latency;
-    const bool dither = bitDepth == 16;
+    const bool dither = bitDepth == 16 && ! twoPass;
     juce::Random rng (0x51c0);
+    const float renderShare = twoPass ? 0.8f : 1.0f;
 
     juce::AudioBuffer<float> buf (2, bs);
     juce::int64 pos = start, produced = 0;
@@ -1575,17 +1865,79 @@ bool Engine::exportMix (const juce::File& file, int bitDepth, double tailSeconds
         const int w = m - skip;
         if (w > 0)
         {
-            if (buf.getMagnitude (skip, w) > 1.0f) clipped = true;
+            meter.process (buf.getReadPointer (0, skip), buf.getReadPointer (1, skip), w);
+            if (! twoPass && buf.getMagnitude (skip, w) > 1.0f) clipped = true;
             if (dither) applyDither (buf, 2, skip, w, rng);
-            if (! writer->writeFromAudioSampleBuffer (buf, skip, w))
+            if (writer != nullptr && ! writer->writeFromAudioSampleBuffer (buf, skip, w))
                 return fail ("Falha ao gravar o arquivo (disco cheio?).");
         }
         produced += m;
-        progress = (float) ((double) produced / (double) juce::jmax ((juce::int64) 1, toProduce));
+        progress = renderShare * (float) ((double) produced / (double) juce::jmax ((juce::int64) 1, toProduce));
     }
     writer.reset();
     endOfflineRender();
-    if (! temp.overwriteTargetFileWithTemporary()) { error = "Nao foi possivel substituir o arquivo de destino."; return false; }
+
+    // ---- medicao e ganho
+    ExportReport rep;
+    rep.measured = true;
+    const float lufs = meter.integratedLufs(), tp = meter.truePeakDb(), sp = meter.samplePeakDb();
+    float gainDb = 0.0f;
+    if (twoPass && std::isfinite (sp))
+    {
+        switch (normalize.mode)
+        {
+            case Normalize::Mode::peak:     gainDb = normalize.target - sp; break;
+            case Normalize::Mode::truePeak: gainDb = normalize.target - tp; break;
+            case Normalize::Mode::lufs:
+                if (std::isfinite (lufs)) gainDb = normalize.target - lufs;
+                if (std::isfinite (tp) && tp + gainDb > normalize.truePeakCeiling)
+                {
+                    gainDb = normalize.truePeakCeiling - tp;
+                    rep.limitedByCeiling = true;
+                }
+                break;
+            case Normalize::Mode::none: break;
+        }
+        gainDb = juce::jlimit (-60.0f, 40.0f, gainDb);
+    }
+    auto shift = [gainDb] (float v) { return std::isfinite (v) ? v + gainDb : -100.0f; };
+    rep.gainDb = gainDb;
+    rep.integratedLufs = shift (lufs);
+    rep.maxShortTermLufs = shift (meter.maxShortTermLufs());
+    rep.truePeakDb = shift (tp);
+    rep.samplePeakDb = shift (sp);
+    if (report != nullptr) *report = rep;
+    if (measureOnly) { progress = 1.0f; return true; }
+
+    if (twoPass)
+    {
+        // segunda passada: le o render float, aplica o ganho (e dither) e grava o formato pedido
+        juce::WavAudioFormat wav;
+        std::unique_ptr<juce::AudioFormatReader> reader (wav.createReaderFor (renderTemp->getFile().createInputStream().release(), true));
+        if (reader == nullptr) { error = "Nao foi possivel reler o render temporario."; return false; }
+        auto out = createWavWriter (*finalTemp, sr, 2, bitDepth, error);
+        if (out == nullptr) return false;
+        const float g = juce::Decibels::decibelsToGain (gainDb);
+        const juce::int64 frames = reader->lengthInSamples;
+        juce::AudioBuffer<float> chunk (2, 16384);
+        juce::Random rng2 (0x51c0);
+        for (juce::int64 done = 0; done < frames;)
+        {
+            if (cancel.load()) { error = "Exportacao cancelada."; return false; }
+            const int n = (int) juce::jmin ((juce::int64) chunk.getNumSamples(), frames - done);
+            reader->read (&chunk, 0, n, done, true, true);
+            chunk.applyGain (0, n, g);
+            if (bitDepth != 32 && chunk.getMagnitude (0, n) > 1.0f) clipped = true;
+            if (bitDepth == 16) applyDither (chunk, 2, 0, n, rng2);
+            if (! out->writeFromAudioSampleBuffer (chunk, 0, n)) { error = "Falha ao gravar o arquivo (disco cheio?)."; return false; }
+            done += n;
+            progress = 0.8f + 0.2f * (float) ((double) done / (double) juce::jmax ((juce::int64) 1, frames));
+        }
+    }
+    else if (bitDepth != 32 && rep.samplePeakDb > 0.0f)
+        clipped = true;
+
+    if (! finalTemp->overwriteTargetFileWithTemporary()) { error = "Nao foi possivel substituir o arquivo de destino."; return false; }
     progress = 1.0f;
     return true;
 }
@@ -1810,6 +2162,8 @@ bool Engine::renderFreeze (Track& t, const juce::File& file, double tailSeconds,
         juce::FloatVectorOperations::clear (TR, bs);
         const ReadSeg seg { pos, 0, bs };
         readTrackSource (t, TL, TR, &seg, 1, sr);
+        blockSegs = &seg;
+        blockNumSegs = 1;
         if (t.phase.load (std::memory_order_relaxed))
         {
             juce::FloatVectorOperations::negate (TL, TL, bs);
